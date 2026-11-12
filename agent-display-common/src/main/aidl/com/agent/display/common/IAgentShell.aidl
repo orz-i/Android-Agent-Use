@@ -4,6 +4,8 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.view.Surface;
 import com.agent.display.common.DisplayConfig;
+import com.agent.display.common.network.INetworkCapture;
+import com.agent.display.common.network.INetworkCapture;
 
 /**
  * 运行在 Shell UID 2000 / Root 进程中的通用 Agent 虚拟屏与系统服务桥接接口。
@@ -357,4 +359,13 @@ interface IAgentShell {
      * 在指定虚拟屏的环境上下文中执行命令（注入 AGENT_DISPLAY_ID 环境变量）。
      */
     Bundle runSystemCommand(int displayId, String command) = 49;
+
+    // ==========================================
+    // 11. 原生网络嗅探与抓包 (Native Network Capture)
+    // ==========================================
+
+    /**
+     * 获取服务端原生网络捕获控制器 (eBPF Root 抓包引擎)。
+     */
+    INetworkCapture getNetworkCapture() = 50;
 }
