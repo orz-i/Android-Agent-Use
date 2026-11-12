@@ -30,6 +30,10 @@ android {
     buildFeatures {
         aidl = true
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {
@@ -38,6 +42,8 @@ kotlin {
 
 dependencies {
     implementation(project(":agent-display-common"))
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlin.test)
 }
 
 // 独立构建 classes.dex 与 agent-display-server.jar (内含 classes.dex)

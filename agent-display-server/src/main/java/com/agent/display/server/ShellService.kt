@@ -16,6 +16,8 @@ import android.util.Log
 import android.view.Surface
 import com.agent.display.common.DisplayConfig
 import com.agent.display.common.IAgentShell
+import com.agent.display.common.network.INetworkCapture
+import com.agent.display.server.network.ebpf.EbpfCaptureEngine
 import java.io.File
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
@@ -462,4 +464,11 @@ class ShellService(
         reader.join(1000L)
         return p.exitValue() to output.get()
     }
+
+    // ==========================================
+    // 11. 原生网络嗅探与抓包 (Native Network Capture)
+    // ==========================================
+
+    override fun getNetworkCapture(): INetworkCapture =
+        EbpfCaptureEngine.getInstance(context)
 }
