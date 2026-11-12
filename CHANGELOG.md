@@ -4,6 +4,31 @@
 
 ---
 
+## [0.2.0] - 2026-11-12
+
+### 🚀 统一模块命名与包名重构 (AAU Modernization)
+- **模块目录重命名**：全面由 `agent-display-*` 迁移至 `aau-*` 标准风格：
+  - `aau-common`: 核心契约与顶层门面
+  - `aau-server`: 特权服务端守护进程（输出 `aau-server.jar`）
+  - `aau-client`: 客户端 SDK 与 CDP 网络管理器
+  - `aau-a11y`: 无障碍语义树与手势交互
+  - `aau-setup`: 特权引导与诊断套件
+- **根包名空间统一**：全面迁移至 `com.agent.use.*`（Maven Group 统一为 `com.agent.use`）；
+- **门面与类重命名**：
+  - `AgentDisplayManager` 升级为 `AAUManager`（保留 `@Deprecated typealias` 向后兼容）；
+  - `AgentDisplayDiagnosticSuite` 升级为 `AAUDiagnosticSuite`（保留 `@Deprecated typealias` 向后兼容）。
+
+### 🌐 原生 CDP 风格网络嗅探与流量捕获子系统 (Native Network Capture)
+- **多态双模抓包引擎**：
+  - **Root eBPF 引擎**：在 Linux 内核 5.4+ (GKI) 上基于 Conscrypt/BoringSSL uprobe 挂载，实现 100% 零证书、零注入 HTTPS 明文捕获；内核态严格匹配 `targetUid`，保证宿主应用零干扰；内置 HTTP/1.1 与 HTTP/2 RFC 7541 HPACK 解析器；
+  - **非 Root 局部 VpnService 引擎**：基于 `addAllowedApplication(targetPackage)` 局部隔离，宿主应用完全旁路直连；内置 TUN 报文解码器（IPv4/IPv6/TCP/UDP/DNS/TLS SNI/HTTP）；
+- **客户端高层门面 `AgentNetworkManager`**：
+  - `CaptureMode.AUTO` 智能自适应调度与优雅降级；
+  - CDP 风格 API：`waitForResponse`（具备 200ms 防先发竞态时间窗口）、`requestFlow`、`responseFlow`、`onRequest` 与 `onResponse`；
+  - 深度集成 `DisplaySession` 与 Jetpack Lifecycle。
+
+---
+
 ## [0.1.0] - 2026-11-12
 
 ### 🎉 首个开源正式版本 (Initial Release)

@@ -19,7 +19,7 @@
 
 ## 3. 本地构建与测试流程
 
-AAU 为标准 Gradle 多模块工程，包含 `common`, `server`, `client`, `a11y`, `setup` 等模块：
+AAU 为标准 Gradle 多模块工程，包含 `aau-common`, `aau-server`, `aau-client`, `aau-a11y`, `aau-setup` 等模块：
 
 1. **环境依赖**：
    - JDK 17
@@ -43,7 +43,7 @@ AAU 为标准 Gradle 多模块工程，包含 `common`, `server`, `client`, `a11
 
 - **Kotlin 优先**：所有新功能模块强制使用 Kotlin 编写；
 - **架构解耦**：
-  - 核心契约与数据模型定义在 `agent-display-common` 中，保持 0 业务污染；
+  - 核心契约与数据模型定义在 `aau-common` 中，保持 0 业务污染；
   - 服务端逻辑（Shell UID 2000）与客户端 SDK 保持清晰边界，不得发生反向或循环依赖；
   - 严格保持向后兼容性与对 Android 12~15 各大 OEM 定制系统的降级容错。
 - **格式化**：遵循 `.editorconfig` 规范，提交前清理无用导入与尾部空格。

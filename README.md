@@ -63,7 +63,7 @@
 flowchart TD
     subgraph ClientProcess["接入方宿主 / Agent 进程 (UID ≥ 10000)"]
         Consumer["Third-Party AI Agent / LLM 调度器"]
-        Manager["AgentDisplayManager (连接池与总控)"]
+        Manager["AAUManager (连接池与总控)"]
         Display["AgentVirtualDisplay (虚拟屏句柄)"]
         Pipeline["DisplayFrameProcessor (ImageReader 双缓冲 / ≤10fps 限速)"]
         A11y["AgentA11yBridge (语义树与手势分发)"]
@@ -76,7 +76,7 @@ flowchart TD
         Display --> Pipeline
     end
 
-    subgraph CommonLayer["agent-display-common (协议与契约层)"]
+    subgraph CommonLayer["aau-common (协议与契约层)"]
         AIDL["IAgentShell.aidl (49 个高内聚原子原语)"]
         Models["DisplayConfig / DisplayGeometry / LaunchResult / AudioMode"]
     end
@@ -108,12 +108,12 @@ flowchart TD
 AAU 遵循严格的单向依赖与关注点分离原则：
 
 ```
-agent-display-kit (Root)
-  ├── agent-display-common    # [核心契约] AIDL 接口定义、Parcelable 数据模型、顶层 Kotlin API 外观
-  ├── agent-display-server    # [特权服务端] 运行在 UID 2000 的独立守护进程，产出独立 dex/jar
-  ├── agent-display-client    # [客户端 SDK] 接入方 Android Library，零拷贝直读管线与生命周期池
-  ├── agent-display-a11y      # [可选扩展] 基于 AccessibilityService 的语义树抽取与定向手势
-  └── agent-display-setup     # [特权引导] Shizuku / 无线调试 / Root 引导与全链路诊断套件
+aau-kit (Root)
+  ├── aau-common    # [核心契约] AIDL 接口定义、Parcelable 数据模型、顶层 Kotlin API 外观 (AAUManager)
+  ├── aau-server    # [特权服务端] 运行在 UID 2000 的独立守护进程，产出独立 dex/jar (aau-server.jar)
+  ├── aau-client    # [客户端 SDK] 接入方 Android Library，零拷贝直读管线与生命周期池、CDP 原生网络捕获
+  ├── aau-a11y      # [可选扩展] 基于 AccessibilityService 的语义树抽取与定向手势
+  └── aau-setup     # [特权引导] Shizuku / 无线调试 / Root 引导与全链路诊断套件 (AAUDiagnosticSuite)
 ```
 
 ---
@@ -143,12 +143,12 @@ agent-display-kit (Root)
 
 ```kotlin
 dependencies {
-    implementation("com.agent.display:agent-display-client:0.1.0")
-    implementation("com.agent.display:agent-display-common:0.1.0")
+    implementation("com.agent.use:aau-client:0.1.0")
+    implementation("com.agent.use:aau-common:0.1.0")
     
     // 可选：无障碍与引导套件
-    implementation("com.agent.display:agent-display-a11y:0.1.0")
-    implementation("com.agent.display:agent-display-setup:0.1.0")
+    implementation("com.agent.use:aau-a11y:0.1.0")
+    implementation("com.agent.use:aau-setup:0.1.0")
 }
 ```
 
@@ -156,7 +156,7 @@ dependencies {
 
 ```kotlin
 // 1. 初始化 Manager (支持 Binder 链接与断线监听)
-val manager = AgentDisplayManager.fromBinder(context, shellBinder)
+val manager = AAUManager.fromBinder(context, shellBinder)
 
 // 2. 创建一块标准 1080P 虚拟屏
 val display = manager.createVirtualDisplay(DisplayConfig.standard1080p())
@@ -207,10 +207,10 @@ val finishResult = display.finish(
 
 ## 七、环境诊断与自检
 
-框架内置了全面的自检引擎 `AgentDisplayDiagnosticSuite`，可一键评估设备兼容性：
+框架内置了全面的自检引擎 `AAUDiagnosticSuite`，可一键评估设备兼容性：
 
 ```kotlin
-val suite = AgentDisplayDiagnosticSuite(context, shell)
+val suite = AAUDiagnosticSuite(context, shell)
 val report = suite.runFullDiagnostics()
 
 // 打印自检结论
@@ -233,7 +233,7 @@ val json = report.desensitize().toJson()
 ### 2. 打包独立服务端 Jar / Dex
 ```bash
 ./gradlew packageServerDex
-# 输出路径: agent-display-server/build/outputs/agent-display-server.jar
+# 输出路径: aau-server/build/outputs/aau-server.jar
 ```
 
 ### 3. 运行全链路单元测试

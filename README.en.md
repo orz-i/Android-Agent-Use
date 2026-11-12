@@ -61,7 +61,7 @@ With the rise of Vision-Language Models (VLMs) and autonomous mobile agents, con
 flowchart TD
     subgraph ClientProcess["Client / Agent Process (UID ≥ 10000)"]
         Consumer["Third-Party AI Agent / LLM Orchestrator"]
-        Manager["AgentDisplayManager (Pool & Facade)"]
+        Manager["AAUManager (Pool & Facade)"]
         Display["AgentVirtualDisplay (Display Handle)"]
         Pipeline["DisplayFrameProcessor (ImageReader Buffer / ≤10fps Rate-limiting)"]
         A11y["AgentA11yBridge (Syntax Tree & Gestures)"]
@@ -74,7 +74,7 @@ flowchart TD
         Display --> Pipeline
     end
 
-    subgraph CommonLayer["agent-display-common (Contracts & Protocols)"]
+    subgraph CommonLayer["aau-common (Contracts & Protocols)"]
         AIDL["IAgentShell.aidl (49 Atomic Primitives)"]
         Models["DisplayConfig / DisplayGeometry / LaunchResult / AudioMode"]
     end
@@ -104,12 +104,12 @@ flowchart TD
 ## 4. Five Modular Components
 
 ```
-agent-display-kit (Root)
-  ├── agent-display-common    # Core contracts: AIDL definitions, Parcelables, top-level Kotlin API
-  ├── agent-display-server    # Shell UID 2000 standalone daemon, builds standalone dex/jar
-  ├── agent-display-client    # Android Library SDK, zero-copy ImageReader pipeline & lifecycle pool
-  ├── agent-display-a11y      # Optional accessibility extension for semantic tree dump & gestures
-  └── agent-display-setup     # Privilege activation (Shizuku/Wireless ADB/Root) & diagnostic suite
+aau-kit (Root)
+  ├── aau-common    # Core contracts: AIDL definitions, Parcelables, top-level Kotlin API (AAUManager)
+  ├── aau-server    # Shell UID 2000 standalone daemon, builds standalone dex/jar (aau-server.jar)
+  ├── aau-client    # Android Library SDK, zero-copy ImageReader pipeline, lifecycle pool & CDP network capture
+  ├── aau-a11y      # Optional accessibility extension for semantic tree dump & gestures
+  └── aau-setup     # Privilege activation (Shizuku/Wireless ADB/Root) & diagnostic suite (AAUDiagnosticSuite)
 ```
 
 ---
@@ -134,19 +134,19 @@ agent-display-kit (Root)
 ### Gradle Dependency
 ```kotlin
 dependencies {
-    implementation("com.agent.display:agent-display-client:0.1.0")
-    implementation("com.agent.display:agent-display-common:0.1.0")
+    implementation("com.agent.use:aau-client:0.1.0")
+    implementation("com.agent.use:aau-common:0.1.0")
     
     // Optional extensions
-    implementation("com.agent.display:agent-display-a11y:0.1.0")
-    implementation("com.agent.display:agent-display-setup:0.1.0")
+    implementation("com.agent.use:aau-a11y:0.1.0")
+    implementation("com.agent.use:aau-setup:0.1.0")
 }
 ```
 
 ### Virtual Display Lifecycle & Screen Capture
 ```kotlin
 // 1. Initialize manager
-val manager = AgentDisplayManager.fromBinder(context, shellBinder)
+val manager = AAUManager.fromBinder(context, shellBinder)
 
 // 2. Create standard 1080P virtual display
 val display = manager.createVirtualDisplay(DisplayConfig.standard1080p())
@@ -179,7 +179,7 @@ display.finish(keepPackages = listOf("com.example.targetapp"))
 ## 7. Diagnostics & Self-Check
 
 ```kotlin
-val suite = AgentDisplayDiagnosticSuite(context, shell)
+val suite = AAUDiagnosticSuite(context, shell)
 val report = suite.runFullDiagnostics()
 
 println("Overall Status: ${report.overallStatus}")
