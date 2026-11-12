@@ -8,6 +8,6 @@ plugins {
 // 顶级快捷任务：packageServerDex
 tasks.register("packageServerDex") {
     group = "build"
-    description = "Assembles standalone agent-display-server.jar and classes.dex"
-    dependsOn(":agent-display-server:packageServerDex")
+    description = "Assembles standalone aau-server.jar and classes.dex"
+    dependsOn(":aau-server:packageServerDex")
 }

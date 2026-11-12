@@ -14,8 +14,8 @@ dependencyResolutionManagement {
 }
 rootProject.name = "Android-Agent-Use"
 
-include(":agent-display-common")
-include(":agent-display-server")
-include(":agent-display-client")
-include(":agent-display-a11y")
-include(":agent-display-setup")
+include(":aau-common")
+include(":aau-server")
+include(":aau-client")
+include(":aau-a11y")
+include(":aau-setup")

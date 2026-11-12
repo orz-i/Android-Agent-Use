@@ -38,7 +38,7 @@ jobs:
         run: |
           mkdir -p dist
           find . -name "*.aar" -exec cp {} dist/ \;
-          find . -name "agent-display-server.jar" -exec cp {} dist/ \;
+          find . -name "aau-server.jar" -exec cp {} dist/ \;
           ls -la dist/
 
       - name: Create GitHub Release
