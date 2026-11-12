@@ -1,0 +1,4 @@
+<resources>
+    <string name="agent_a11y_service_label">Agent Display Accessibility Extension</string>
+    <string name="agent_a11y_service_description">Provides multi-display window inspection, semantic tree extraction, and gesture dispatching for Agent Virtual Displays.</string>
+</resources>
