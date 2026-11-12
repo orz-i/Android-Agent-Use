@@ -5,6 +5,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import com.agent.display.client.network.AgentNetworkManager
 import com.agent.display.common.DisplayConfig
 import com.agent.display.common.IAgentShell
 import java.io.Closeable
@@ -22,6 +23,7 @@ class DisplaySession(
     val awakeClient: DisplayAwakeClient,
     val conflictManager: MainScreenConflictManager,
     val audioManager: AgentAudioManager,
+    val networkManager: AgentNetworkManager? = null,
     private val onRelease: (AgentDisplay) -> Unit = { it.close() }
 ) : Closeable, AutoCloseable {
 
@@ -70,6 +72,7 @@ class DisplaySession(
             }
             awakeClient.stopKeepAwake(display.displayId)
             audioManager.close()
+            networkManager?.close()
             onRelease(display)
         }
     }
@@ -85,7 +88,8 @@ class DisplaySession(
             shell: IAgentShell,
             displayManager: DisplayManager,
             config: DisplayConfig = DisplayConfig.compact720p(),
-            pool: AgentDisplayPool? = null
+            pool: AgentDisplayPool? = null,
+            networkManager: AgentNetworkManager? = null
         ): DisplaySession {
             val display = pool?.acquire(config) ?: AgentDisplay(shell, config, displayManager)
             val awake = DisplayAwakeClient(shell)
@@ -97,6 +101,7 @@ class DisplaySession(
                 awakeClient = awake,
                 conflictManager = conflict,
                 audioManager = audio,
+                networkManager = networkManager,
                 onRelease = { disp ->
                     if (pool != null) {
                         pool.recycle(disp)
