@@ -91,6 +91,7 @@ struct tls_event_hdr {
     __u64 ssl_ptr;
     __u32 direction;
     __u32 length;
+    __u64 ts_ns;
 };
 
 struct tls_event {
@@ -153,7 +154,7 @@ static __inline __u32 match_target_uid(void) {
     return current_uid;
 }
 
-static __inline void emit_ssl_chunk(
+static __inline __attribute__((always_inline)) void emit_ssl_chunk(
     struct pt_regs *ctx,
     __u32 uid,
     __u64 ssl_ptr,
@@ -162,15 +163,6 @@ static __inline void emit_ssl_chunk(
     __u32 direction
 ) {
     if (len <= 0 || !buf_ptr) {
-        return;
-    }
-
-    __u32 copy_len = (__u32)len;
-    if (copy_len > MAX_DATA_CHUNK) {
-        copy_len = MAX_DATA_CHUNK;
-    }
-    copy_len &= MAX_DATA_CHUNK;
-    if (copy_len == 0) {
         return;
     }
 
@@ -185,18 +177,39 @@ static __inline void emit_ssl_chunk(
     ev->hdr.uid = uid;
     ev->hdr.ssl_ptr = ssl_ptr;
     ev->hdr.direction = direction;
-    ev->hdr.length = copy_len;
 
-    if (bpf_probe_read_user(ev->data, copy_len, buf_ptr) != 0) {
-        return;
-    }
+    __u32 total_len = (__u32)len;
+    __u32 offset = 0;
 
-    __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + copy_len;
-    emit_size &= 0x7FFFU;
-    if (emit_size <= sizeof(struct tls_event_hdr) || emit_size > sizeof(struct tls_event)) {
-        return;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (offset >= total_len) {
+            break;
+        }
+
+        __u32 remaining = total_len - offset;
+        __u32 copy_len = (remaining > MAX_DATA_CHUNK) ? MAX_DATA_CHUNK : remaining;
+        copy_len &= MAX_DATA_CHUNK;
+        if (copy_len == 0) {
+            break;
+        }
+
+        const void *src = (const void *)((const char *)buf_ptr + offset);
+        if (bpf_probe_read_user(ev->data, copy_len, src) != 0) {
+            break;
+        }
+
+        ev->hdr.length = copy_len;
+        ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+
+        __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + copy_len;
+        emit_size &= 0x7FFFU;
+        if (emit_size <= sizeof(struct tls_event_hdr) || emit_size > sizeof(struct tls_event)) {
+            break;
+        }
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+        offset += copy_len;
     }
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
 }
 
 SEC("uprobe/ssl_write")

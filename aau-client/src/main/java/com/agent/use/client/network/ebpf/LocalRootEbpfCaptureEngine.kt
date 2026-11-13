@@ -35,10 +35,22 @@ class LocalRootEbpfCaptureEngine(
     private val context: Context?,
     private val binaryPathResolver: () -> File? = { context?.let { resolveDefaultBinary(it) } },
     private val uidResolver: (String) -> Int = { pkg -> context?.let { resolveTargetUid(it, pkg) } ?: -1 },
-    private val processStarter: (binaryPath: String, uid: Int) -> Process = { binaryPath, uid ->
-        startHelperProcess(binaryPath, uid)
-    }
+    private val processStarter: ((binaryPath: String, uid: Int) -> Process)? = null
 ) : INetworkCapture.Stub() {
+
+    private var libDirResolver: (String) -> String? = { pkg -> context?.let { resolveNativeLibraryDir(it, pkg) } }
+    private var processStarterWithLib: ((binaryPath: String, uid: Int, libDir: String?) -> Process)? = null
+
+    constructor(
+        context: Context?,
+        binaryPathResolver: () -> File? = { context?.let { resolveDefaultBinary(it) } },
+        uidResolver: (String) -> Int = { pkg -> context?.let { resolveTargetUid(it, pkg) } ?: -1 },
+        libDirResolver: (String) -> String?,
+        processStarter: (binaryPath: String, uid: Int, libDir: String?) -> Process
+    ) : this(context, binaryPathResolver, uidResolver, null as ((String, Int) -> Process)?) {
+        this.libDirResolver = libDirResolver
+        this.processStarterWithLib = processStarter
+    }
 
     companion object {
         private const val TAG = "LocalRootEbpfEngine"
@@ -75,6 +87,25 @@ class LocalRootEbpfCaptureEngine(
             return null
         }
 
+        fun resolveNativeLibraryDir(context: Context, packageName: String): String? {
+            if (packageName.isBlank()) return null
+            return try {
+                val pm = context.packageManager
+                val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getApplicationInfo(
+                        packageName,
+                        PackageManager.ApplicationInfoFlags.of(PackageManager.MATCH_ALL.toLong())
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getApplicationInfo(packageName, 0)
+                }
+                appInfo.nativeLibraryDir
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
         fun resolveTargetUid(context: Context, packageName: String): Int {
             if (packageName.isBlank()) return -1
             return try {
@@ -101,18 +132,23 @@ class LocalRootEbpfCaptureEngine(
             return null
         }
 
-        fun startHelperProcess(binaryPath: String, uid: Int): Process {
+        @JvmOverloads
+        fun startHelperProcess(binaryPath: String, uid: Int, libDir: String? = null): Process {
             val isAlreadyRoot = try {
                 AndroidProcess.myUid() == 0
             } catch (_: Throwable) {
                 false
             }
+            val libArgs = if (!libDir.isNullOrBlank()) listOf("--lib-dir", libDir) else emptyList()
             return if (isAlreadyRoot) {
-                ProcessBuilder(binaryPath, "--uid", uid.toString()).start()
+                val cmd = mutableListOf(binaryPath, "--uid", uid.toString())
+                cmd.addAll(libArgs)
+                ProcessBuilder(cmd).start()
             } else {
                 val suPath = findSuBinary() ?: "su"
                 val safePath = binaryPath.replace("\"", "")
-                val cmd = "\"$safePath\" --uid $uid"
+                val extra = if (!libDir.isNullOrBlank()) " --lib-dir \"$libDir\"" else ""
+                val cmd = "\"$safePath\" --uid $uid$extra"
                 ProcessBuilder(suPath, "-c", cmd).start()
             }
         }
@@ -161,8 +197,13 @@ class LocalRootEbpfCaptureEngine(
         val streamParser = TlsStreamParser(config, listener)
         parser = streamParser
 
+        val libDir = libDirResolver(config.targetPackage)
         val process = try {
-            processStarter(binaryFile.absolutePath, targetUid)
+            when {
+                processStarterWithLib != null -> processStarterWithLib!!.invoke(binaryFile.absolutePath, targetUid, libDir)
+                processStarter != null -> processStarter.invoke(binaryFile.absolutePath, targetUid)
+                else -> startHelperProcess(binaryFile.absolutePath, targetUid, libDir)
+            }
         } catch (t: Throwable) {
             lastError = "ebpf_process_spawn_failed:${t.message}"
             parser = null

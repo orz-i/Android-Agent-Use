@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "aau_ebpf_bpf_blob.h"
@@ -28,9 +29,29 @@
 #define R_BPF_64_64 1
 #endif
 
+#define MAX_DATA_CHUNK 16383U
+#define MAX_ATTACHED_LIBS 16
+#define MAX_LIB_DIRS 16
+#define MAX_BATCH_EVENTS 512
+
 static volatile sig_atomic_t g_stop = 0;
 static char g_tracefs_dir[256] = {0};
 static char g_probe_prefix[64] = {0};
+static char g_lib_dirs[MAX_LIB_DIRS][512];
+static int g_lib_dir_count = 0;
+
+typedef struct {
+    char path[512];
+    dev_t dev;
+    ino_t ino;
+    uint64_t off_write;
+    uint64_t off_read;
+    int uprobe_fd_count;
+    int uprobe_fds[3 * 128];
+} attached_lib;
+
+static attached_lib g_attached_libs[MAX_ATTACHED_LIBS];
+static int g_attached_lib_count = 0;
 
 static void on_signal(int sig) {
     (void)sig;
@@ -185,92 +206,7 @@ static int resolve_elf_symbol_offset(const char *path, const char *sym_name, uin
     return rc;
 }
 
-static int find_libssl_path(uint32_t target_uid, const char *explicit_lib, char *out_path, size_t out_len) {
-    if (explicit_lib && explicit_lib[0] && file_exists_nonempty(explicit_lib)) {
-        uint64_t dummy = 0;
-        if (resolve_elf_symbol_offset(explicit_lib, "SSL_write", &dummy) == 0 &&
-            resolve_elf_symbol_offset(explicit_lib, "SSL_read", &dummy) == 0) {
-            snprintf(out_path, out_len, "%s", explicit_lib);
-            return 0;
-        }
-    }
 
-    // Check mapped libraries of any running process belonging to target_uid first
-    DIR *proc = opendir("/proc");
-    if (proc) {
-        struct dirent *de;
-        while ((de = readdir(proc)) != NULL) {
-            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-            char status_path[128];
-            snprintf(status_path, sizeof(status_path), "/proc/%s/status", de->d_name);
-            FILE *sf = fopen(status_path, "r");
-            if (!sf) continue;
-            char line[512];
-            uint32_t puid = 0;
-            int found_uid = 0;
-            while (fgets(line, sizeof(line), sf)) {
-                if (strncmp(line, "Uid:", 4) == 0) {
-                    if (sscanf(line + 4, "%u", &puid) == 1) found_uid = 1;
-                    break;
-                }
-            }
-            fclose(sf);
-            if (!found_uid || puid != target_uid) continue;
-
-            char maps_path[128];
-            snprintf(maps_path, sizeof(maps_path), "/proc/%s/maps", de->d_name);
-            FILE *mf = fopen(maps_path, "r");
-            if (!mf) continue;
-            while (fgets(line, sizeof(line), mf)) {
-                char *slash = strchr(line, '/');
-                if (!slash) continue;
-                size_t slen = strlen(slash);
-                while (slen > 0 && (slash[slen - 1] == '\n' || slash[slen - 1] == '\r')) {
-                    slash[--slen] = '\0';
-                }
-                if (strstr(slash, "libssl.so") && file_exists_nonempty(slash)) {
-                    uint64_t off_w = 0, off_r = 0;
-                    if (resolve_elf_symbol_offset(slash, "SSL_write", &off_w) == 0 &&
-                        resolve_elf_symbol_offset(slash, "SSL_read", &off_r) == 0) {
-                        snprintf(out_path, out_len, "%s", slash);
-                        fclose(mf);
-                        closedir(proc);
-                        return 0;
-                    }
-                }
-            }
-            fclose(mf);
-        }
-        closedir(proc);
-    }
-
-#if defined(__LP64__)
-    const char *defaults[] = {
-        "/apex/com.android.conscrypt/lib64/libssl.so",
-        "/system/lib64/libssl.so",
-        "/apex/com.android.conscrypt/lib/libssl.so",
-        "/system/lib/libssl.so",
-        NULL
-    };
-#else
-    const char *defaults[] = {
-        "/apex/com.android.conscrypt/lib/libssl.so",
-        "/system/lib/libssl.so",
-        NULL
-    };
-#endif
-
-    for (int i = 0; defaults[i]; i++) {
-        if (!file_exists_nonempty(defaults[i])) continue;
-        uint64_t off_w = 0, off_r = 0;
-        if (resolve_elf_symbol_offset(defaults[i], "SSL_write", &off_w) == 0 &&
-            resolve_elf_symbol_offset(defaults[i], "SSL_read", &off_r) == 0) {
-            snprintf(out_path, out_len, "%s", defaults[i]);
-            return 0;
-        }
-    }
-    return -1;
-}
 
 typedef struct {
     uint32_t type;
@@ -476,6 +412,12 @@ static void cleanup_tracefs_uprobes(void) {
         int n = snprintf(cmd, sizeof(cmd), "-:uprobes/%s_w\n-:uprobes/%s_rw\n-:uprobes/%s_rr\n",
                          g_probe_prefix, g_probe_prefix, g_probe_prefix);
         if (n > 0) write(fd, cmd, (size_t)n);
+
+        for (int i = 0; i < g_attached_lib_count && i < MAX_ATTACHED_LIBS; i++) {
+            n = snprintf(cmd, sizeof(cmd), "-:uprobes/%s_w_%d\n-:uprobes/%s_rw_%d\n-:uprobes/%s_rr_%d\n",
+                         g_probe_prefix, i, g_probe_prefix, i, g_probe_prefix, i);
+            if (n > 0) write(fd, cmd, (size_t)n);
+        }
         close(fd);
     }
 }
@@ -602,12 +544,157 @@ static int attach_uprobe_pmu_or_tracefs(
     return 0;
 }
 
+static int try_attach_library(const char *path, bpf_bundle *bundle, int num_cpus) {
+    if (!path || !path[0] || !file_exists_nonempty(path)) return -1;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) return -1;
+
+    for (int i = 0; i < g_attached_lib_count; i++) {
+        if ((g_attached_libs[i].dev == st.st_dev && g_attached_libs[i].ino == st.st_ino) ||
+            strcmp(g_attached_libs[i].path, path) == 0) {
+            return 0; // already attached
+        }
+    }
+
+    if (g_attached_lib_count >= MAX_ATTACHED_LIBS) {
+        return -1;
+    }
+
+    uint64_t off_write = 0, off_read = 0;
+    if (resolve_elf_symbol_offset(path, "SSL_write", &off_write) != 0 ||
+        resolve_elf_symbol_offset(path, "SSL_read", &off_read) != 0) {
+        return -1;
+    }
+
+    int idx = g_attached_lib_count;
+    char suf_w[32], suf_rw[32], suf_rr[32];
+    snprintf(suf_w, sizeof(suf_w), "w_%d", idx);
+    snprintf(suf_rw, sizeof(suf_rw), "rw_%d", idx);
+    snprintf(suf_rr, sizeof(suf_rr), "rr_%d", idx);
+
+    int fd_cnt = 0;
+    int rc1 = attach_uprobe_pmu_or_tracefs(path, off_write, 0, suf_w, bundle->prog_write_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt);
+    int rc2 = attach_uprobe_pmu_or_tracefs(path, off_read, 0, suf_rw, bundle->prog_read_enter_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt);
+    int rc3 = attach_uprobe_pmu_or_tracefs(path, off_read, 1, suf_rr, bundle->prog_read_exit_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt);
+
+    if (rc1 != 0 || rc2 != 0 || rc3 != 0) {
+        for (int k = 0; k < fd_cnt; k++) {
+            close(g_attached_libs[idx].uprobe_fds[k]);
+        }
+        return -1;
+    }
+
+    snprintf(g_attached_libs[idx].path, sizeof(g_attached_libs[idx].path), "%s", path);
+    g_attached_libs[idx].dev = st.st_dev;
+    g_attached_libs[idx].ino = st.st_ino;
+    g_attached_libs[idx].off_write = off_write;
+    g_attached_libs[idx].off_read = off_read;
+    g_attached_libs[idx].uprobe_fd_count = fd_cnt;
+    g_attached_lib_count++;
+
+    fprintf(stderr, "ATTACHED:%s\n", path);
+    fflush(stderr);
+    return 1;
+}
+
+static int scan_and_attach_lib_dirs(bpf_bundle *bundle, int num_cpus) {
+    int attached = 0;
+    for (int d = 0; d < g_lib_dir_count; d++) {
+        DIR *dir = opendir(g_lib_dirs[d]);
+        if (!dir) continue;
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 3 || strcmp(de->d_name + nlen - 3, ".so") != 0) continue;
+            char full_path[1024];
+            snprintf(full_path, sizeof(full_path), "%s/%s", g_lib_dirs[d], de->d_name);
+            if (try_attach_library(full_path, bundle, num_cpus) == 1) {
+                attached++;
+            }
+        }
+        closedir(dir);
+    }
+    return attached;
+}
+
+static int scan_and_attach_proc_maps(uint32_t target_uid, bpf_bundle *bundle, int num_cpus) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+    int attached = 0;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        char status_path[128];
+        snprintf(status_path, sizeof(status_path), "/proc/%s/status", de->d_name);
+        FILE *sf = fopen(status_path, "r");
+        if (!sf) continue;
+        char line[512];
+        uint32_t puid = 0;
+        int found_uid = 0;
+        while (fgets(line, sizeof(line), sf)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                if (sscanf(line + 4, "%u", &puid) == 1) found_uid = 1;
+                break;
+            }
+        }
+        fclose(sf);
+        if (!found_uid || puid != target_uid) continue;
+
+        char maps_path[128];
+        snprintf(maps_path, sizeof(maps_path), "/proc/%s/maps", de->d_name);
+        FILE *mf = fopen(maps_path, "r");
+        if (!mf) continue;
+        while (fgets(line, sizeof(line), mf)) {
+            char *slash = strchr(line, '/');
+            if (!slash) continue;
+            size_t slen = strlen(slash);
+            while (slen > 0 && (slash[slen - 1] == '\n' || slash[slen - 1] == '\r' || slash[slen - 1] == ' ')) {
+                slash[--slen] = '\0';
+            }
+            if (slen < 3 || strcmp(slash + slen - 3, ".so") != 0) continue;
+            if (try_attach_library(slash, bundle, num_cpus) == 1) {
+                attached++;
+            }
+        }
+        fclose(mf);
+    }
+    closedir(proc);
+    return attached;
+}
+
+static int scan_and_attach_defaults(bpf_bundle *bundle, int num_cpus) {
+#if defined(__LP64__)
+    const char *defaults[] = {
+        "/apex/com.android.conscrypt/lib64/libssl.so",
+        "/system/lib64/libssl.so",
+        "/apex/com.android.conscrypt/lib/libssl.so",
+        "/system/lib/libssl.so",
+        NULL
+    };
+#else
+    const char *defaults[] = {
+        "/apex/com.android.conscrypt/lib/libssl.so",
+        "/system/lib/libssl.so",
+        NULL
+    };
+#endif
+    int attached = 0;
+    for (int i = 0; defaults[i]; i++) {
+        if (try_attach_library(defaults[i], bundle, num_cpus) == 1) {
+            attached++;
+        }
+    }
+    return attached;
+}
+
 typedef struct {
     uint32_t pid;
     uint32_t uid;
     uint64_t ssl_ptr;
     uint32_t direction;
     uint32_t length;
+    uint64_t ts_ns;
 } __attribute__((packed)) bpf_tls_hdr;
 
 typedef struct {
@@ -625,6 +712,47 @@ typedef struct {
     size_t mmap_len;
     size_t data_size;
 } perf_ring;
+
+typedef struct {
+    bpf_tls_hdr hdr;
+    uint32_t payload_offset;
+} batch_event_meta;
+
+static batch_event_meta g_batch_metas[MAX_BATCH_EVENTS];
+static uint8_t *g_batch_payload_pool = NULL;
+static size_t g_batch_payload_pool_cap = 4 * 1024 * 1024;
+static size_t g_batch_payload_pool_len = 0;
+static int g_batch_count = 0;
+
+static int compare_batch_events(const void *a, const void *b) {
+    const batch_event_meta *ea = (const batch_event_meta *)a;
+    const batch_event_meta *eb = (const batch_event_meta *)b;
+    if (ea->hdr.ts_ns < eb->hdr.ts_ns) return -1;
+    if (ea->hdr.ts_ns > eb->hdr.ts_ns) return 1;
+    return 0;
+}
+
+static void flush_event_batch(void) {
+    if (g_batch_count <= 0) return;
+    if (g_batch_count > 1) {
+        qsort(g_batch_metas, (size_t)g_batch_count, sizeof(batch_event_meta), compare_batch_events);
+    }
+    for (int i = 0; i < g_batch_count; i++) {
+        wire_tls_hdr wh;
+        wh.magic = 0x45554141U; // "AAUE" little-endian
+        wh.pid = g_batch_metas[i].hdr.pid;
+        wh.uid = g_batch_metas[i].hdr.uid;
+        wh.direction = g_batch_metas[i].hdr.direction;
+        wh.length = g_batch_metas[i].hdr.length;
+        wh.ssl_ptr = g_batch_metas[i].hdr.ssl_ptr;
+        fwrite(&wh, 1, sizeof(wh), stdout);
+        if (wh.length > 0 && g_batch_payload_pool) {
+            fwrite(g_batch_payload_pool + g_batch_metas[i].payload_offset, 1, wh.length, stdout);
+        }
+    }
+    g_batch_count = 0;
+    g_batch_payload_pool_len = 0;
+}
 
 static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch, size_t scratch_cap) {
     struct perf_event_mmap_page *meta = (struct perf_event_mmap_page *)ring->base;
@@ -664,15 +792,18 @@ static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch,
                     bpf_tls_hdr bh;
                     memcpy(&bh, sample, sizeof(bh));
                     if (bh.length > 0 && sizeof(bh) + bh.length <= raw_size) {
-                        wire_tls_hdr wh;
-                        wh.magic = 0x45554141U; // "AAUE" little-endian bytes 'A','A','U','E'
-                        wh.pid = bh.pid;
-                        wh.uid = bh.uid;
-                        wh.direction = bh.direction;
-                        wh.length = bh.length;
-                        wh.ssl_ptr = bh.ssl_ptr;
-                        fwrite(&wh, 1, sizeof(wh), stdout);
-                        fwrite(sample + sizeof(bh), 1, bh.length, stdout);
+                        if (g_batch_count >= MAX_BATCH_EVENTS ||
+                            g_batch_payload_pool_len + bh.length > g_batch_payload_pool_cap) {
+                            flush_event_batch();
+                        }
+                        if (g_batch_payload_pool &&
+                            g_batch_payload_pool_len + bh.length <= g_batch_payload_pool_cap) {
+                            g_batch_metas[g_batch_count].hdr = bh;
+                            g_batch_metas[g_batch_count].payload_offset = (uint32_t)g_batch_payload_pool_len;
+                            memcpy(g_batch_payload_pool + g_batch_payload_pool_len, sample + sizeof(bh), bh.length);
+                            g_batch_payload_pool_len += bh.length;
+                            g_batch_count++;
+                        }
                     }
                 }
             }
@@ -692,6 +823,11 @@ int main(int argc, char **argv) {
             target_uid = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
             explicit_lib = argv[++i];
+        } else if (strcmp(argv[i], "--lib-dir") == 0 && i + 1 < argc) {
+            const char *ld = argv[++i];
+            if (g_lib_dir_count < MAX_LIB_DIRS) {
+                snprintf(g_lib_dirs[g_lib_dir_count++], sizeof(g_lib_dirs[0]), "%s", ld);
+            }
         }
     }
 
@@ -706,19 +842,6 @@ int main(int argc, char **argv) {
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 
     snprintf(g_probe_prefix, sizeof(g_probe_prefix), "aau_%d", getpid());
-
-    char lib_path[512] = {0};
-    if (find_libssl_path(target_uid, explicit_lib, lib_path, sizeof(lib_path)) != 0) {
-        fprintf(stderr, "ERR:libssl_not_found\n");
-        return 3;
-    }
-
-    uint64_t off_write = 0, off_read = 0;
-    if (resolve_elf_symbol_offset(lib_path, "SSL_write", &off_write) != 0 ||
-        resolve_elf_symbol_offset(lib_path, "SSL_read", &off_read) != 0) {
-        fprintf(stderr, "ERR:ssl_symbols_not_found(%s)\n", lib_path);
-        return 4;
-    }
 
     int num_cpus = (int)sysconf(_SC_NPROCESSORS_CONF);
     if (num_cpus <= 0) num_cpus = 1;
@@ -750,8 +873,6 @@ int main(int argc, char **argv) {
 
     perf_ring *rings = (perf_ring *)calloc((size_t)num_cpus, sizeof(perf_ring));
     struct pollfd *pfds = (struct pollfd *)calloc((size_t)num_cpus + 1, sizeof(struct pollfd));
-    int *uprobe_fds = (int *)calloc((size_t)(num_cpus * 3 + 4), sizeof(int));
-    int uprobe_fd_count = 0;
 
     for (int cpu = 0; cpu < num_cpus; cpu++) {
         struct perf_event_attr attr;
@@ -799,19 +920,26 @@ int main(int argc, char **argv) {
     pfds[num_cpus].fd = STDIN_FILENO;
     pfds[num_cpus].events = POLLHUP | POLLERR;
 
-    if (attach_uprobe_pmu_or_tracefs(lib_path, off_write, 0, "w", bundle.prog_write_fd, num_cpus, uprobe_fds, &uprobe_fd_count) != 0 ||
-        attach_uprobe_pmu_or_tracefs(lib_path, off_read, 0, "rw", bundle.prog_read_enter_fd, num_cpus, uprobe_fds, &uprobe_fd_count) != 0 ||
-        attach_uprobe_pmu_or_tracefs(lib_path, off_read, 1, "rr", bundle.prog_read_exit_fd, num_cpus, uprobe_fds, &uprobe_fd_count) != 0) {
-        cleanup_tracefs_uprobes();
-        return 10;
+    if (explicit_lib && explicit_lib[0]) {
+        try_attach_library(explicit_lib, &bundle, num_cpus);
+    }
+    scan_and_attach_lib_dirs(&bundle, num_cpus);
+    scan_and_attach_proc_maps(target_uid, &bundle, num_cpus);
+    scan_and_attach_defaults(&bundle, num_cpus);
+
+    if (g_attached_lib_count == 0) {
+        fprintf(stderr, "ERR:libssl_not_found\n");
+        return 3;
     }
 
     // Signal readiness to Java parent
-    fprintf(stderr, "READY:%s\n", lib_path);
+    fprintf(stderr, "READY:%s\n", g_attached_libs[0].path);
     fflush(stderr);
 
-    size_t scratch_cap = 32768;
+    g_batch_payload_pool = (uint8_t *)malloc(g_batch_payload_pool_cap);
+    size_t scratch_cap = 65536;
     uint8_t *scratch = (uint8_t *)malloc(scratch_cap);
+    time_t last_rescan = time(NULL);
 
     while (!g_stop) {
         int pr = poll(pfds, (nfds_t)(num_cpus + 1), 250);
@@ -830,12 +958,23 @@ int main(int argc, char **argv) {
             }
         }
         if (had_data) {
+            flush_event_batch();
             fflush(stdout);
+        }
+
+        // Periodic hot-rescan of /proc/<pid>/maps every 2 seconds for lazy dlopen
+        time_t now = time(NULL);
+        if (now - last_rescan >= 2) {
+            last_rescan = now;
+            scan_and_attach_proc_maps(target_uid, &bundle, num_cpus);
         }
     }
 
-    for (int i = 0; i < uprobe_fd_count; i++) {
-        close(uprobe_fds[i]);
+    for (int i = 0; i < g_attached_lib_count; i++) {
+        for (int k = 0; k < g_attached_libs[i].uprobe_fd_count; k++) {
+            close(g_attached_libs[i].uprobe_fds[k]);
+        }
+        g_attached_libs[i].uprobe_fd_count = 0;
     }
     for (int cpu = 0; cpu < num_cpus; cpu++) {
         munmap(rings[cpu].base, rings[cpu].mmap_len);
@@ -843,7 +982,10 @@ int main(int argc, char **argv) {
     }
     cleanup_tracefs_uprobes();
     free(scratch);
-    free(uprobe_fds);
+    if (g_batch_payload_pool) {
+        free(g_batch_payload_pool);
+        g_batch_payload_pool = NULL;
+    }
     free(pfds);
     free(rings);
     return 0;
