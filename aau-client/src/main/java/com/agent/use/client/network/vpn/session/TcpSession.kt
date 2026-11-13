@@ -26,7 +26,8 @@ data class TcpConnectionKey(
  */
 class TcpSession(
     val key: TcpConnectionKey,
-    val startTimeMs: Long = System.currentTimeMillis()
+    val startTimeMs: Long = System.currentTimeMillis(),
+    var destinationHostHint: String? = null
 ) {
     @Volatile
     var lastActiveTimeMs: Long = startTimeMs
@@ -36,6 +37,9 @@ class TcpSession(
 
     @Volatile
     var isTls: Boolean = false
+
+    @Volatile
+    var isHttp2: Boolean = false
 
     @Volatile
     var activeRequestId: String? = null
@@ -68,8 +72,9 @@ class TcpSession(
                     sniDomain = clientHello.sni
                     val reqId = "vpn_tls_${UUID.randomUUID().toString().substring(0, 8)}"
                     activeRequestId = reqId
-                    val host = sniDomain ?: key.serverIp
-                    val url = "https://$host:${key.serverPort}/"
+                    val host = sniDomain ?: destinationHostHint ?: key.serverIp
+                    val portSuffix = if (key.serverPort == 443) "" else ":${key.serverPort}"
+                    val url = "https://$host$portSuffix/"
                     activeRequestUrl = url
                     return UplinkParseResult.TlsHandshake(
                         requestId = reqId,
@@ -77,6 +82,22 @@ class TcpSession(
                         url = url
                     )
                 }
+            }
+
+            // 2. 检查是否为明文 HTTP/2 Client Preface (h2c)
+            if (!isTls && !isHttp2 && isHttp2ClientPreface(payload)) {
+                isHttp2 = true
+                val reqId = "vpn_h2_${UUID.randomUUID().toString().substring(0, 8)}"
+                activeRequestId = reqId
+                val host = destinationHostHint ?: key.serverIp
+                val portSuffix = if (key.serverPort == 80) "" else ":${key.serverPort}"
+                val url = "http://$host$portSuffix/"
+                activeRequestUrl = url
+                return UplinkParseResult.Http2Preface(
+                    requestId = reqId,
+                    url = url,
+                    host = host
+                )
             }
 
             // 2. HTTP 明文请求重组与解析
@@ -262,6 +283,15 @@ class TcpSession(
         }
     }
 
+    private fun isHttp2ClientPreface(payload: ByteArray): Boolean {
+        val preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray(Charsets.US_ASCII)
+        if (payload.size < preface.size) return false
+        for (i in preface.indices) {
+            if (payload[i] != preface[i]) return false
+        }
+        return true
+    }
+
     /**
      * 重置会话流缓冲区。
      */
@@ -272,6 +302,7 @@ class TcpSession(
             activeRequestId = null
             activeRequestUrl = null
             activeRequestMethod = null
+            isHttp2 = false
         }
     }
 }
@@ -280,6 +311,7 @@ sealed class UplinkParseResult {
     object None : UplinkParseResult()
     data class TlsHandshake(val requestId: String, val sni: String?, val url: String) : UplinkParseResult()
     data class HttpRequest(val requestId: String, val data: HttpRequestData) : UplinkParseResult()
+    data class Http2Preface(val requestId: String, val url: String, val host: String) : UplinkParseResult()
 }
 
 sealed class DownlinkParseResult {

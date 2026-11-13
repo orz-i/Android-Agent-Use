@@ -568,8 +568,8 @@ class VpnTunForwarder(
             payload = data,
             payloadLen = data.size
         )
-        packetProcessor?.processPacket(respPkt, respPkt.size)
         emitToTun(respPkt, respPkt.size)
+        packetProcessor?.processPacket(respPkt, respPkt.size)
     }
 
     private fun processOutboundTcp(
@@ -751,8 +751,8 @@ class VpnTunForwarder(
                             payloadLen = segLen
                         )
                         session.serverSeq = (session.serverSeq + segLen.toLong()) and 0xFFFFFFFFL
-                        packetProcessor?.processPacket(tcpPkt, tcpPkt.size)
                         emitToTun(tcpPkt, tcpPkt.size)
+                        packetProcessor?.processPacket(tcpPkt, tcpPkt.size)
                         off += segLen
                     }
                 } else if (n < 0) {
@@ -768,8 +768,8 @@ class VpnTunForwarder(
                             flags = TCP_FLAG_FIN or TCP_FLAG_ACK
                         )
                         session.serverSeq = (session.serverSeq + 1L) and 0xFFFFFFFFL
-                        packetProcessor?.processPacket(finPkt, finPkt.size)
                         emitToTun(finPkt, finPkt.size)
+                        packetProcessor?.processPacket(finPkt, finPkt.size)
                     }
                     // Stop monitoring OP_READ once server EOF is sent
                     if (sk.isValid) {

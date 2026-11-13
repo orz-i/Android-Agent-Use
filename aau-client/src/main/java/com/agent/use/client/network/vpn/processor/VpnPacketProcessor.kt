@@ -81,10 +81,11 @@ class VpnPacketProcessor(
         val srcPort = tcpPacket.srcPort
         val dstIp = ipPacket.dstAddress
         val dstPort = tcpPacket.dstPort
+        val hostHint = dnsCache.getDomain(dstIp)
 
         // 1. 握手与终止管理
         if (tcpPacket.isSyn && !tcpPacket.isAck) {
-            sessionTracker.getOrCreateSession(srcIp, srcPort, dstIp, dstPort)
+            sessionTracker.getOrCreateSession(srcIp, srcPort, dstIp, dstPort, hostHint)
             return
         }
 
@@ -116,7 +117,10 @@ class VpnPacketProcessor(
 
         // 2. 查找所属会话
         val sessionPair = sessionTracker.findSession(srcIp, srcPort, dstIp, dstPort)
-        val session = sessionPair?.first ?: sessionTracker.getOrCreateSession(srcIp, srcPort, dstIp, dstPort)
+        val session = sessionPair?.first ?: sessionTracker.getOrCreateSession(srcIp, srcPort, dstIp, dstPort, hostHint)
+        if (session.destinationHostHint == null && hostHint != null) {
+            session.destinationHostHint = hostHint
+        }
         val isUplink = sessionPair?.second ?: true
 
         if (isUplink) {
@@ -135,8 +139,12 @@ class VpnPacketProcessor(
         val result = session.appendUplink(payload, config.maxBodySizeBytes)
         when (result) {
             is UplinkParseResult.TlsHandshake -> {
-                // 嗅探到 TLS Client Hello 握手报文，提取 SNI 域名
-                val host = result.sni ?: dnsCache.getDomain(ipPacket.dstAddress) ?: ipPacket.dstAddress
+                // 嗅探到 TLS Client Hello 握手报文，提取 SNI 域名或根据 DNS/IP 反查
+                val host = result.sni
+                    ?: session.destinationHostHint
+                    ?: dnsCache.getDomain(ipPacket.dstAddress)
+                    ?: ipPacket.dstAddress
+                session.sniDomain = host
                 val portSuffix = if (tcpPacket.dstPort == 443) "" else ":${tcpPacket.dstPort}"
                 val url = "https://$host$portSuffix/"
                 session.activeRequestUrl = url
@@ -160,14 +168,22 @@ class VpnPacketProcessor(
             is UplinkParseResult.HttpRequest -> {
                 // 嗅探到 HTTP/1.x 请求
                 val req = result.data
-                val host = req.headers.getIgnoreCase("Host")
+                val rawHost = req.headers.getIgnoreCase("Host")
+                    ?: session.destinationHostHint
                     ?: dnsCache.getDomain(ipPacket.dstAddress)
                     ?: ipPacket.dstAddress
-                val portSuffix = if (tcpPacket.dstPort == 80) "" else ":${tcpPacket.dstPort}"
+                val host = if (rawHost.contains(":")) rawHost.substringBefore(":") else rawHost
+                val port = if (rawHost.contains(":")) {
+                    rawHost.substringAfter(":").toIntOrNull() ?: tcpPacket.dstPort
+                } else {
+                    tcpPacket.dstPort
+                }
+                val portSuffix = if (port == 80) "" else ":$port"
+                val uriPath = if (req.uri.startsWith("/")) req.uri else "/${req.uri}"
                 val url = if (req.uri.startsWith("http://") || req.uri.startsWith("https://")) {
                     req.uri
                 } else {
-                    "http://$host$portSuffix${req.uri}"
+                    "http://$host$portSuffix$uriPath"
                 }
                 session.activeRequestUrl = url
 
@@ -187,6 +203,31 @@ class VpnPacketProcessor(
                         method = req.method,
                         headers = req.headers,
                         postData = postDataText,
+                        isTls = false
+                    )
+                    safeDispatch { listener.onRequestWillBeSent(requestEvent) }
+                }
+            }
+            is UplinkParseResult.Http2Preface -> {
+                // 嗅探到明文 HTTP/2 Client Preface
+                val host = session.destinationHostHint
+                    ?: dnsCache.getDomain(ipPacket.dstAddress)
+                    ?: ipPacket.dstAddress
+                val portSuffix = if (tcpPacket.dstPort == 80) "" else ":${tcpPacket.dstPort}"
+                val url = "http://$host$portSuffix/"
+                session.activeRequestUrl = url
+
+                if (config.matchesUrl(url)) {
+                    val requestEvent = HttpRequestEvent(
+                        requestId = result.requestId,
+                        timestamp = System.currentTimeMillis(),
+                        url = url,
+                        method = "PRI",
+                        headers = listOf(
+                            HttpHeader("Host", host),
+                            HttpHeader("X-Capture-Mode", "VpnService-H2C")
+                        ),
+                        postData = null,
                         isTls = false
                     )
                     safeDispatch { listener.onRequestWillBeSent(requestEvent) }
@@ -217,8 +258,12 @@ class VpnPacketProcessor(
         result: DownlinkParseResult.HttpResponse
     ) {
         val resp = result.data
-        val url = session.activeRequestUrl
-            ?: "http://${dnsCache.getDomain(ipPacket.srcAddress) ?: ipPacket.srcAddress}:${tcpPacket.srcPort}/"
+        val fallbackHost = dnsCache.getDomain(ipPacket.srcAddress)
+            ?: session.destinationHostHint
+            ?: session.sniDomain
+            ?: ipPacket.srcAddress
+        val fallbackPortSuffix = if (tcpPacket.srcPort == 80) "" else ":${tcpPacket.srcPort}"
+        val url = session.activeRequestUrl ?: "http://$fallbackHost$fallbackPortSuffix/"
 
         if (config.matchesUrl(url)) {
             if (resp.body.isNotEmpty()) {

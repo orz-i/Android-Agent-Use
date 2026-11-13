@@ -19,14 +19,19 @@ class TcpSessionTracker(
         clientIp: String,
         clientPort: Int,
         serverIp: String,
-        serverPort: Int
+        serverPort: Int,
+        hostHint: String? = null
     ): TcpSession {
         val key = TcpConnectionKey(clientIp, clientPort, serverIp, serverPort)
         return sessions.computeIfAbsent(key) {
             if (sessions.size >= maxSessions) {
                 cleanupExpired(30_000L)
             }
-            TcpSession(key)
+            TcpSession(key, destinationHostHint = hostHint)
+        }.apply {
+            if (destinationHostHint == null && hostHint != null) {
+                destinationHostHint = hostHint
+            }
         }
     }
 

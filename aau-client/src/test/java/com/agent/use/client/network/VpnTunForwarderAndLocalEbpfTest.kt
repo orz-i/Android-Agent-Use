@@ -214,10 +214,15 @@ class VpnTunForwarderAndLocalEbpfTest {
             assertEquals("""{"hello":"vpn_nat"}""", String(cachedBody!!, StandardCharsets.UTF_8))
 
             // Confirm at least one response data packet was actually written back to TUN
-            val tunHasHttpBody = finOrBodyPackets.any { pkt ->
-                val ip = IpPacket.parse(pkt)
-                val tcp = ip?.let { TcpPacket.parse(it) }
-                tcp != null && tcp.getPayload().toString(StandardCharsets.UTF_8).contains("vpn_nat")
+            var tunHasHttpBody = false
+            for (i in 0 until 20) {
+                tunHasHttpBody = finOrBodyPackets.any { pkt ->
+                    val ip = IpPacket.parse(pkt)
+                    val tcp = ip?.let { TcpPacket.parse(it) }
+                    tcp != null && tcp.getPayload().toString(StandardCharsets.UTF_8).contains("vpn_nat")
+                }
+                if (tunHasHttpBody) break
+                Thread.sleep(50)
             }
             assertTrue("TUN output must contain forwarded HTTP response segment", tunHasHttpBody)
         } finally {

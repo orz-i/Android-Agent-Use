@@ -1,5 +1,7 @@
 package com.agent.use.client.network.vpn.session
 
+import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -9,23 +11,26 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class DnsSessionCache(private val maxEntries: Int = 1000) {
 
-    private val ipToDomainMap = ConcurrentHashMap<String, String>()
+    // 采用 LRU 访问排序，保证热点域名的 IP 映射始终被优先保留
+    private val ipToDomainMap = Collections.synchronizedMap(
+        object : LinkedHashMap<String, String>(128, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+                return size > maxEntries
+            }
+        }
+    )
+
     private val domainToIpMap = ConcurrentHashMap<String, String>()
 
     /**
      * 记录一条 DNS 解析映射。
      */
     fun record(ip: String, domain: String) {
-        if (ipToDomainMap.size >= maxEntries) {
-            // 简单清理以防无界膨胀
-            val keyToRemove = ipToDomainMap.keys().toList().firstOrNull()
-            if (keyToRemove != null) {
-                val dom = ipToDomainMap.remove(keyToRemove)
-                if (dom != null) domainToIpMap.remove(dom)
-            }
-        }
-        ipToDomainMap[ip] = domain
-        domainToIpMap[domain] = ip
+        val cleanDomain = domain.trimEnd('.')
+        if (cleanDomain.isEmpty()) return
+
+        ipToDomainMap[ip] = cleanDomain
+        domainToIpMap[cleanDomain] = ip
     }
 
     /**
@@ -36,7 +41,12 @@ class DnsSessionCache(private val maxEntries: Int = 1000) {
     /**
      * 根据域名查找对应的 IP 地址。
      */
-    fun getIp(domain: String): String? = domainToIpMap[domain]
+    fun getIp(domain: String): String? = domainToIpMap[domain.trimEnd('.')]
+
+    /**
+     * 当前缓存条目数。
+     */
+    val size: Int get() = ipToDomainMap.size
 
     /**
      * 清空缓存。

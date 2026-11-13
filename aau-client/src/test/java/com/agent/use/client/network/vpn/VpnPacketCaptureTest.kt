@@ -441,6 +441,122 @@ class VpnPacketCaptureTest {
     }
 
     // ==========================================
+    // 12. DNS 关联与 Host Hint 传播测试 (消除 localhost)
+    // ==========================================
+
+    @Test
+    fun testDnsAssociationAndHostHintPropagationWithoutSni() {
+        val capturedRequests = mutableListOf<HttpRequestEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(request: HttpRequestEvent) {
+                capturedRequests.add(request)
+            }
+            override fun onResponseReceived(response: HttpResponseEvent) {}
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, errorMsg: String) {}
+        }
+
+        val config = NetworkCaptureConfig(targetPackage = "com.xingin.xhs")
+        val processor = VpnPacketProcessor(config = config, listener = listener)
+
+        // 1. 模拟 DNS 解析 110.242.68.66 -> api.xiaohongshu.com
+        val dnsResp = buildDnsResponse(0x7788, "api.xiaohongshu.com", "110.242.68.66")
+        val udpDns = buildUdpDatagram(53, 52100, dnsResp)
+        val ipDns = buildIpv4Packet("8.8.8.8", "10.0.0.2", IpPacket.PROTOCOL_UDP, udpDns)
+        processor.processPacket(ipDns, ipDns.size)
+        assertEquals("api.xiaohongshu.com", processor.dnsCache.getDomain("110.242.68.66"))
+
+        // 2. 模拟客户端发送无 SNI 的 TLS ClientHello 到 110.242.68.66:443
+        val tlsNoSni = buildTlsClientHelloWithoutSni()
+        val tcpTls = buildTcpSegment(52101, 443, 100L, 0L, TcpPacket.FLAG_PSH or TcpPacket.FLAG_ACK, tlsNoSni)
+        val ipTls = buildIpv4Packet("10.0.0.2", "110.242.68.66", IpPacket.PROTOCOL_TCP, tcpTls)
+        processor.processPacket(ipTls, ipTls.size)
+
+        assertEquals(1, capturedRequests.size)
+        val tlsReq = capturedRequests[0]
+        assertEquals("CONNECT", tlsReq.method)
+        // 必须优先使用从 DNS 继承的 HostHint，绝不能变成 https://localhost/ 或纯 IP
+        assertEquals("https://api.xiaohongshu.com/", tlsReq.url)
+        assertTrue(tlsReq.isTls)
+    }
+
+    // ==========================================
+    // 13. HTTP Host 带端口及 HTTP/2 Preface 识别测试
+    // ==========================================
+
+    @Test
+    fun testHttpHostWithPortAndHttp2PrefaceRecognition() {
+        val capturedRequests = mutableListOf<HttpRequestEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(request: HttpRequestEvent) {
+                capturedRequests.add(request)
+            }
+            override fun onResponseReceived(response: HttpResponseEvent) {}
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, errorMsg: String) {}
+        }
+
+        val config = NetworkCaptureConfig(targetPackage = "com.xingin.xhs")
+        val processor = VpnPacketProcessor(config = config, listener = listener)
+
+        // 0. 先模拟 DNS 解析绑定 110.242.68.66 -> api.xiaohongshu.com
+        val dnsResp = buildDnsResponse(0x9988, "api.xiaohongshu.com", "110.242.68.66")
+        val udpDns = buildUdpDatagram(53, 53000, dnsResp)
+        val ipDns = buildIpv4Packet("8.8.8.8", "10.0.0.2", IpPacket.PROTOCOL_UDP, udpDns)
+        processor.processPacket(ipDns, ipDns.size)
+
+        // 1. 发送带有端口的 Host 头 (api.xiaohongshu.com:8080) 到 8080 端口
+        val rawHttpWithPort = "GET /api/v1/feed HTTP/1.1\r\nHost: api.xiaohongshu.com:8080\r\n\r\n".toByteArray()
+        val tcpReqWithPort = buildTcpSegment(53001, 8080, 10L, 0L, TcpPacket.FLAG_PSH or TcpPacket.FLAG_ACK, rawHttpWithPort)
+        val ipReqWithPort = buildIpv4Packet("10.0.0.2", "110.242.68.66", IpPacket.PROTOCOL_TCP, tcpReqWithPort)
+        processor.processPacket(ipReqWithPort, ipReqWithPort.size)
+
+        assertEquals(1, capturedRequests.size)
+        // 绝不应该出现 :8080:8080 重复端口
+        assertEquals("http://api.xiaohongshu.com:8080/api/v1/feed", capturedRequests[0].url)
+
+        // 2. 发送 HTTP/2 Client Preface
+        val h2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray(Charsets.US_ASCII)
+        val tcpH2 = buildTcpSegment(53002, 80, 1L, 0L, TcpPacket.FLAG_PSH or TcpPacket.FLAG_ACK, h2Preface)
+        val ipH2 = buildIpv4Packet("10.0.0.2", "110.242.68.66", IpPacket.PROTOCOL_TCP, tcpH2)
+        processor.processPacket(ipH2, ipH2.size)
+
+        assertEquals(2, capturedRequests.size)
+        val h2Req = capturedRequests[1]
+        assertEquals("PRI", h2Req.method)
+        assertEquals("http://api.xiaohongshu.com/", h2Req.url)
+        assertTrue(h2Req.headers.any { it.name == "X-Capture-Mode" && it.value == "VpnService-H2C" })
+    }
+
+    // ==========================================
+    // 14. QUIC (UDP 443) ICMP Port Unreachable 测试
+    // ==========================================
+
+    @Test
+    fun testQuicUdp443IcmpPortUnreachable() {
+        val quicPayload = ByteArray(64) { 0x42 }
+        val udpQuic = buildUdpDatagram(49999, 443, quicPayload)
+        val ipQuic = buildIpv4Packet("10.0.0.2", "142.250.190.46", IpPacket.PROTOCOL_UDP, udpQuic)
+
+        val icmpPkt = VpnTunForwarder.buildIpv4IcmpPortUnreachable(ipQuic, ipQuic.size)
+        assertNotNull(icmpPkt)
+
+        val parsedIp = IpPacket.parse(icmpPkt!!, 0, icmpPkt.size)
+        assertNotNull(parsedIp)
+        assertEquals(4, parsedIp!!.version)
+        assertEquals(IpPacket.PROTOCOL_ICMP, parsedIp.protocol)
+        // 源地址与目的地址对调
+        assertEquals("142.250.190.46", parsedIp.srcAddress)
+        assertEquals("10.0.0.2", parsedIp.dstAddress)
+
+        // ICMP Type 3, Code 3
+        val icmpType = icmpPkt[20].toInt() and 0xFF
+        val icmpCode = icmpPkt[21].toInt() and 0xFF
+        assertEquals(3, icmpType) // Destination Unreachable
+        assertEquals(3, icmpCode) // Port Unreachable
+    }
+
+    // ==========================================
     // 辅助合成数据包函数
     // ==========================================
 
@@ -568,6 +684,43 @@ class VpnPacketCaptureTest {
             write((extensionsData.size ushr 8) and 0xFF)
             write(extensionsData.size and 0xFF)
             write(extensionsData)
+        }.toByteArray()
+
+        val handshakeLen = clientHelloBody.size
+        val handshakeRecord = ByteArrayOutputStream().apply {
+            write(0x01) // Client Hello
+            write((handshakeLen ushr 16) and 0xFF)
+            write((handshakeLen ushr 8) and 0xFF)
+            write(handshakeLen and 0xFF)
+            write(clientHelloBody)
+        }.toByteArray()
+
+        val tlsRecord = ByteArrayOutputStream().apply {
+            write(0x16) // Handshake
+            write(0x03) // TLS 1.0 record version
+            write(0x01)
+            write((handshakeRecord.size ushr 8) and 0xFF)
+            write(handshakeRecord.size and 0xFF)
+            write(handshakeRecord)
+        }.toByteArray()
+
+        return tlsRecord
+    }
+
+    private fun buildTlsClientHelloWithoutSni(): ByteArray {
+        val clientHelloBody = ByteArrayOutputStream().apply {
+            write(0x03) // Version 0x0303
+            write(0x03)
+            write(ByteArray(32)) // Random
+            write(0) // Session ID length
+            write(0x00) // Cipher Suites length = 2
+            write(0x02)
+            write(0x13)
+            write(0x01)
+            write(0x01) // Compression length = 1
+            write(0x00)
+            write(0x00) // Extensions length = 0
+            write(0x00)
         }.toByteArray()
 
         val handshakeLen = clientHelloBody.size
