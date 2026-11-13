@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class EbpfUprobeAttacher(
     private val libSslPath: String,
     private val targetFilter: EbpfTargetFilter,
-    private val streamParser: TlsStreamParser
+    private val streamParser: TlsStreamParser,
+    private val allowSimulatedTestMode: Boolean = false
 ) {
 
     companion object {
@@ -43,7 +44,13 @@ class EbpfUprobeAttacher(
         Log.i(TAG, "Attaching eBPF uprobes to $libSslPath...")
         val attached = attachUprobes()
         if (!attached) {
-            Log.w(TAG, "Direct tracefs uprobe attach failed; running with embedded event engine.")
+            if (!allowSimulatedTestMode) {
+                Log.e(TAG, "Failed to attach kernel tracefs uprobes to $libSslPath; refusing to report false eBPF start.")
+                isRunning.set(false)
+                return false
+            }
+            Log.w(TAG, "Direct tracefs uprobe attach failed; running in headless simulated test mode.")
+            return true
         }
 
         // 启动后台事件监听线程

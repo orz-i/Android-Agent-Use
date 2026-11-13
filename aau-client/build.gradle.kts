@@ -15,6 +15,15 @@ android {
         minSdk = 30
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     compileOptions {

@@ -90,7 +90,7 @@ class EbpfCaptureEngineTest {
         assertEquals("https://agent.ai/api/agent/task", listener.requests[0].url)
 
         // 3. 注入响应
-        val sampleResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"ok\":true}"
+        val sampleResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
         engine.injectTlsDataForTest("conn_target", 2, sampleResponse.toByteArray(StandardCharsets.UTF_8), uid = targetUid)
 
         assertEquals("Target UID response must be dispatched", 1, listener.responses.size)

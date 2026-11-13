@@ -95,7 +95,12 @@ class EbpfCaptureEngine(
 
         // 4. 初始化解析器与 Uprobe 挂载器
         val parser = TlsStreamParser(config, listener)
-        val uprobeAttacher = EbpfUprobeAttacher(libSslPath, targetFilter, parser)
+        val uprobeAttacher = EbpfUprobeAttacher(
+            libSslPath = libSslPath,
+            targetFilter = targetFilter,
+            streamParser = parser,
+            allowSimulatedTestMode = (context == null)
+        )
 
         val attachSuccess = uprobeAttacher.start()
         if (!attachSuccess) {
