@@ -4,6 +4,7 @@ import com.agent.use.client.network.vpn.parser.HttpPacket
 import com.agent.use.client.network.vpn.parser.HttpRequestData
 import com.agent.use.client.network.vpn.parser.HttpResponseData
 import com.agent.use.client.network.vpn.parser.TlsPacket
+import com.agent.use.common.network.parser.HttpContentDecoder
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 
@@ -41,6 +42,9 @@ class TcpSession(
 
     @Volatile
     var activeRequestUrl: String? = null
+
+    @Volatile
+    var activeRequestMethod: String? = null
 
     private val uplinkBuffer = ByteArrayOutputStream()
     private val downlinkBuffer = ByteArrayOutputStream()
@@ -82,20 +86,47 @@ class TcpSession(
                 if (HttpPacket.isHttpRequest(currentBytes)) {
                     val req = HttpPacket.parseRequest(currentBytes, maxBodyBytes = maxBodyBytes)
                     if (req != null) {
-                        // 检查请求体是否已满足 Content-Length
                         val expectedBodyLen = req.contentLength
-                        val actualBodyLen = currentBytes.size - req.headerEndOffset
-                        val isComplete = if (expectedBodyLen >= 0) {
-                            actualBodyLen >= expectedBodyLen
+                        val rawTailLen = currentBytes.size - req.headerEndOffset
+                        val isChunked = req.headers.any {
+                            it.name.equals("Transfer-Encoding", ignoreCase = true) &&
+                                it.value.contains("chunked", ignoreCase = true)
+                        }
+
+                        var decodedReqBody = req.body
+                        var consumed = 0
+                        val isComplete = if (isChunked) {
+                            val tail = currentBytes.copyOfRange(req.headerEndOffset, currentBytes.size)
+                            val chunkRes = HttpContentDecoder.decodeChunked(tail, maxBodyBytes = maxBodyBytes)
+                            decodedReqBody = HttpContentDecoder.decompressIfNeeded(chunkRes.decoded, req.headers)
+                            consumed = req.headerEndOffset + chunkRes.consumedBytes
+                            chunkRes.isComplete
+                        } else if (expectedBodyLen > 0) {
+                            if (rawTailLen >= expectedBodyLen) {
+                                val rawBody = currentBytes.copyOfRange(
+                                    req.headerEndOffset,
+                                    (req.headerEndOffset + expectedBodyLen.toInt()).coerceAtMost(currentBytes.size)
+                                )
+                                decodedReqBody = HttpContentDecoder.decompressIfNeeded(rawBody, req.headers)
+                                consumed = minOf(currentBytes.size, req.headerEndOffset + expectedBodyLen.toInt())
+                                true
+                            } else {
+                                false
+                            }
                         } else {
+                            consumed = req.headerEndOffset
                             true
                         }
 
                         if (isComplete) {
-                            uplinkBuffer.reset()
+                            consumePrefix(uplinkBuffer, currentBytes, consumed)
                             val reqId = "vpn_http_${UUID.randomUUID().toString().substring(0, 8)}"
                             activeRequestId = reqId
-                            return UplinkParseResult.HttpRequest(requestId = reqId, data = req)
+                            activeRequestMethod = req.method
+                            return UplinkParseResult.HttpRequest(
+                                requestId = reqId,
+                                data = req.copy(body = decodedReqBody)
+                            )
                         }
                     }
                 } else if (uplinkBuffer.size() > 65536) {
@@ -109,7 +140,7 @@ class TcpSession(
     }
 
     /**
-     * 追加服务端下发的下行数据，并尝试提取 HTTP 响应。
+     * 追加服务端下发的下行数据，并尝试提取完整 HTTP 响应（支持 chunked 与 gzip/deflate 解码）。
      */
     fun appendDownlink(
         payload: ByteArray,
@@ -117,45 +148,117 @@ class TcpSession(
     ): DownlinkParseResult {
         synchronized(lock) {
             lastActiveTimeMs = System.currentTimeMillis()
+            if (isTls) return DownlinkParseResult.None
 
-            if (!isTls) {
-                downlinkBuffer.write(payload)
+            downlinkBuffer.write(payload)
+            while (true) {
                 val currentBytes = downlinkBuffer.toByteArray()
+                if (currentBytes.isEmpty()) break
 
-                if (HttpPacket.isHttpResponse(currentBytes)) {
-                    val resp = HttpPacket.parseResponse(currentBytes, maxBodyBytes = maxBodyBytes)
-                    if (resp != null) {
-                        val expectedBodyLen = resp.contentLength
-                        val actualBodyLen = currentBytes.size - resp.headerEndOffset
-                        val isComplete = if (expectedBodyLen >= 0) {
-                            actualBodyLen >= expectedBodyLen
-                        } else if (resp.isChunked) {
-                            currentBytes.size >= 5 &&
-                                    currentBytes[currentBytes.size - 5] == '0'.code.toByte() &&
-                                    currentBytes[currentBytes.size - 4] == '\r'.code.toByte() &&
-                                    currentBytes[currentBytes.size - 3] == '\n'.code.toByte() &&
-                                    currentBytes[currentBytes.size - 2] == '\r'.code.toByte() &&
-                                    currentBytes[currentBytes.size - 1] == '\n'.code.toByte()
-                        } else {
-                            false
-                        }
-
-                        val reqId = activeRequestId ?: "vpn_resp_${UUID.randomUUID().toString().substring(0, 8)}"
-                        if (isComplete) {
-                            downlinkBuffer.reset()
-                        }
-                        return DownlinkParseResult.HttpResponse(
-                            requestId = reqId,
-                            data = resp,
-                            isComplete = isComplete
-                        )
+                if (!HttpPacket.isHttpResponse(currentBytes)) {
+                    if (downlinkBuffer.size() > 10 * 1024 * 1024) {
+                        downlinkBuffer.reset()
                     }
-                } else if (downlinkBuffer.size() > 10 * 1024 * 1024) {
-                    downlinkBuffer.reset()
+                    break
                 }
+
+                val resp = HttpPacket.parseResponse(currentBytes, maxBodyBytes = maxBodyBytes) ?: break
+                // Ignore 1xx interim responses (e.g. 100 Continue)
+                if (resp.statusCode in 100..199 && resp.statusCode != 101) {
+                    consumePrefix(downlinkBuffer, currentBytes, resp.headerEndOffset)
+                    continue
+                }
+
+                val hasNoBody = activeRequestMethod.equals("HEAD", ignoreCase = true) ||
+                    resp.statusCode == 204 ||
+                    resp.statusCode == 304 ||
+                    (resp.contentLength == 0L && !resp.isChunked)
+
+                val rawTail = currentBytes.copyOfRange(resp.headerEndOffset, currentBytes.size)
+                var decodedBody = ByteArray(0)
+                var consumed = 0
+                val isComplete: Boolean
+
+                if (hasNoBody) {
+                    consumed = resp.headerEndOffset
+                    isComplete = true
+                } else if (resp.isChunked) {
+                    val chunkRes = HttpContentDecoder.decodeChunked(rawTail, maxBodyBytes = maxBodyBytes)
+                    decodedBody = HttpContentDecoder.decompressIfNeeded(chunkRes.decoded, resp.headers)
+                    consumed = resp.headerEndOffset + chunkRes.consumedBytes
+                    isComplete = chunkRes.isComplete
+                } else if (resp.contentLength > 0) {
+                    if (rawTail.size.toLong() >= resp.contentLength) {
+                        val take = minOf(resp.contentLength, maxBodyBytes).toInt()
+                        val rawBody = rawTail.copyOfRange(0, take)
+                        decodedBody = HttpContentDecoder.decompressIfNeeded(rawBody, resp.headers)
+                        consumed = minOf(currentBytes.size, resp.headerEndOffset + resp.contentLength.toInt())
+                        isComplete = true
+                    } else {
+                        consumed = 0
+                        isComplete = false
+                    }
+                } else {
+                    // Connection: close without Content-Length; wait for finishDownlinkOnEof()
+                    consumed = 0
+                    isComplete = false
+                }
+
+                val reqId = activeRequestId ?: "vpn_resp_${UUID.randomUUID().toString().substring(0, 8)}"
+                if (isComplete) {
+                    consumePrefix(downlinkBuffer, currentBytes, consumed)
+                    return DownlinkParseResult.HttpResponse(
+                        requestId = reqId,
+                        data = resp.copy(body = decodedBody),
+                        isComplete = true
+                    )
+                }
+
+                return DownlinkParseResult.HttpResponse(
+                    requestId = reqId,
+                    data = resp,
+                    isComplete = false
+                )
             }
 
             return DownlinkParseResult.None
+        }
+    }
+
+    /**
+     * Finalizes any pending HTTP response (`Connection: close`) when TCP FIN/EOF closes the downlink stream.
+     */
+    fun finishDownlinkOnEof(maxBodyBytes: Long = 10 * 1024 * 1024L): DownlinkParseResult {
+        synchronized(lock) {
+            if (isTls) return DownlinkParseResult.None
+            val currentBytes = downlinkBuffer.toByteArray()
+            if (currentBytes.isEmpty() || !HttpPacket.isHttpResponse(currentBytes)) {
+                return DownlinkParseResult.None
+            }
+            val resp = HttpPacket.parseResponse(currentBytes, maxBodyBytes = maxBodyBytes)
+                ?: return DownlinkParseResult.None
+            val rawTail = currentBytes.copyOfRange(resp.headerEndOffset, currentBytes.size)
+            val decoded = if (resp.isChunked) {
+                val chunkRes = HttpContentDecoder.decodeChunked(rawTail, maxBodyBytes = maxBodyBytes)
+                HttpContentDecoder.decompressIfNeeded(chunkRes.decoded, resp.headers)
+            } else {
+                HttpContentDecoder.decompressIfNeeded(rawTail, resp.headers)
+            }
+            val reqId = activeRequestId ?: "vpn_resp_${UUID.randomUUID().toString().substring(0, 8)}"
+            downlinkBuffer.reset()
+            return DownlinkParseResult.HttpResponse(
+                requestId = reqId,
+                data = resp.copy(body = decoded),
+                isComplete = true
+            )
+        }
+    }
+
+    private fun consumePrefix(stream: ByteArrayOutputStream, snapshot: ByteArray, consumed: Int) {
+        val safeConsumed = consumed.coerceIn(0, snapshot.size)
+        stream.reset()
+        if (safeConsumed < snapshot.size) {
+            stream.write(snapshot, safeConsumed, snapshot.size - safeConsumed)
         }
     }
 
@@ -168,6 +271,7 @@ class TcpSession(
             downlinkBuffer.reset()
             activeRequestId = null
             activeRequestUrl = null
+            activeRequestMethod = null
         }
     }
 }

@@ -32,6 +32,10 @@ class VpnCaptureEngine(
     @Volatile
     private var packetProcessor: VpnPacketProcessor? = null
 
+    @Volatile
+    var lastError: String? = null
+        private set
+
     /**
      * 启动免 Root VpnService 网络捕获。
      *
@@ -43,9 +47,11 @@ class VpnCaptureEngine(
         config: NetworkCaptureConfig,
         listener: INetworkEventListener
     ): Boolean {
+        lastError = null
         if (config.targetPackage.isBlank()) {
             Log.e(TAG, "Cannot start VpnCapture: targetPackage is empty")
-            listener.onErrorOccurred("", "targetPackage cannot be blank")
+            lastError = "targetPackage cannot be blank"
+            listener.onErrorOccurred("", lastError)
             return false
         }
 
@@ -61,18 +67,30 @@ class VpnCaptureEngine(
         if (context != null) {
             val prepareIntent = VpnService.prepare(context)
             if (prepareIntent != null) {
-                val msg = "VpnService permission not granted. Please prepare VPN intent first."
-                Log.w(TAG, msg)
+                val msg = "vpn_permission_not_granted"
+                Log.w(TAG, "VpnService permission not granted. Please prepare VPN intent first.")
+                lastError = msg
+                this.packetProcessor = null
+                this.activeConfig = null
+                this.activeListener = null
                 listener.onErrorOccurred("", msg)
                 return false
             }
 
-            AauVpnService.start(
+            val (started, err) = AauVpnService.start(
                 context = context,
                 targetPackage = config.targetPackage,
                 processor = processor,
                 listener = listener
             )
+            if (!started) {
+                lastError = err ?: "vpn_establish_failed"
+                Log.w(TAG, "AauVpnService failed to start: $lastError")
+                this.packetProcessor = null
+                this.activeConfig = null
+                this.activeListener = null
+                return false
+            }
         } else {
             Log.i(TAG, "VpnCaptureEngine started in headless/test mode (context is null)")
         }

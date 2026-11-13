@@ -60,7 +60,7 @@ class VpnPacketProcessor(
     private fun processUdpPacket(ipPacket: IpPacket) {
         val udpPacket = UdpPacket.parse(ipPacket) ?: return
 
-        // 仅拦截并嗅探 DNS 查询与应答 (端口 53)
+        // 仅拦截并嗅探 DNS 应答 (端口 53) 以填充域名-IP 映射
         if (udpPacket.srcPort == UdpPacket.DNS_PORT || udpPacket.dstPort == UdpPacket.DNS_PORT) {
             val dns = DnsPacket.parse(udpPacket) ?: return
             if (dns.isResponse) {
@@ -69,11 +69,6 @@ class VpnPacketProcessor(
                     if (addr != null && ans.name.isNotEmpty()) {
                         dnsCache.record(addr, ans.name)
                     }
-                }
-            } else {
-                val qName = dns.primaryQuestionName
-                if (!qName.isNullOrEmpty()) {
-                    dnsCache.record(ipPacket.dstAddress, qName)
                 }
             }
         }
@@ -93,13 +88,30 @@ class VpnPacketProcessor(
             return
         }
 
+        val payload = tcpPacket.getPayload()
         if (tcpPacket.isFin || tcpPacket.isRst) {
+            val existingPair = sessionTracker.findSession(srcIp, srcPort, dstIp, dstPort)
+            if (existingPair != null) {
+                val (session, isUplink) = existingPair
+                if (payload.isNotEmpty()) {
+                    if (isUplink) {
+                        handleUplinkPayload(session, ipPacket, tcpPacket, payload)
+                    } else {
+                        handleDownlinkPayload(session, ipPacket, tcpPacket, payload)
+                    }
+                }
+                if (tcpPacket.isFin) {
+                    val eofResult = session.finishDownlinkOnEof(config.maxBodySizeBytes)
+                    if (eofResult is DownlinkParseResult.HttpResponse) {
+                        dispatchCompleteResponse(session, ipPacket, tcpPacket, eofResult)
+                    }
+                }
+            }
             sessionTracker.removeSession(srcIp, srcPort, dstIp, dstPort)
             sessionTracker.removeSession(dstIp, dstPort, srcIp, srcPort)
             return
         }
 
-        val payload = tcpPacket.getPayload()
         if (payload.isEmpty()) return
 
         // 2. 查找所属会话
@@ -193,35 +205,39 @@ class VpnPacketProcessor(
         payload: ByteArray
     ) {
         val result = session.appendDownlink(payload, config.maxBodySizeBytes)
-        when (result) {
-            is DownlinkParseResult.HttpResponse -> {
-                val resp = result.data
-                val url = session.activeRequestUrl
-                    ?: "http://${dnsCache.getDomain(ipPacket.srcAddress) ?: ipPacket.srcAddress}:${tcpPacket.srcPort}/"
+        if (result is DownlinkParseResult.HttpResponse && result.isComplete) {
+            dispatchCompleteResponse(session, ipPacket, tcpPacket, result)
+        }
+    }
 
-                if (config.matchesUrl(url)) {
-                    val responseEvent = HttpResponseEvent(
-                        requestId = result.requestId,
-                        timestamp = System.currentTimeMillis(),
-                        url = url,
-                        statusCode = resp.statusCode,
-                        statusText = resp.statusText,
-                        headers = resp.headers,
-                        mimeType = resp.mimeType,
-                        contentLength = resp.contentLength,
-                        fromCache = false
-                    )
-                    safeDispatch { listener.onResponseReceived(responseEvent) }
+    private fun dispatchCompleteResponse(
+        session: com.agent.use.client.network.vpn.session.TcpSession,
+        ipPacket: IpPacket,
+        tcpPacket: TcpPacket,
+        result: DownlinkParseResult.HttpResponse
+    ) {
+        val resp = result.data
+        val url = session.activeRequestUrl
+            ?: "http://${dnsCache.getDomain(ipPacket.srcAddress) ?: ipPacket.srcAddress}:${tcpPacket.srcPort}/"
 
-                    if (resp.body.isNotEmpty()) {
-                        safeDispatch { listener.onDataChunkReceived(result.requestId, resp.body) }
-                        sessionTracker.cacheResponseBody(result.requestId, resp.body)
-                    }
-                }
+        if (config.matchesUrl(url)) {
+            if (resp.body.isNotEmpty()) {
+                sessionTracker.cacheResponseBody(result.requestId, resp.body)
+                safeDispatch { listener.onDataChunkReceived(result.requestId, resp.body) }
             }
-            is DownlinkParseResult.None -> {
-                // 尚在缓冲或非 HTTP 响应
-            }
+
+            val responseEvent = HttpResponseEvent(
+                requestId = result.requestId,
+                timestamp = System.currentTimeMillis(),
+                url = url,
+                statusCode = resp.statusCode,
+                statusText = resp.statusText,
+                headers = resp.headers,
+                mimeType = resp.mimeType,
+                contentLength = if (resp.body.isNotEmpty()) resp.body.size.toLong() else resp.contentLength,
+                fromCache = false
+            )
+            safeDispatch { listener.onResponseReceived(responseEvent) }
         }
     }
 

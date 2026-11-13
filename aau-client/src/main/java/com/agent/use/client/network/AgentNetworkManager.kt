@@ -5,6 +5,7 @@ import android.os.RemoteException
 import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import com.agent.use.client.network.ebpf.LocalRootEbpfCaptureEngine
 import com.agent.use.client.network.vpn.VpnCaptureEngine
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.network.CaptureMode
@@ -51,7 +52,8 @@ class AgentNetworkManager(
     private val vpnEngineProvider: (() -> INetworkCapture)? = null,
     private val serverCaptureProvider: (() -> INetworkCapture?)? = null,
     private val rootChecker: (() -> Boolean)? = null,
-    private val kernelChecker: (() -> Boolean)? = null
+    private val kernelChecker: (() -> Boolean)? = null,
+    private val localEbpfProvider: (() -> INetworkCapture?)? = null
 ) : Closeable, AutoCloseable {
 
     companion object {
@@ -66,6 +68,13 @@ class AgentNetworkManager(
 
     @Volatile
     private var vpnEngine: INetworkCapture? = null
+
+    @Volatile
+    private var localEbpfEngine: INetworkCapture? = null
+
+    @Volatile
+    var lastError: String? = null
+        private set
 
     @Volatile
     private var activeMode: CaptureMode = CaptureMode.AUTO
@@ -158,6 +167,7 @@ class AgentNetworkManager(
 
         override fun onErrorOccurred(requestId: String, errorMsg: String) {
             Log.w(TAG, "Capture error occurred: requestId=$requestId, msg=$errorMsg")
+            lastError = errorMsg
             _errorFlow.tryEmit(requestId to errorMsg)
         }
     }
@@ -202,9 +212,11 @@ class AgentNetworkManager(
         val targetPkg = config.targetPackage.trim()
         if (targetPkg.isEmpty()) {
             Log.e(TAG, "Cannot enable network capture: targetPackage is empty")
+            lastError = "targetPackage cannot be empty"
             return false
         }
 
+        this.lastError = null
         this.currentPackage = targetPkg
 
         return when (config.mode) {
@@ -273,14 +285,21 @@ class AgentNetworkManager(
 
     private fun activateEbpf(config: NetworkCaptureConfig): Boolean {
         val engine = try {
-            serverCaptureProvider?.invoke() ?: shell?.networkCapture
+            serverCaptureProvider?.invoke()
+                ?: shell?.networkCapture
+                ?: localEbpfProvider?.invoke()
+                ?: context?.let { ctx ->
+                    localEbpfEngine ?: LocalRootEbpfCaptureEngine(ctx).also { localEbpfEngine = it }
+                }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to obtain networkCapture binder from shell: ${e.message}", e)
+            Log.e(TAG, "Failed to obtain eBPF capture engine: ${e.message}", e)
+            lastError = "ebpf_engine_error:${e.message}"
             null
         }
 
         if (engine == null) {
-            Log.w(TAG, "EbpfCaptureEngine unavailable (shell or networkCapture is null)")
+            Log.w(TAG, "EbpfCaptureEngine unavailable (no shell binder and no local root helper)")
+            if (lastError == null) lastError = "ebpf_engine_unavailable"
             return false
         }
 
@@ -290,16 +309,25 @@ class AgentNetworkManager(
                 activeEngine = engine
                 activeMode = CaptureMode.EBPF
                 currentConfig = config
+                lastError = null
                 true
             } else {
-                Log.w(TAG, "EbpfCaptureEngine.startCapture returned false")
+                val engineErr = (engine as? LocalRootEbpfCaptureEngine)?.lastError
+                if (!engineErr.isNullOrBlank()) {
+                    lastError = engineErr
+                } else if (lastError == null) {
+                    lastError = "ebpf_start_failed"
+                }
+                Log.w(TAG, "EbpfCaptureEngine.startCapture returned false ($lastError)")
                 false
             }
         } catch (e: RemoteException) {
             Log.e(TAG, "RemoteException calling EbpfCaptureEngine.startCapture: ${e.message}", e)
+            lastError = "ebpf_remote_exception:${e.message}"
             false
         } catch (e: Exception) {
             Log.e(TAG, "Exception calling EbpfCaptureEngine.startCapture: ${e.message}", e)
+            lastError = "ebpf_exception:${e.message}"
             false
         }
     }
@@ -309,6 +337,7 @@ class AgentNetworkManager(
             vpnEngineProvider?.invoke() ?: VpnCaptureEngine(context).also { vpnEngine = it }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to instantiate VpnCaptureEngine: ${e.message}", e)
+            lastError = "vpn_init_failed:${e.message}"
             return false
         }
 
@@ -318,13 +347,21 @@ class AgentNetworkManager(
                 activeEngine = vpn
                 activeMode = CaptureMode.VPN_SERVICE
                 currentConfig = config
+                lastError = null
                 true
             } else {
-                Log.w(TAG, "VpnCaptureEngine.startCapture returned false")
+                val vpnErr = (vpn as? VpnCaptureEngine)?.lastError
+                if (!vpnErr.isNullOrBlank()) {
+                    lastError = vpnErr
+                } else if (lastError == null) {
+                    lastError = "vpn_start_failed"
+                }
+                Log.w(TAG, "VpnCaptureEngine.startCapture returned false ($lastError)")
                 false
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception calling VpnCaptureEngine.startCapture: ${e.message}", e)
+            lastError = "vpn_exception:${e.message}"
             false
         }
     }
