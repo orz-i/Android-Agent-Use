@@ -1,25 +1,21 @@
-package com.agent.use.server.network.ebpf
+package com.agent.use.common.network.parser
 
 import com.agent.use.common.network.HttpHeader
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.nio.charset.StandardCharsets
 
 /**
- * HTTP/2 HPACK 头部解码器 (RFC 7541 实现)。
- *
- * 支持：
- * 1. 静态索引表查找 (Static Table Indices 1..61)；
- * 2. 伪头部 (:method, :path, :authority, :scheme, :status) 解析；
- * 3. 带增量索引 / 不带索引 / 从不索引的字面量头部解析；
- * 4. RFC 7541 霍夫曼解码 (Huffman Decoding) 与普通字面量解码。
+ * Full RFC 7541 HPACK header decoder with static + dynamic table support and RFC 7541 Huffman decoding.
+ * Maintain one instance per direction (`outbound` and `inbound`) for each HTTP/2 connection.
  */
-class Http2HpackDecoder {
+class Http2HpackDecoder(
+    private var maxDynamicTableSize: Int = 4096
+) {
+    private val dynamicTable = ArrayDeque<HttpHeader>()
+    private var dynamicTableBytes = 0
 
     companion object {
-        // RFC 7541 静态表 (索引 1..61)
         private val STATIC_TABLE = arrayOf(
-            "", // 0 占位
+            "", "",
             ":authority", "",
             ":method", "GET",
             ":method", "POST",
@@ -82,11 +78,11 @@ class Http2HpackDecoder {
             "via", "",
             "www-authenticate", ""
         )
+
+        private const val STATIC_TABLE_SIZE = 61
     }
 
-    /**
-     * 解码包含在 HEADERS / CONTINUATION 帧中的 HPACK 编码头部块。
-     */
+    @Synchronized
     fun decode(headerBlock: ByteArray): List<HttpHeader> {
         val headers = mutableListOf<HttpHeader>()
         val input = ByteArrayInputStream(headerBlock)
@@ -96,39 +92,32 @@ class Http2HpackDecoder {
             if (b == -1) break
 
             when {
-                // 1. 索引头部字段 (1xxxxxxx, 7-bit prefix)
+                // 1. Indexed Header Field Representation (1xxxxxxx)
                 (b and 0x80) != 0 -> {
                     val index = readInteger(b, 0x7F, input)
-                    val header = getFromStaticTable(index)
-                    if (header != null) {
-                        headers.add(header)
-                    }
+                    getEntry(index)?.let { headers.add(it) }
                 }
-                // 2. 带增量索引的字面量头部字段 (01xxxxxx, 6-bit prefix)
+                // 2. Literal Header Field with Incremental Indexing (01xxxxxx)
                 (b and 0x40) != 0 -> {
                     val index = readInteger(b, 0x3F, input)
-                    val name = if (index != 0) {
-                        getFromStaticTable(index)?.name ?: ""
-                    } else {
-                        readString(input)
-                    }
+                    val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
                     val value = readString(input)
                     if (name.isNotEmpty()) {
-                        headers.add(HttpHeader(name, value))
+                        val header = HttpHeader(name, value)
+                        headers.add(header)
+                        insertDynamicEntry(header)
                     }
                 }
-                // 3. 动态表大小更新 (001xxxxx, 5-bit prefix)
+                // 3. Dynamic Table Size Update (001xxxxx)
                 (b and 0x20) != 0 -> {
-                    readInteger(b, 0x1F, input) // 忽略动态表大小更新
+                    val newMax = readInteger(b, 0x1F, input).coerceAtLeast(0)
+                    maxDynamicTableSize = newMax
+                    evictToMaxSize()
                 }
-                // 4. 不带索引 / 从不索引的字面量头部字段 (0000xxxx, 4-bit prefix)
+                // 4. Literal Header Field without Indexing / Never Indexed (0000xxxx / 0001xxxx)
                 else -> {
                     val index = readInteger(b, 0x0F, input)
-                    val name = if (index != 0) {
-                        getFromStaticTable(index)?.name ?: ""
-                    } else {
-                        readString(input)
-                    }
+                    val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
                     val value = readString(input)
                     if (name.isNotEmpty()) {
                         headers.add(HttpHeader(name, value))
@@ -140,13 +129,38 @@ class Http2HpackDecoder {
         return headers
     }
 
-    private fun getFromStaticTable(index: Int): HttpHeader? {
-        if (index <= 0 || index * 2 >= STATIC_TABLE.size) {
-            return null
+    private fun getEntry(index: Int): HttpHeader? {
+        if (index <= 0) return null
+        if (index <= STATIC_TABLE_SIZE) {
+            val name = STATIC_TABLE[index * 2]
+            val value = STATIC_TABLE[index * 2 + 1]
+            return HttpHeader(name, value)
         }
-        val name = STATIC_TABLE[index * 2 - 1]
-        val value = STATIC_TABLE[index * 2]
-        return HttpHeader(name, value)
+        val dynIndex = index - STATIC_TABLE_SIZE - 1
+        return dynamicTable.getOrNull(dynIndex)
+    }
+
+    private fun entrySize(header: HttpHeader): Int =
+        header.name.toByteArray(Charsets.UTF_8).size +
+            header.value.toByteArray(Charsets.UTF_8).size + 32
+
+    private fun insertDynamicEntry(header: HttpHeader) {
+        val size = entrySize(header)
+        if (size > maxDynamicTableSize) {
+            dynamicTable.clear()
+            dynamicTableBytes = 0
+            return
+        }
+        dynamicTable.addFirst(header)
+        dynamicTableBytes += size
+        evictToMaxSize()
+    }
+
+    private fun evictToMaxSize() {
+        while (dynamicTableBytes > maxDynamicTableSize && dynamicTable.isNotEmpty()) {
+            val removed = dynamicTable.removeLast()
+            dynamicTableBytes = (dynamicTableBytes - entrySize(removed)).coerceAtLeast(0)
+        }
     }
 
     private fun readInteger(firstByte: Int, prefixMask: Int, input: ByteArrayInputStream): Int {
@@ -160,7 +174,7 @@ class Http2HpackDecoder {
             if (b == -1) break
             value += (b and 0x7F) shl m
             m += 7
-            if ((b and 0x80) == 0) {
+            if ((b and 0x80) == 0 || m > 28) {
                 break
             }
         }
@@ -171,28 +185,17 @@ class Http2HpackDecoder {
         if (input.available() == 0) return ""
         val first = input.read()
         val isHuffman = (first and 0x80) != 0
-        val length = readInteger(first, 0x7F, input)
-        if (length <= 0) return ""
-
-        val bytes = ByteArray(length)
-        val readBytes = input.read(bytes, 0, length)
+        val length = readInteger(first, 0x7F, input).coerceAtLeast(0)
+        if (length == 0) return ""
+        val safeLen = length.coerceAtMost(input.available())
+        if (safeLen == 0) return ""
+        val bytes = ByteArray(safeLen)
+        val readBytes = input.read(bytes, 0, safeLen)
         if (readBytes <= 0) return ""
-
         return if (isHuffman) {
-            decodeHuffman(bytes, readBytes)
+            Http2Huffman.decodeToString(bytes, readBytes)
         } else {
-            String(bytes, 0, readBytes, StandardCharsets.UTF_8)
-        }
-    }
-
-    /**
-     * 基础霍夫曼解码 fallback 实现：若遇到复杂树结构异常则优雅容错。
-     */
-    private fun decodeHuffman(data: ByteArray, length: Int): String {
-        return try {
-            Http2Huffman.decode(data, length)
-        } catch (_: Exception) {
-            String(data, 0, length, StandardCharsets.ISO_8859_1)
+            String(bytes, 0, readBytes, Charsets.UTF_8)
         }
     }
 }
