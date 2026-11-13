@@ -13,10 +13,23 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class Http2PlaintextParser(
     private val maxBodySizeBytes: Long = 10 * 1024 * 1024L,
+    private val connectionHostHint: String? = null,
     private val onParsedRequest: (HttpRequestEvent) -> Unit,
     private val onParsedResponse: (HttpResponseEvent) -> Unit,
     private val onBodyChunk: (requestId: String, chunk: ByteArray) -> Unit
 ) {
+    constructor(
+        maxBodySizeBytes: Long = 10 * 1024 * 1024L,
+        onParsedRequest: (HttpRequestEvent) -> Unit,
+        onParsedResponse: (HttpResponseEvent) -> Unit,
+        onBodyChunk: (requestId: String, chunk: ByteArray) -> Unit
+    ) : this(
+        maxBodySizeBytes = maxBodySizeBytes,
+        connectionHostHint = null,
+        onParsedRequest = onParsedRequest,
+        onParsedResponse = onParsedResponse,
+        onBodyChunk = onBodyChunk
+    )
 
     companion object {
         const val FRAME_TYPE_DATA = 0x0
@@ -38,6 +51,15 @@ class Http2PlaintextParser(
         val CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
     }
 
+    @Volatile
+    private var lastSeenAuthority: String? = connectionHostHint
+
+    fun setConnectionHostHint(host: String) {
+        if (host.isNotBlank() && !host.equals("localhost", ignoreCase = true) && !host.equals("unknown-host", ignoreCase = true)) {
+            lastSeenAuthority = host
+        }
+    }
+
     private val outboundHpack = Http2HpackDecoder()
     private val inboundHpack = Http2HpackDecoder()
 
@@ -56,7 +78,7 @@ class Http2PlaintextParser(
     private data class StreamContext(
         val streamId: Int,
         val requestId: String,
-        var url: String = "https://localhost/",
+        var url: String,
         var method: String = "GET",
         var requestHeaders: List<HttpHeader> = emptyList(),
         val postDataStream: ByteArrayOutputStream = ByteArrayOutputStream(),
@@ -105,8 +127,21 @@ class Http2PlaintextParser(
                 }
                 outboundPrefaceChecked = true
             } else {
-                // Wait for full preface before scanning frame headers
-                return
+                // Check if the partial buffer could match CLIENT_PREFACE
+                var prefixMatches = true
+                for (i in bytes.indices) {
+                    if (bytes[i] != CLIENT_PREFACE[i]) {
+                        prefixMatches = false
+                        break
+                    }
+                }
+                if (prefixMatches) {
+                    // Wait for full preface before scanning frame headers
+                    return
+                } else {
+                    // Mid-stream attach: bytes do not match preface prefix, start parsing frames directly
+                    outboundPrefaceChecked = true
+                }
             }
         }
 
@@ -154,9 +189,11 @@ class Http2PlaintextParser(
         if (streamId == 0) return
 
         val stream = streams.computeIfAbsent(streamId) {
+            val fallbackHost = lastSeenAuthority ?: connectionHostHint ?: "unknown-host"
             StreamContext(
                 streamId = streamId,
-                requestId = "${connectionId}_h2_s${streamId}"
+                requestId = "${connectionId}_h2_s${streamId}",
+                url = "https://$fallbackHost/"
             )
         }
 
@@ -243,20 +280,35 @@ class Http2PlaintextParser(
         if (isOutbound) {
             var method = "GET"
             var scheme = "https"
-            var authority = "localhost"
+            var authority: String? = null
             var path = "/"
 
             for (h in headers) {
                 when (h.name.lowercase()) {
                     ":method" -> method = h.value
                     ":scheme" -> scheme = h.value
-                    ":authority", "host" -> if (h.value.isNotEmpty()) authority = h.value
+                    ":authority" -> if (h.value.isNotEmpty()) authority = h.value
+                    "host" -> if (authority == null && h.value.isNotEmpty()) authority = h.value
                     ":path" -> path = h.value
                 }
             }
 
+            if (authority == null) {
+                val originOrReferer = headers.firstOrNull {
+                    it.name.equals("Origin", ignoreCase = true) || it.name.equals("Referer", ignoreCase = true)
+                }?.value
+                authority = extractHost(originOrReferer)
+            }
+
+            if (authority == null) {
+                authority = lastSeenAuthority ?: connectionHostHint ?: "unknown-host"
+            } else if (authority != "unknown-host" && !authority.equals("localhost", ignoreCase = true)) {
+                lastSeenAuthority = authority
+            }
+
+            val normalizedPath = if (path.startsWith("/")) path else "/$path"
             stream.method = method
-            stream.url = "$scheme://$authority$path"
+            stream.url = "$scheme://$authority$normalizedPath"
             stream.requestHeaders = headers
             if (isEndStream) {
                 dispatchRequestIfNeeded(stream)
@@ -270,6 +322,18 @@ class Http2PlaintextParser(
             }
             // Ignore 1xx informational header blocks (except 101)
             if (statusCode in 100..199 && statusCode != 101) return
+
+            // If this stream was created by an inbound response without outbound request captured,
+            // update stream.url if headers provide any host hint
+            if (stream.requestHeaders.isEmpty()) {
+                val location = headers.firstOrNull { it.name.equals("Location", ignoreCase = true) }?.value
+                val locHost = extractHost(location)
+                if (locHost != null && locHost != "unknown-host" && !locHost.equals("localhost", ignoreCase = true)) {
+                    lastSeenAuthority = locHost
+                }
+                val fallbackHost = lastSeenAuthority ?: connectionHostHint ?: "unknown-host"
+                stream.url = "https://$fallbackHost/"
+            }
 
             stream.statusCode = statusCode
             stream.mimeType = headers.firstOrNull { it.name.equals("content-type", ignoreCase = true) }?.value

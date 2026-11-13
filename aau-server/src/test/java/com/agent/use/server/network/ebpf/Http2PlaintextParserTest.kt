@@ -71,7 +71,7 @@ class Http2PlaintextParserTest {
 
         assertNotNull("HTTP/2 request should be parsed", parsedReq)
         assertEquals("GET", parsedReq!!.method)
-        assertEquals("https://localhost/", parsedReq!!.url)
+        assertEquals("https://unknown-host/", parsedReq!!.url)
 
         // 构造入站响应 HEADERS Frame + DATA Frame
         // HEADERS Frame: Length = 1, Type = 0x1 (HEADERS), Flags = 0x4 (END_HEADERS), StreamID = 1

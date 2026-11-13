@@ -16,11 +16,47 @@ class Http1PlaintextParser(
     private val maxBodySizeBytes: Long = 10 * 1024 * 1024L,
     private val isTls: Boolean = true,
     private val defaultScheme: String = if (isTls) "https" else "http",
+    private val connectionHostHint: String? = null,
     private val onParsedRequest: (HttpRequestEvent) -> Unit,
     private val onParsedResponse: (HttpResponseEvent) -> Unit,
     private val onBodyChunk: (requestId: String, chunk: ByteArray) -> Unit
 ) {
+    constructor(
+        maxBodySizeBytes: Long = 10 * 1024 * 1024L,
+        isTls: Boolean = true,
+        defaultScheme: String = if (isTls) "https" else "http",
+        onParsedRequest: (HttpRequestEvent) -> Unit,
+        onParsedResponse: (HttpResponseEvent) -> Unit,
+        onBodyChunk: (requestId: String, chunk: ByteArray) -> Unit
+    ) : this(
+        maxBodySizeBytes = maxBodySizeBytes,
+        isTls = isTls,
+        defaultScheme = defaultScheme,
+        connectionHostHint = null,
+        onParsedRequest = onParsedRequest,
+        onParsedResponse = onParsedResponse,
+        onBodyChunk = onBodyChunk
+    )
+
     private val seq = AtomicLong(0L)
+    private val dispatchedCount = AtomicLong(0L)
+
+    @Volatile
+    private var lastSeenHost: String? = connectionHostHint
+
+    fun setConnectionHostHint(host: String) {
+        if (host.isNotBlank() && !host.equals("localhost", ignoreCase = true) && !host.equals("unknown-host", ignoreCase = true)) {
+            lastSeenHost = host
+        }
+    }
+
+    fun hasDispatched(): Boolean = dispatchedCount.get() > 0
+
+    @Synchronized
+    fun getUnconsumedOutbound(): ByteArray = outboundBuffer.toByteArray()
+
+    @Synchronized
+    fun getUnconsumedInbound(): ByteArray = inboundBuffer.toByteArray()
 
     private data class RequestMeta(
         val requestId: String,
@@ -110,11 +146,29 @@ class Http1PlaintextParser(
                 val method = requestLine[0].trim().uppercase()
                 val rawPath = requestLine[1].trim()
                 val headers = parseHeaders(lines, 1)
-                val host = headers.firstOrNull { it.name.equals("Host", ignoreCase = true) }?.value ?: "localhost"
+
+                val hostHeader = headers.firstOrNull { it.name.equals("Host", ignoreCase = true) }?.value?.trim()
+                val host = when {
+                    !hostHeader.isNullOrEmpty() -> hostHeader
+                    rawPath.startsWith("http://") || rawPath.startsWith("https://") -> {
+                        extractHost(rawPath) ?: (lastSeenHost ?: connectionHostHint ?: "unknown-host")
+                    }
+                    else -> {
+                        val refererOrOrigin = headers.firstOrNull {
+                            it.name.equals("Origin", ignoreCase = true) || it.name.equals("Referer", ignoreCase = true)
+                        }?.value
+                        extractHost(refererOrOrigin) ?: (lastSeenHost ?: connectionHostHint ?: "unknown-host")
+                    }
+                }
+                if (host != "unknown-host" && !host.equals("localhost", ignoreCase = true)) {
+                    lastSeenHost = host
+                }
+
                 val fullUrl = if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
                     rawPath
                 } else {
-                    "$defaultScheme://$host$rawPath"
+                    val normalizedPath = if (rawPath.startsWith("/")) rawPath else "/$rawPath"
+                    "$defaultScheme://$host$normalizedPath"
                 }
 
                 val contentLength = headers.firstOrNull { it.name.equals("Content-Length", ignoreCase = true) }
@@ -216,7 +270,8 @@ class Http1PlaintextParser(
                 val matchedReq = awaitingResponseQueue.removeFirstOrNull()
                 val reqId = matchedReq?.requestId
                     ?: "${connectionId}_res_${System.currentTimeMillis()}_${seq.incrementAndGet()}"
-                val reqUrl = matchedReq?.url ?: "https://unknown"
+                val fallbackHost = lastSeenHost ?: connectionHostHint ?: "unknown-host"
+                val reqUrl = matchedReq?.url ?: "$defaultScheme://$fallbackHost/"
                 val reqMethod = matchedReq?.method ?: "GET"
 
                 pendingResponse = PendingResponse(
@@ -293,6 +348,7 @@ class Http1PlaintextParser(
     }
 
     private fun emitCompletedRequest(req: PendingRequest) {
+        dispatchedCount.incrementAndGet()
         val rawBody = req.bodyStream.toByteArray()
         val decodedBody = HttpContentDecoder.decompressIfNeeded(rawBody, req.headers)
         val postDataStr = if (decodedBody.isNotEmpty()) {
@@ -313,6 +369,7 @@ class Http1PlaintextParser(
     }
 
     private fun emitCompletedResponse(resp: PendingResponse, rawBody: ByteArray) {
+        dispatchedCount.incrementAndGet()
         val finalBody = HttpContentDecoder.decompressIfNeeded(rawBody, resp.headers)
         if (finalBody.isNotEmpty()) {
             onBodyChunk(resp.requestId, finalBody)

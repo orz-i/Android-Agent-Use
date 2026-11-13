@@ -166,3 +166,24 @@ object HttpContentDecoder {
         return null
     }
 }
+
+internal fun extractHost(urlOrHost: String?): String? {
+    if (urlOrHost.isNullOrBlank()) return null
+    val trimmed = urlOrHost.trim()
+    return try {
+        if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+            val uri = java.net.URI(trimmed)
+            uri.host?.takeIf { it.isNotEmpty() }
+        } else {
+            val cleaned = trimmed.substringBefore('/').substringBefore(':')
+            cleaned.takeIf { it.isNotEmpty() }
+        }
+    } catch (_: Exception) {
+        val noScheme = trimmed.substringAfter("://", "")
+        if (noScheme.isNotEmpty()) {
+            noScheme.substringBefore('/').substringBefore(':').takeIf { it.isNotEmpty() }
+        } else {
+            trimmed.substringBefore('/').substringBefore(':').takeIf { it.isNotEmpty() }
+        }
+    }
+}

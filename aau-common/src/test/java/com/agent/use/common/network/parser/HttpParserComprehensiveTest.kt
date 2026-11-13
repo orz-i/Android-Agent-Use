@@ -260,4 +260,157 @@ class HttpParserComprehensiveTest {
         assertNotNull(cached)
         assertArrayEquals("pong".toByteArray(StandardCharsets.UTF_8), cached)
     }
+
+    @Test
+    fun testMidStreamHttp2WithoutPrefaceSettingsAndHeaders() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val responses = mutableListOf<HttpResponseEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) {
+                requests.add(event)
+            }
+            override fun onResponseReceived(event: HttpResponseEvent) {
+                responses.add(event)
+            }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+        val config = NetworkCaptureConfig(targetPackage = "com.xingin.xhs")
+        val tlsParser = TlsStreamParser(config, listener, defaultConnectionHostHint = "edith.xiaohongshu.com")
+
+        // 1. Mid-stream attach: Outbound SETTINGS frame on stream 0 (NO CLIENT_PREFACE!)
+        val settingsPayload = byteArrayOf(0x00, 0x01, 0x00, 0x00, 0x10, 0x00) // SETTINGS_HEADER_TABLE_SIZE = 4096
+        val settingsFrame = h2Frame(Http2PlaintextParser.FRAME_TYPE_SETTINGS, 0, 0, settingsPayload)
+        tlsParser.onOutboundData("conn_xhs", settingsFrame)
+
+        // 2. Outbound HEADERS frame on stream 1 without preface
+        val reqHeaders = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(hpackLiteralInc(1, "edith.xiaohongshu.com")) // :authority
+            write(hpackLiteralInc(4, "/api/v1/user")) // :path
+        }.toByteArray()
+        val headersFrame = h2Frame(
+            Http2PlaintextParser.FRAME_TYPE_HEADERS,
+            Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM,
+            1,
+            reqHeaders
+        )
+        tlsParser.onOutboundData("conn_xhs", headersFrame)
+
+        assertEquals("Mid-stream HTTP/2 request must be parsed without preface", 1, requests.size)
+        assertEquals("GET", requests[0].method)
+        assertEquals("https://edith.xiaohongshu.com/api/v1/user", requests[0].url)
+
+        // 3. Inbound HEADERS (stream 1) + DATA (stream 1)
+        val respHeaders = ByteArrayOutputStream().apply {
+            write(0x88) // :status: 200
+            write(hpackLiteralInc(31, "application/json"))
+        }.toByteArray()
+        val respHeadersFrame = h2Frame(Http2PlaintextParser.FRAME_TYPE_HEADERS, Http2PlaintextParser.FLAG_END_HEADERS, 1, respHeaders)
+        val dataPayload = """{"code":0,"msg":"Success"}""".toByteArray(StandardCharsets.UTF_8)
+        val respDataFrame = h2Frame(Http2PlaintextParser.FRAME_TYPE_DATA, Http2PlaintextParser.FLAG_END_STREAM, 1, dataPayload)
+
+        tlsParser.onInboundData("conn_xhs", respHeadersFrame)
+        tlsParser.onInboundData("conn_xhs", respDataFrame)
+
+        assertEquals("Mid-stream HTTP/2 response must be parsed", 1, responses.size)
+        assertEquals(200, responses[0].statusCode)
+        assertEquals("https://edith.xiaohongshu.com/api/v1/user", responses[0].url)
+        val body = tlsParser.getResponseBody(responses[0].requestId)
+        assertNotNull(body)
+        assertEquals("""{"code":0,"msg":"Success"}""", String(body!!, StandardCharsets.UTF_8))
+    }
+
+    @Test
+    fun testMidStreamHpackDynamicTableMissFallsBackWhileKeepingPath() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val parser = Http2PlaintextParser(
+            connectionHostHint = null,
+            onParsedRequest = { requests.add(it) },
+            onParsedResponse = {},
+            onBodyChunk = { _, _ -> }
+        )
+
+        // Request 1 establishes lastSeenAuthority = "api.xiaohongshu.com"
+        val req1Headers = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(hpackLiteralInc(1, "api.xiaohongshu.com")) // :authority
+            write(hpackLiteralInc(4, "/feed"))
+        }.toByteArray()
+        parser.feedOutbound(
+            h2Frame(Http2PlaintextParser.FRAME_TYPE_HEADERS, Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM, 1, req1Headers),
+            "conn_miss"
+        )
+        assertEquals(1, requests.size)
+        assertEquals("https://api.xiaohongshu.com/feed", requests[0].url)
+
+        // Request 2 has dynamic table miss (0xBE = index 62 in dynamic table), but specifies path /api/sns/v1/note
+        val req2Headers = ByteArrayOutputStream().apply {
+            write(0x83) // :method: POST
+            write(0x87) // :scheme: https
+            write(0x80 or 62) // Unknown dynamic index 62 (:authority miss)
+            write(hpackLiteralInc(4, "/api/sns/v1/note"))
+        }.toByteArray()
+        parser.feedOutbound(
+            h2Frame(Http2PlaintextParser.FRAME_TYPE_HEADERS, Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM, 3, req2Headers),
+            "conn_miss"
+        )
+        assertEquals(2, requests.size)
+        assertEquals("POST", requests[1].method)
+        // Must fall back to lastSeenAuthority while keeping decoded :path (NEVER localhost!)
+        assertEquals("https://api.xiaohongshu.com/api/sns/v1/note", requests[1].url)
+
+        // Request on fresh parser without lastSeenAuthority or hint: falls back to unknown-host, keeping path
+        val freshRequests = mutableListOf<HttpRequestEvent>()
+        val freshParser = Http2PlaintextParser(
+            onParsedRequest = { freshRequests.add(it) },
+            onParsedResponse = {},
+            onBodyChunk = { _, _ -> }
+        )
+        freshParser.feedOutbound(
+            h2Frame(Http2PlaintextParser.FRAME_TYPE_HEADERS, Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM, 1, req2Headers),
+            "conn_fresh"
+        )
+        assertEquals(1, freshRequests.size)
+        assertEquals("https://unknown-host/api/sns/v1/note", freshRequests[0].url)
+    }
+
+    @Test
+    fun testHttp1WithoutHostHeaderFallsBackWithoutLocalhost() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val parserWithHint = Http1PlaintextParser(
+            connectionHostHint = "mobile.xiaohongshu.com",
+            onParsedRequest = { requests.add(it) },
+            onParsedResponse = {},
+            onBodyChunk = { _, _ -> }
+        )
+
+        // Request without Host header on parser with connectionHostHint
+        val reqNoHost = "GET /api/v2/items HTTP/1.1\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        parserWithHint.feedOutbound(reqNoHost, "c_hint")
+        assertEquals(1, requests.size)
+        assertEquals("https://mobile.xiaohongshu.com/api/v2/items", requests[0].url)
+
+        // Fresh parser without Host header and without hint
+        val noHintRequests = mutableListOf<HttpRequestEvent>()
+        val freshParser = Http1PlaintextParser(
+            onParsedRequest = { noHintRequests.add(it) },
+            onParsedResponse = {},
+            onBodyChunk = { _, _ -> }
+        )
+        freshParser.feedOutbound(reqNoHost, "c_nohint")
+        assertEquals(1, noHintRequests.size)
+        assertEquals("https://unknown-host/api/v2/items", noHintRequests[0].url)
+
+        // Sequential requests: first establishes Host, second lacks Host header
+        val req1WithHost = "GET /first HTTP/1.1\r\nHost: service.example.com\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        val req2WithoutHost = "GET /second HTTP/1.1\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        freshParser.feedOutbound(req1WithHost, "c_seq")
+        freshParser.feedOutbound(req2WithoutHost, "c_seq")
+        assertEquals(3, noHintRequests.size)
+        assertEquals("https://service.example.com/first", noHintRequests[1].url)
+        assertEquals("https://service.example.com/second", noHintRequests[2].url)
+    }
 }

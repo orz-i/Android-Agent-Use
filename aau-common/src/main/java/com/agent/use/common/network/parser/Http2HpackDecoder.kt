@@ -91,38 +91,43 @@ class Http2HpackDecoder(
             val b = input.read()
             if (b == -1) break
 
-            when {
-                // 1. Indexed Header Field Representation (1xxxxxxx)
-                (b and 0x80) != 0 -> {
-                    val index = readInteger(b, 0x7F, input)
-                    getEntry(index)?.let { headers.add(it) }
-                }
-                // 2. Literal Header Field with Incremental Indexing (01xxxxxx)
-                (b and 0x40) != 0 -> {
-                    val index = readInteger(b, 0x3F, input)
-                    val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
-                    val value = readString(input)
-                    if (name.isNotEmpty()) {
-                        val header = HttpHeader(name, value)
-                        headers.add(header)
-                        insertDynamicEntry(header)
+            try {
+                when {
+                    // 1. Indexed Header Field Representation (1xxxxxxx)
+                    (b and 0x80) != 0 -> {
+                        val index = readInteger(b, 0x7F, input)
+                        getEntry(index)?.let { headers.add(it) }
+                    }
+                    // 2. Literal Header Field with Incremental Indexing (01xxxxxx)
+                    (b and 0x40) != 0 -> {
+                        val index = readInteger(b, 0x3F, input)
+                        val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
+                        val value = readString(input)
+                        if (name.isNotEmpty()) {
+                            val header = HttpHeader(name, value)
+                            headers.add(header)
+                            insertDynamicEntry(header)
+                        }
+                    }
+                    // 3. Dynamic Table Size Update (001xxxxx)
+                    (b and 0x20) != 0 -> {
+                        val newMax = readInteger(b, 0x1F, input).coerceAtLeast(0)
+                        maxDynamicTableSize = newMax
+                        evictToMaxSize()
+                    }
+                    // 4. Literal Header Field without Indexing / Never Indexed (0000xxxx / 0001xxxx)
+                    else -> {
+                        val index = readInteger(b, 0x0F, input)
+                        val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
+                        val value = readString(input)
+                        if (name.isNotEmpty()) {
+                            headers.add(HttpHeader(name, value))
+                        }
                     }
                 }
-                // 3. Dynamic Table Size Update (001xxxxx)
-                (b and 0x20) != 0 -> {
-                    val newMax = readInteger(b, 0x1F, input).coerceAtLeast(0)
-                    maxDynamicTableSize = newMax
-                    evictToMaxSize()
-                }
-                // 4. Literal Header Field without Indexing / Never Indexed (0000xxxx / 0001xxxx)
-                else -> {
-                    val index = readInteger(b, 0x0F, input)
-                    val name = if (index != 0) getEntry(index)?.name.orEmpty() else readString(input)
-                    val value = readString(input)
-                    if (name.isNotEmpty()) {
-                        headers.add(HttpHeader(name, value))
-                    }
-                }
+            } catch (_: Exception) {
+                // Gracefully recover on mid-stream truncated or malformed field without aborting
+                break
             }
         }
 
@@ -184,6 +189,7 @@ class Http2HpackDecoder(
     private fun readString(input: ByteArrayInputStream): String {
         if (input.available() == 0) return ""
         val first = input.read()
+        if (first == -1) return ""
         val isHuffman = (first and 0x80) != 0
         val length = readInteger(first, 0x7F, input).coerceAtLeast(0)
         if (length == 0) return ""
@@ -192,10 +198,14 @@ class Http2HpackDecoder(
         val bytes = ByteArray(safeLen)
         val readBytes = input.read(bytes, 0, safeLen)
         if (readBytes <= 0) return ""
-        return if (isHuffman) {
-            Http2Huffman.decodeToString(bytes, readBytes)
-        } else {
-            String(bytes, 0, readBytes, Charsets.UTF_8)
+        return try {
+            if (isHuffman) {
+                Http2Huffman.decodeToString(bytes, readBytes)
+            } else {
+                String(bytes, 0, readBytes, Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            ""
         }
     }
 }
