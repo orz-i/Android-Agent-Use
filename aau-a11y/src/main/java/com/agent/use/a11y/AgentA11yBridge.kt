@@ -1,8 +1,10 @@
 package com.agent.use.a11y
 
+import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
+import android.view.Display
 import com.agent.use.a11y.model.A11yNode
 
 /**
@@ -98,6 +100,27 @@ class AgentA11yBridge(
         val endY = screenHeight * 0.75f
         return gestureDispatcher.swipe(displayId, midX, startY, midX, endY, durationMs = 300L)
     }
+
+    /**
+     * 截取指定屏幕画面
+     */
+    suspend fun captureScreenshot(displayId: Int = Display.DEFAULT_DISPLAY): AgentAccessibilityService.ScreenshotOutcome {
+        val service = AgentAccessibilityService.instance.value
+            ?: return AgentAccessibilityService.ScreenshotOutcome.Failed(
+                AccessibilityService.ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS
+            )
+        return service.captureScreenshot(displayId)
+    }
+
+    /**
+     * 获取指定屏幕当前顶层应用包名
+     */
+    fun topPackage(displayId: Int): String? = windowInspector.topPackage(displayId)
+
+    /**
+     * 计算指定屏幕当前窗口的 64 位 FNV-1a 指纹
+     */
+    fun windowHash(displayId: Int): Long = windowInspector.windowHash(displayId)
 
     companion object {
         @JvmStatic

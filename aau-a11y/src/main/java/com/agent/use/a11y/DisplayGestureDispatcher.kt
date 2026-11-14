@@ -37,7 +37,7 @@ class DisplayGestureDispatcher(
         }
         val gesture = builder.build()
 
-        return suspendCancellableCoroutine { cont ->
+        suspend fun send(): Boolean = suspendCancellableCoroutine { cont ->
             val callback = object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription) {
                     if (cont.isActive) cont.resume(true)
@@ -52,7 +52,20 @@ class DisplayGestureDispatcher(
                 cont.resume(false)
             }
         }
+        return service.passInjectedGestureThrough { send() }
     }
+
+    /**
+     * 沿着单个 Path 执行单指手势
+     */
+    suspend fun gesture(displayId: Int, path: Path, durationMs: Long): Boolean =
+        gesture(displayId, listOf(path), durationMs)
+
+    /**
+     * 沿着多个 Path 并行执行多指手势
+     */
+    suspend fun gesture(displayId: Int, paths: List<Path>, durationMs: Long): Boolean =
+        dispatch(displayId, paths.map { GestureDescription.StrokeDescription(it, 0, durationMs.coerceAtLeast(1L)) })
 
     /**
      * 在指定屏幕坐标执行单点点击
