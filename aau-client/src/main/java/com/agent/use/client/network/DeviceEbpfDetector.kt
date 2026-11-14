@@ -3,19 +3,21 @@ package com.agent.use.client.network
 import android.util.Log
 import com.agent.use.common.IAgentShell
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
 /**
  * 客户端轻量级 eBPF 与 Root 运行环境探测器。
  *
  * 用于在 [com.agent.use.common.network.CaptureMode.AUTO] 模式下快速裁决设备是否具备
- * 进入 Root eBPF 捕获的前提条件（需具备 Root 权限且 Linux 内核版本 >= 5.4）。
+ * 进入 Root eBPF 捕获的前提条件（需具备实际可用的 Root 权限且 Linux 内核版本 >= 5.4）。
  */
 object DeviceEbpfDetector {
     private const val TAG = "DeviceEbpfDetector"
 
     const val MIN_KERNEL_MAJOR = 5
     const val MIN_KERNEL_MINOR = 4
+    private const val SU_PROBE_TIMEOUT_MS = 1500L
 
     private val KERNEL_REGEX = Pattern.compile("(?:Linux version |^)(\\d+)\\.(\\d+)(?:\\.(\\d+))?")
 
@@ -23,10 +25,10 @@ object DeviceEbpfDetector {
         "/system/bin/su",
         "/system/xbin/su",
         "/sbin/su",
+        "/su/bin/su",
+        "/vendor/bin/su",
+        "/debug_ramdisk/su",
         "/data/local/tmp/su",
-        "/data/adb/ksu/bin/su",
-        "/data/adb/ap/bin/su",
-        "/system/sd/xbin/su",
         "/data/local/xbin/su",
         "/data/local/bin/su",
         "/data/local/su"
@@ -43,14 +45,20 @@ object DeviceEbpfDetector {
     }
 
     /**
-     * 判断设备是否拥有 Root 权限。
+     * 判断设备是否拥有实际可用的 Root 权限（不依赖特定 Root 管理器实现）。
      *
      * 判定优先级：
-     * 1. 若已有 shell 连接，直接校验服务端守护进程的 UID 是否为 0 (Root)；
-     * 2. 检查常见 su 二进制可执行路径；
-     * 3. 尝试通过 which su 探测。
+     * 1. 若已有 shell 连接，校验服务端守护进程的 UID 是否为 0 (Root)；
+     * 2. 查找通用 `su` 可执行路径（标准路径、PATH）并实测 `su -c id` 是否返回 `uid=0`。
      */
-    fun isDeviceRooted(shell: IAgentShell? = null): Boolean {
+    fun isDeviceRooted(shell: IAgentShell? = null): Boolean =
+        isDeviceRooted(shell, ::verifySuUidZero)
+
+    internal fun isDeviceRooted(
+        shell: IAgentShell?,
+        suRootVerifier: (String) -> Boolean,
+        extraSuCandidates: List<String> = emptyList()
+    ): Boolean {
         // 1. 若已有 shell 连接，检查其 UID 是否为 0
         if (shell != null) {
             try {
@@ -63,17 +71,61 @@ object DeviceEbpfDetector {
             }
         }
 
-        // 2. 检查常见 su 路径
+        // 2. 收集通用 su 候选并验证是否真实具备 UID 0 提权能力
+        val candidates = LinkedHashSet<String>()
+        for (path in extraSuCandidates) {
+            if (path.isNotBlank()) candidates.add(path)
+        }
         for (path in KNOWN_SU_PATHS) {
-            if (File(path).exists()) {
+            val file = File(path)
+            if (file.exists() && file.canExecute()) {
+                candidates.add(path)
+            }
+        }
+        resolveWhichSu()?.let { candidates.add(it) }
+        candidates.add("su")
+
+        for (candidate in candidates) {
+            if (suRootVerifier(candidate)) {
                 return true
             }
         }
+        return false
+    }
 
-        // 3. 尝试 which su 探测
+    private fun resolveWhichSu(): String? {
         return try {
-            val process = ProcessBuilder("which", "su").start()
-            process.waitFor() == 0
+            val process = ProcessBuilder("which", "su")
+                .redirectErrorStream(true)
+                .start()
+            val finished = process.waitFor(SU_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return null
+            }
+            if (process.exitValue() == 0) {
+                process.inputStream.bufferedReader().readText().lineSequence()
+                    .firstOrNull { it.isNotBlank() }?.trim()
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun verifySuUidZero(suBinary: String): Boolean {
+        return try {
+            val process = ProcessBuilder(suBinary, "-c", "id")
+                .redirectErrorStream(true)
+                .start()
+            val finished = process.waitFor(SU_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return false
+            }
+            val output = process.inputStream.bufferedReader().readText()
+            process.exitValue() == 0 && output.contains("uid=0")
         } catch (_: Exception) {
             false
         }

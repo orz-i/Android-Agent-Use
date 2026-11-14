@@ -76,6 +76,11 @@ class AgentNetworkManager(
     var lastError: String? = null
         private set
 
+    /** 当 AUTO 模式尝试 eBPF 失败并降级到 VpnService 时，保留当次 eBPF 失败原因以供诊断。 */
+    @Volatile
+    var lastEbpfFallbackError: String? = null
+        private set
+
     @Volatile
     private var activeMode: CaptureMode = CaptureMode.AUTO
 
@@ -111,8 +116,8 @@ class AgentNetworkManager(
     val errorFlow: SharedFlow<Pair<String, String>> = _errorFlow.asSharedFlow()
 
     private val _chunkFlow = MutableSharedFlow<Pair<String, ByteArray>>(
-        replay = 0,
-        extraBufferCapacity = 64,
+        replay = 32,
+        extraBufferCapacity = 256,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val chunkFlow: SharedFlow<Pair<String, ByteArray>> = _chunkFlow.asSharedFlow()
@@ -133,6 +138,8 @@ class AgentNetworkManager(
 
     private val requestSubscriptions = CopyOnWriteArrayList<RequestSubscription>()
     private val responseSubscriptions = CopyOnWriteArrayList<ResponseSubscription>()
+    private val chunkSubscriptions = CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
+    private val errorSubscriptions = CopyOnWriteArrayList<(String, String) -> Unit>()
 
     // ==========================================
     // AIDL 事件桥接器
@@ -163,12 +170,22 @@ class AgentNetworkManager(
 
         override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {
             _chunkFlow.tryEmit(requestId to chunk)
+            for (sub in chunkSubscriptions) {
+                runCatching { sub(requestId, chunk) }.onFailure {
+                    Log.e(TAG, "Error in onDataChunk callback for $requestId", it)
+                }
+            }
         }
 
         override fun onErrorOccurred(requestId: String, errorMsg: String) {
             Log.w(TAG, "Capture error occurred: requestId=$requestId, msg=$errorMsg")
             lastError = errorMsg
             _errorFlow.tryEmit(requestId to errorMsg)
+            for (sub in errorSubscriptions) {
+                runCatching { sub(requestId, errorMsg) }.onFailure {
+                    Log.e(TAG, "Error in onError callback for $requestId", it)
+                }
+            }
         }
     }
 
@@ -217,6 +234,7 @@ class AgentNetworkManager(
         }
 
         this.lastError = null
+        this.lastEbpfFallbackError = null
         this.currentPackage = targetPkg
 
         return when (config.mode) {
@@ -237,7 +255,8 @@ class AgentNetworkManager(
                         Log.i(TAG, "Successfully activated eBPF capture engine for $targetPkg")
                         return true
                     }
-                    Log.w(TAG, "eBPF activation failed in AUTO mode. Falling back gracefully to VpnCaptureEngine...")
+                    Log.w(TAG, "eBPF activation failed in AUTO mode ($lastError). Falling back gracefully to VpnCaptureEngine...")
+                    lastEbpfFallbackError = lastError
                 } else {
                     Log.i(TAG, "Device does not satisfy eBPF requirements. Falling back gracefully to VpnCaptureEngine...")
                 }
@@ -284,52 +303,66 @@ class AgentNetworkManager(
     }
 
     private fun activateEbpf(config: NetworkCaptureConfig): Boolean {
-        val engine = try {
-            serverCaptureProvider?.invoke()
-                ?: shell?.networkCapture
-                ?: localEbpfProvider?.invoke()
-                ?: context?.let { ctx ->
-                    localEbpfEngine ?: LocalRootEbpfCaptureEngine(ctx).also { localEbpfEngine = it }
+        val candidates = ArrayList<INetworkCapture>(3)
+        fun addCandidate(candidate: INetworkCapture?) {
+            if (candidate != null && candidates.none { it === candidate }) {
+                candidates.add(candidate)
+            }
+        }
+
+        try {
+            addCandidate(serverCaptureProvider?.invoke())
+            addCandidate(shell?.networkCapture)
+            addCandidate(localEbpfProvider?.invoke())
+            if (localEbpfProvider == null) {
+                context?.let { ctx ->
+                    val local = localEbpfEngine ?: LocalRootEbpfCaptureEngine(ctx).also { localEbpfEngine = it }
+                    addCandidate(local)
                 }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to obtain eBPF capture engine: ${e.message}", e)
             lastError = "ebpf_engine_error:${e.message}"
-            null
+            return false
         }
 
-        if (engine == null) {
+        if (candidates.isEmpty()) {
             Log.w(TAG, "EbpfCaptureEngine unavailable (no shell binder and no local root helper)")
             if (lastError == null) lastError = "ebpf_engine_unavailable"
             return false
         }
 
-        return try {
-            val success = engine.startCapture(config, internalListener)
-            if (success) {
-                activeEngine = engine
-                activeMode = CaptureMode.EBPF
-                currentConfig = config
-                lastError = null
-                true
-            } else {
+        for (engine in candidates) {
+            val started = try {
+                val success = engine.startCapture(config, internalListener)
+                if (success) {
+                    activeEngine = engine
+                    activeMode = CaptureMode.EBPF
+                    currentConfig = config
+                    lastError = null
+                    lastEbpfFallbackError = null
+                    return true
+                }
                 val engineErr = (engine as? LocalRootEbpfCaptureEngine)?.lastError
                 if (!engineErr.isNullOrBlank()) {
                     lastError = engineErr
                 } else if (lastError == null) {
                     lastError = "ebpf_start_failed"
                 }
-                Log.w(TAG, "EbpfCaptureEngine.startCapture returned false ($lastError)")
+                Log.w(TAG, "EbpfCaptureEngine candidate ${engine.javaClass.simpleName} failed ($lastError)")
+                false
+            } catch (e: RemoteException) {
+                Log.e(TAG, "RemoteException calling EbpfCaptureEngine.startCapture: ${e.message}", e)
+                lastError = "ebpf_remote_exception:${e.message}"
+                false
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception calling EbpfCaptureEngine.startCapture: ${e.message}", e)
+                lastError = "ebpf_exception:${e.message}"
                 false
             }
-        } catch (e: RemoteException) {
-            Log.e(TAG, "RemoteException calling EbpfCaptureEngine.startCapture: ${e.message}", e)
-            lastError = "ebpf_remote_exception:${e.message}"
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception calling EbpfCaptureEngine.startCapture: ${e.message}", e)
-            lastError = "ebpf_exception:${e.message}"
-            false
+            if (started) return true
         }
+        return false
     }
 
     private fun activateVpn(config: NetworkCaptureConfig): Boolean {
@@ -408,6 +441,22 @@ class AgentNetworkManager(
      */
     fun removeResponseListener(callback: (HttpResponseEvent) -> Unit) {
         responseSubscriptions.removeAll { it.callback == callback }
+    }
+
+    /**
+     * 同步注册响应体分片到达监听，避免早期分片因异步 Flow 调度延迟而丢失。
+     */
+    fun onDataChunk(callback: (String, ByteArray) -> Unit): AutoCloseable {
+        chunkSubscriptions.add(callback)
+        return AutoCloseable { chunkSubscriptions.remove(callback) }
+    }
+
+    /**
+     * 同步注册抓包/请求错误监听。
+     */
+    fun onError(callback: (String, String) -> Unit): AutoCloseable {
+        errorSubscriptions.add(callback)
+        return AutoCloseable { errorSubscriptions.remove(callback) }
     }
 
     /**
@@ -540,6 +589,8 @@ class AgentNetworkManager(
             disable()
             requestSubscriptions.clear()
             responseSubscriptions.clear()
+            chunkSubscriptions.clear()
+            errorSubscriptions.clear()
         }
     }
 }

@@ -348,4 +348,30 @@ class AgentNetworkManagerTest {
         // close 后再次 enable 应直接返回 false
         assertFalse(manager.enable("com.example.target", CaptureMode.VPN_SERVICE))
     }
+
+    @Test
+    fun testAutoSelection_ServerEbpfFails_FallsBackToLocalEbpfBeforeVpn() {
+        val mockServerEbpf = MockEngine(CaptureMode.ACTIVE_MODE_EBPF, shouldSucceed = false)
+        val mockLocalEbpf = MockEngine(CaptureMode.ACTIVE_MODE_EBPF, shouldSucceed = true)
+        val mockVpn = MockEngine(CaptureMode.ACTIVE_MODE_VPN_SERVICE, shouldSucceed = true)
+
+        val manager = AgentNetworkManager(
+            context = null,
+            shell = null,
+            vpnEngineProvider = { mockVpn },
+            serverCaptureProvider = { mockServerEbpf },
+            localEbpfProvider = { mockLocalEbpf },
+            rootChecker = { true },
+            kernelChecker = { true }
+        )
+
+        val started = manager.enable("com.example.target", CaptureMode.AUTO)
+
+        assertTrue(started)
+        assertEquals(CaptureMode.EBPF, manager.getActiveMode())
+        assertEquals(1, mockServerEbpf.startCount)
+        assertEquals(1, mockLocalEbpf.startCount)
+        assertEquals(0, mockVpn.startCount)
+        manager.close()
+    }
 }

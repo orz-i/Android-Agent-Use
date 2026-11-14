@@ -1,8 +1,10 @@
 package com.agent.use.client.network
 
+import com.agent.use.common.IAgentShell
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.lang.reflect.Proxy
 
 class DeviceEbpfDetectorTest {
 
@@ -26,5 +28,31 @@ class DeviceEbpfDetectorTest {
         assertFalse(DeviceEbpfDetector.isKernelVersionSupported("5.3.9"))
         assertFalse(DeviceEbpfDetector.isKernelVersionSupported("invalid-kernel-string"))
         assertFalse(DeviceEbpfDetector.isKernelVersionSupported(""))
+    }
+
+    @Test
+    fun testActualRootVerificationIndependentOfShellUidAndManagerPaths() {
+        val shellUid2000 = Proxy.newProxyInstance(
+            IAgentShell::class.java.classLoader,
+            arrayOf(IAgentShell::class.java)
+        ) { _, method, _ ->
+            if (method.name == "identity") intArrayOf(2000, 2000) else null
+        } as IAgentShell
+
+        val shellUid0 = Proxy.newProxyInstance(
+            IAgentShell::class.java.classLoader,
+            arrayOf(IAgentShell::class.java)
+        ) { _, method, _ ->
+            if (method.name == "identity") intArrayOf(0, 0) else null
+        } as IAgentShell
+
+        // 1. Shell running as UID 0 immediately satisfies root
+        assertTrue(DeviceEbpfDetector.isDeviceRooted(shellUid0, { false }))
+
+        // 2. Shell running as UID 2000, but app itself has working `su -c id` -> true
+        assertTrue(DeviceEbpfDetector.isDeviceRooted(shellUid2000, { candidate -> candidate == "su" }))
+
+        // 3. No su grants uid=0 -> false
+        assertFalse(DeviceEbpfDetector.isDeviceRooted(shellUid2000, { false }))
     }
 }

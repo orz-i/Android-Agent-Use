@@ -35,9 +35,10 @@ object EbpfCapabilityDetector : EbpfCapabilityProvider {
         "/system/bin/su",
         "/system/xbin/su",
         "/sbin/su",
+        "/su/bin/su",
+        "/vendor/bin/su",
+        "/debug_ramdisk/su",
         "/data/local/tmp/su",
-        "/data/adb/ksu/bin/su",
-        "/data/adb/ap/bin/su",
         "/system/xbin/daemonsu"
     )
 
