@@ -1,6 +1,7 @@
 package com.agent.use.a11y.model
 
 import android.graphics.Rect
+import com.agent.use.a11y.DisplayWindowInspector
 
 /**
  * 无障碍无状态节点语义模型。
@@ -22,15 +23,30 @@ data class A11yNode(
     val isSelected: Boolean = false,
     val isEnabled: Boolean = true,
     val isPassword: Boolean = false,
-    val children: List<A11yNode> = emptyList()
+    val children: List<A11yNode> = emptyList(),
+    val hintText: String? = null,
+    val stateDescription: String? = null,
+    val isShowingHintText: Boolean = false,
+    val isCheckable: Boolean = false,
+    val isChecked: Boolean = false,
+    val canSetText: Boolean = isEditable
 ) {
     val centerX: Int get() = bounds.centerX()
     val centerY: Int get() = bounds.centerY()
 
-    /** 最佳可读标签：优先取 text，若为空取 contentDescription */
+    /** 控件简短角色名（如 Button、EditText） */
+    val role: String
+        get() = className?.substringAfterLast('.')?.ifEmpty { null } ?: "View"
+
+    /** 可读短资源 ID（过滤混淆名） */
+    val readableResourceId: String?
+        get() = DisplayWindowInspector.readableResourceId(viewId)
+
+    /** 最佳可读标签：优先取 text，若为空取 contentDescription，再取 hintText */
     val label: String
-        get() = text?.takeIf { it.isNotBlank() }
-            ?: contentDescription?.takeIf { it.isNotBlank() }
+        get() = text?.trim()?.takeIf { it.isNotEmpty() }
+            ?: contentDescription?.trim()?.takeIf { it.isNotEmpty() }
+            ?: hintText?.trim()?.takeIf { it.isNotEmpty() }
             ?: ""
 
     /**

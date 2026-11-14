@@ -38,3 +38,12 @@ data class DisplayEvent(
         }
     }
 }
+
+/**
+ * 通知事件模型。
+ */
+data class NotificationEvent(
+    val packageName: String?,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
