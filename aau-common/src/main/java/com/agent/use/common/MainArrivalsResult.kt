@@ -15,13 +15,18 @@ data class MainArrivalsResult(
     companion object {
         const val KEY_TASK_IDS = "taskIds"
         const val KEY_PACKAGES = "packages"
+        const val KEY_TASK = "task"
+        const val KEY_PACKAGE = "package"
 
         @JvmStatic
         fun fromBundle(bundle: Bundle?): MainArrivalsResult {
             if (bundle == null) return MainArrivalsResult(emptyList(), emptyList())
-            val ids = bundle.getIntArray(KEY_TASK_IDS)?.toList().orEmpty()
-            val pkgs = bundle.getStringArrayList(KEY_PACKAGES)?.toList()
-                ?: bundle.getStringArray(KEY_PACKAGES)?.toList().orEmpty()
+            val ids = (bundle.getIntArray(KEY_TASK_IDS) ?: bundle.getIntArray(KEY_TASK))?.toList().orEmpty()
+            val pkgs = bundle.getStringArrayList(KEY_PACKAGES)?.map { it.orEmpty() }
+                ?: bundle.getStringArray(KEY_PACKAGES)?.map { it.orEmpty() }
+                ?: bundle.getStringArrayList(KEY_PACKAGE)?.map { it.orEmpty() }
+                ?: bundle.getStringArray(KEY_PACKAGE)?.map { it.orEmpty() }
+                ?: emptyList()
             return MainArrivalsResult(ids, pkgs)
         }
     }

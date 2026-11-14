@@ -72,14 +72,14 @@ data class AppAudioKey(
     val second: Int? get() = userId
 
     override fun toString(): String =
-        if (userId == null || userId == 0) packageName else "$packageName@$userId"
+        if (userId == null) packageName else "$packageName@$userId"
 
     companion object {
         private val REGEX = Regex("""([A-Za-z0-9_.]+)(?:@([0-9]+))?""")
 
         @JvmStatic
-        fun of(packageName: String, user: Int?): String =
-            if (user == null || user == 0) packageName else "$packageName@$user"
+        fun of(packageName: String, user: Int? = null): String =
+            if (user == null) packageName else "$packageName@$user"
 
         @JvmStatic
         fun parse(key: String): AppAudioKey? {
