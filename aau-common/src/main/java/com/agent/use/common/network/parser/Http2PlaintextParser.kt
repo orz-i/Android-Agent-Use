@@ -255,6 +255,12 @@ class Http2PlaintextParser(
                     if (endStream) {
                         dispatchResponseIfNeeded(stream)
                         streams.remove(streamId)
+                    } else if (
+                        stream.responseHeadersReceived &&
+                        stream.contentLength > 0L &&
+                        stream.responseBodyStream.size().toLong() >= stream.contentLength
+                    ) {
+                        dispatchResponseIfNeeded(stream)
                     }
                 }
             }
@@ -287,22 +293,19 @@ class Http2PlaintextParser(
                 when (h.name.lowercase()) {
                     ":method" -> method = h.value
                     ":scheme" -> scheme = h.value
-                    ":authority" -> if (h.value.isNotEmpty()) authority = h.value
-                    "host" -> if (authority == null && h.value.isNotEmpty()) authority = h.value
+                    ":authority" -> if (isUsableHost(h.value)) authority = h.value.trim()
+                    "host" -> if (authority == null && isUsableHost(h.value)) authority = h.value.trim()
                     ":path" -> path = h.value
                 }
             }
 
             if (authority == null) {
-                val originOrReferer = headers.firstOrNull {
-                    it.name.equals("Origin", ignoreCase = true) || it.name.equals("Referer", ignoreCase = true)
-                }?.value
-                authority = extractHost(originOrReferer)
+                authority = extractHostFromHeaders(headers)
             }
 
             if (authority == null) {
                 authority = lastSeenAuthority ?: connectionHostHint ?: "unknown-host"
-            } else if (authority != "unknown-host" && !authority.equals("localhost", ignoreCase = true)) {
+            } else {
                 lastSeenAuthority = authority
             }
 
@@ -314,33 +317,42 @@ class Http2PlaintextParser(
                 dispatchRequestIfNeeded(stream)
             }
         } else {
-            var statusCode = 200
-            for (h in headers) {
-                if (h.name == ":status") {
-                    statusCode = h.value.toIntOrNull() ?: 200
+            if (!stream.responseHeadersReceived) {
+                var statusCode = 200
+                for (h in headers) {
+                    if (h.name == ":status") {
+                        statusCode = h.value.toIntOrNull() ?: 200
+                    }
                 }
-            }
-            // Ignore 1xx informational header blocks (except 101)
-            if (statusCode in 100..199 && statusCode != 101) return
+                // Ignore 1xx informational header blocks (except 101)
+                if (statusCode in 100..199 && statusCode != 101) return
 
-            // If this stream was created by an inbound response without outbound request captured,
-            // update stream.url if headers provide any host hint
-            if (stream.requestHeaders.isEmpty()) {
-                val location = headers.firstOrNull { it.name.equals("Location", ignoreCase = true) }?.value
-                val locHost = extractHost(location)
-                if (locHost != null && locHost != "unknown-host" && !locHost.equals("localhost", ignoreCase = true)) {
-                    lastSeenAuthority = locHost
+                val respHost = extractHostFromHeaders(headers)
+                if (respHost != null) {
+                    lastSeenAuthority = respHost
                 }
-                val fallbackHost = lastSeenAuthority ?: connectionHostHint ?: "unknown-host"
-                stream.url = "https://$fallbackHost/"
-            }
+                val resolvedHost = respHost ?: lastSeenAuthority ?: connectionHostHint
+                if (resolvedHost != null && isUsableHost(resolvedHost)) {
+                    if (stream.url.contains("://unknown-host")) {
+                        stream.url = stream.url.replace("://unknown-host", "://$resolvedHost")
+                    } else if (stream.requestHeaders.isEmpty() && stream.url.isEmpty()) {
+                        stream.url = "https://$resolvedHost/"
+                    }
+                } else if (stream.requestHeaders.isEmpty() && stream.url.isEmpty()) {
+                    stream.url = "https://unknown-host/"
+                }
 
-            stream.statusCode = statusCode
-            stream.mimeType = headers.firstOrNull { it.name.equals("content-type", ignoreCase = true) }?.value
-            stream.contentLength = headers.firstOrNull { it.name.equals("content-length", ignoreCase = true) }
-                ?.value?.trim()?.toLongOrNull() ?: -1L
-            stream.responseHeaders = headers
-            stream.responseHeadersReceived = true
+                stream.statusCode = statusCode
+                stream.mimeType = headers.firstOrNull { it.name.equals("content-type", ignoreCase = true) }?.value
+                stream.contentLength = headers.firstOrNull { it.name.equals("content-length", ignoreCase = true) }
+                    ?.value?.trim()?.toLongOrNull() ?: -1L
+                stream.responseHeaders = headers
+                stream.responseHeadersReceived = true
+            } else {
+                // HTTP/2 trailing HEADERS (e.g., gRPC Trailers with grpc-status / grpc-message):
+                // preserve initial :status / content-type / headers and append trailers.
+                stream.responseHeaders = stream.responseHeaders + headers
+            }
 
             if (isEndStream) {
                 dispatchResponseIfNeeded(stream)
@@ -349,12 +361,21 @@ class Http2PlaintextParser(
         }
     }
 
+    private fun resolveStreamHostIfUnknown(stream: StreamContext) {
+        if (!stream.url.contains("://unknown-host")) return
+        val fallbackHost = lastSeenAuthority ?: connectionHostHint
+        if (fallbackHost != null && isUsableHost(fallbackHost)) {
+            stream.url = stream.url.replace("://unknown-host", "://$fallbackHost")
+        }
+    }
+
     private fun dispatchRequestIfNeeded(stream: StreamContext) {
         if (stream.requestDispatched) return
         stream.requestDispatched = true
+        resolveStreamHostIfUnknown(stream)
         val rawPost = stream.postDataStream.toByteArray()
         val decodedPost = HttpContentDecoder.decompressIfNeeded(rawPost, stream.requestHeaders)
-        val postStr = if (decodedPost.isNotEmpty()) decodedPost.toString(StandardCharsets.UTF_8) else null
+        val postStr = GrpcDecoder.formatRequestPostData(decodedPost, stream.requestHeaders)
         onParsedRequest(
             HttpRequestEvent(
                 requestId = stream.requestId,
@@ -371,6 +392,7 @@ class Http2PlaintextParser(
     private fun dispatchResponseIfNeeded(stream: StreamContext) {
         if (stream.responseDispatched || !stream.responseHeadersReceived) return
         stream.responseDispatched = true
+        resolveStreamHostIfUnknown(stream)
         dispatchRequestIfNeeded(stream)
 
         val rawBody = stream.responseBodyStream.toByteArray()

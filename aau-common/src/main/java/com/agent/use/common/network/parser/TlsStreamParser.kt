@@ -2,6 +2,7 @@ package com.agent.use.common.network.parser
 
 import android.os.RemoteException
 import android.util.Log
+import com.agent.use.common.network.HttpHeader
 import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
@@ -10,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Shared plaintext TLS/HTTP stream demultiplexer that auto-detects HTTP/2 vs HTTP/1.x,
@@ -23,7 +25,7 @@ class TlsStreamParser(
 
     companion object {
         private const val TAG = "TlsStreamParser"
-        private const val MAX_CACHED_BODIES = 200
+        private const val MAX_CACHED_BODIES = 500
         val HTTP2_PREFACE_PREFIX = "PRI ".toByteArray(StandardCharsets.ISO_8859_1)
 
         /**
@@ -107,6 +109,28 @@ class TlsStreamParser(
     private val http1Parsers = ConcurrentHashMap<String, Http1PlaintextParser>()
     private val http2Parsers = ConcurrentHashMap<String, Http2PlaintextParser>()
 
+    private class CronetStreamState(
+        val requestId: String,
+        var url: String,
+        var method: String = "GET",
+        var statusCode: Int = 200,
+        var statusText: String = "OK",
+        var responseHeaders: List<HttpHeader> = emptyList(),
+        var mimeType: String? = null,
+        var contentLength: Long = -1L,
+        var hasContentEncoding: Boolean = false,
+        var requestDispatched: Boolean = false,
+        var responseHeadersReceived: Boolean = false,
+        var responseDispatched: Boolean = false,
+        val bodyBuffer: ByteArrayOutputStream = ByteArrayOutputStream()
+    )
+
+    private val cronetSeq = AtomicLong(1L)
+    private val cronetStreams = ConcurrentHashMap<String, CronetStreamState>()
+
+    @Volatile
+    private var lastKnownHost: String? = defaultConnectionHostHint?.takeIf { isUsableHost(it) }
+
     private val responseBodies = Collections.synchronizedMap(
         object : LinkedHashMap<String, ByteArrayOutputStream>(64, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArrayOutputStream>?): Boolean {
@@ -116,10 +140,12 @@ class TlsStreamParser(
     )
 
     fun setConnectionHostHint(connectionId: String, hostHint: String) {
-        if (hostHint.isNotBlank() && !hostHint.equals("localhost", ignoreCase = true) && !hostHint.equals("unknown-host", ignoreCase = true)) {
-            connectionHostHints[connectionId] = hostHint
-            http1Parsers[connectionId]?.setConnectionHostHint(hostHint)
-            http2Parsers[connectionId]?.setConnectionHostHint(hostHint)
+        val clean = extractHost(hostHint) ?: return
+        if (isUsableHost(clean)) {
+            connectionHostHints[connectionId] = clean
+            lastKnownHost = clean
+            http1Parsers[connectionId]?.setConnectionHostHint(clean)
+            http2Parsers[connectionId]?.setConnectionHostHint(clean)
         }
     }
 
@@ -141,10 +167,196 @@ class TlsStreamParser(
         }
     }
 
+    fun onCronetRequest(connectionId: String, payload: ByteArray) {
+        if (payload.isEmpty()) return
+        val nulIdx = payload.indexOf(0.toByte())
+        val endIdx = if (nulIdx >= 0) nulIdx else payload.size
+        val url = String(payload, 0, endIdx, StandardCharsets.UTF_8).trim()
+        if (url.isEmpty()) return
+
+        cronetStreams.remove(connectionId)?.let { prev ->
+            if (prev.responseHeadersReceived && !prev.responseDispatched) {
+                finalizeCronetStream(connectionId, prev)
+            }
+        }
+
+        extractHost(url)?.takeIf { isUsableHost(it) }?.let { host ->
+            connectionHostHints[connectionId] = host
+            lastKnownHost = host
+        }
+
+        val state = CronetStreamState(
+            requestId = "${connectionId}_cr_${cronetSeq.getAndIncrement()}",
+            url = url
+        )
+        cronetStreams[connectionId] = state
+        dispatchCronetRequestIfNeeded(state)
+    }
+
+    fun onCronetResponseStarted(connectionId: String, payload: ByteArray) {
+        if (payload.size < 4) return
+        val statusCode = (payload[0].toInt() and 0xFF) or
+            ((payload[1].toInt() and 0xFF) shl 8) or
+            ((payload[2].toInt() and 0xFF) shl 16) or
+            ((payload[3].toInt() and 0xFF) shl 24)
+
+        val state = cronetStreams.computeIfAbsent(connectionId) {
+            val fallbackHost = connectionHostHints[connectionId] ?: lastKnownHost ?: defaultConnectionHostHint ?: "unknown-host"
+            CronetStreamState(
+                requestId = "${connectionId}_cr_${cronetSeq.getAndIncrement()}",
+                url = "https://$fallbackHost/"
+            )
+        }
+
+        val (parsedStatusText, headers) = parseCronetHeaders(payload, 4, payload.size - 4)
+        synchronized(state) {
+            state.statusCode = if (statusCode > 0) statusCode else 200
+            if (parsedStatusText != null) {
+                state.statusText = parsedStatusText
+            } else {
+                state.statusText = if (state.statusCode in 200..299) "OK" else ""
+            }
+            state.responseHeaders = headers
+            state.mimeType = headers.firstOrNull { it.name.equals("content-type", ignoreCase = true) }?.value
+            state.contentLength = headers.firstOrNull { it.name.equals("content-length", ignoreCase = true) }
+                ?.value?.trim()?.toLongOrNull() ?: -1L
+            val encoding = headers.firstOrNull { it.name.equals("content-encoding", ignoreCase = true) }?.value?.trim()?.lowercase()
+            state.hasContentEncoding = !encoding.isNullOrBlank() && encoding != "identity"
+            state.responseHeadersReceived = true
+        }
+        dispatchCronetRequestIfNeeded(state)
+    }
+
+    fun onCronetReadCompleted(connectionId: String, payload: ByteArray) {
+        if (payload.isEmpty()) return
+        val state = cronetStreams[connectionId] ?: return
+        val shouldFinalize = synchronized(state) {
+            if (state.responseDispatched) return@synchronized false
+            val remaining = (config.maxBodySizeBytes - state.bodyBuffer.size()).toInt().coerceAtLeast(0)
+            val toWrite = minOf(payload.size, remaining)
+            if (toWrite > 0) {
+                state.bodyBuffer.write(payload, 0, toWrite)
+            }
+            !state.hasContentEncoding &&
+                state.responseHeadersReceived &&
+                state.contentLength > 0L &&
+                state.bodyBuffer.size().toLong() >= state.contentLength
+        }
+        if (shouldFinalize) {
+            finalizeCronetStream(connectionId, state)
+        }
+    }
+
+    fun onCronetFinish(connectionId: String) {
+        val state = cronetStreams.remove(connectionId) ?: return
+        finalizeCronetStream(connectionId, state)
+    }
+
+    private fun dispatchCronetRequestIfNeeded(state: CronetStreamState) {
+        val shouldSend = synchronized(state) {
+            if (state.requestDispatched) false else {
+                state.requestDispatched = true
+                true
+            }
+        }
+        if (!shouldSend) return
+        dispatchRequest(
+            HttpRequestEvent(
+                requestId = state.requestId,
+                timestamp = System.currentTimeMillis(),
+                url = state.url,
+                method = state.method,
+                headers = emptyList(),
+                postData = null,
+                isTls = state.url.startsWith("https", ignoreCase = true)
+            )
+        )
+    }
+
+    private fun finalizeCronetStream(connectionId: String, state: CronetStreamState) {
+        val rawBytes: ByteArray
+        synchronized(state) {
+            if (state.responseDispatched) return
+            state.responseDispatched = true
+            rawBytes = state.bodyBuffer.toByteArray()
+        }
+        cronetStreams.remove(connectionId, state)
+        dispatchCronetRequestIfNeeded(state)
+
+        // Cronet's OnReadCompleted delivers decompressed bytes even when raw_headers_ retains Content-Encoding.
+        // Only run gzip decompression if the bytes still have the gzip magic header (0x1f 0x8b).
+        val isGzipMagic = rawBytes.size >= 2 &&
+            (rawBytes[0].toInt() and 0xFF) == 0x1F &&
+            (rawBytes[1].toInt() and 0xFF) == 0x8B
+        val finalBody = if (isGzipMagic) {
+            HttpContentDecoder.decompressIfNeeded(rawBytes, state.responseHeaders)
+        } else {
+            rawBytes
+        }
+
+        if (finalBody.isNotEmpty()) {
+            dispatchBodyChunk(state.requestId, finalBody)
+        }
+
+        val effectiveLength = if (finalBody.isNotEmpty()) {
+            finalBody.size.toLong()
+        } else {
+            state.contentLength.coerceAtLeast(0L)
+        }
+
+        dispatchResponse(
+            HttpResponseEvent(
+                requestId = state.requestId,
+                timestamp = System.currentTimeMillis(),
+                url = state.url,
+                statusCode = state.statusCode,
+                statusText = state.statusText,
+                headers = state.responseHeaders,
+                mimeType = state.mimeType,
+                contentLength = effectiveLength,
+                fromCache = false
+            )
+        )
+    }
+
+    private fun parseCronetHeaders(payload: ByteArray, offset: Int, len: Int): Pair<String?, List<HttpHeader>> {
+        if (len <= 0 || offset >= payload.size) return null to emptyList()
+        val safeLen = minOf(len, payload.size - offset)
+        val rawText = String(payload, offset, safeLen, StandardCharsets.ISO_8859_1)
+        val lines = rawText.split('\u0000', '\n')
+        var statusText: String? = null
+        val headers = ArrayList<HttpHeader>()
+        for (rawLine in lines) {
+            val line = rawLine.trim('\r', ' ', '\t')
+            if (line.isEmpty()) continue
+            if (line.startsWith("HTTP/", ignoreCase = true)) {
+                val firstSpace = line.indexOf(' ')
+                if (firstSpace > 0) {
+                    val afterProto = line.substring(firstSpace + 1).trim()
+                    val secondSpace = afterProto.indexOf(' ')
+                    if (secondSpace > 0 && secondSpace + 1 < afterProto.length) {
+                        statusText = afterProto.substring(secondSpace + 1).trim()
+                    }
+                }
+                continue
+            }
+            val colon = line.indexOf(':', startIndex = if (line.startsWith(':')) 1 else 0)
+            if (colon > 0) {
+                val name = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                if (name.isNotEmpty()) {
+                    headers.add(HttpHeader(name, value))
+                }
+            }
+        }
+        return statusText to headers
+    }
+
     fun finishConnection(connectionId: String) {
         http1Parsers[connectionId]?.finishOnEof()
         http1Parsers.remove(connectionId)
         http2Parsers.remove(connectionId)
+        cronetStreams.remove(connectionId)?.let { finalizeCronetStream(connectionId, it) }
         connectionProtocols.remove(connectionId)
         connectionHostHints.remove(connectionId)
     }
@@ -159,6 +371,8 @@ class TlsStreamParser(
         connectionHostHints.clear()
         http1Parsers.clear()
         http2Parsers.clear()
+        cronetStreams.clear()
+        lastKnownHost = defaultConnectionHostHint?.takeIf { isUsableHost(it) }
         synchronized(responseBodies) { responseBodies.clear() }
     }
 
@@ -202,7 +416,7 @@ class TlsStreamParser(
     private fun createHttp1Parser(connectionId: String): Http1PlaintextParser =
         Http1PlaintextParser(
             maxBodySizeBytes = config.maxBodySizeBytes,
-            connectionHostHint = connectionHostHints[connectionId] ?: defaultConnectionHostHint,
+            connectionHostHint = connectionHostHints[connectionId] ?: lastKnownHost ?: defaultConnectionHostHint,
             onParsedRequest = ::dispatchRequest,
             onParsedResponse = ::dispatchResponse,
             onBodyChunk = ::dispatchBodyChunk
@@ -211,25 +425,47 @@ class TlsStreamParser(
     private fun createHttp2Parser(connectionId: String): Http2PlaintextParser =
         Http2PlaintextParser(
             maxBodySizeBytes = config.maxBodySizeBytes,
-            connectionHostHint = connectionHostHints[connectionId] ?: defaultConnectionHostHint,
+            connectionHostHint = connectionHostHints[connectionId] ?: lastKnownHost ?: defaultConnectionHostHint,
             onParsedRequest = ::dispatchRequest,
             onParsedResponse = ::dispatchResponse,
             onBodyChunk = ::dispatchBodyChunk
         )
 
     private fun dispatchRequest(request: HttpRequestEvent) {
-        if (!config.matchesUrl(request.url)) return
+        var effective = request
+        val currentHost = extractHost(request.url)
+        if (currentHost != null) {
+            lastKnownHost = currentHost
+        } else if (request.url.contains("://unknown-host")) {
+            val resolved = extractHostFromHeaders(request.headers) ?: lastKnownHost ?: defaultConnectionHostHint
+            if (resolved != null && isUsableHost(resolved)) {
+                lastKnownHost = resolved
+                effective = request.copy(url = request.url.replace("://unknown-host", "://$resolved"))
+            }
+        }
+        if (!config.matchesUrl(effective.url)) return
         try {
-            listener.onRequestWillBeSent(request)
+            listener.onRequestWillBeSent(effective)
         } catch (e: RemoteException) {
             Log.w(TAG, "RemoteException dispatching onRequestWillBeSent: ${e.message}")
         }
     }
 
     private fun dispatchResponse(response: HttpResponseEvent) {
-        if (!config.matchesUrl(response.url)) return
+        var effective = response
+        val currentHost = extractHost(response.url)
+        if (currentHost != null) {
+            lastKnownHost = currentHost
+        } else if (response.url.contains("://unknown-host")) {
+            val resolved = extractHostFromHeaders(response.headers) ?: lastKnownHost ?: defaultConnectionHostHint
+            if (resolved != null && isUsableHost(resolved)) {
+                lastKnownHost = resolved
+                effective = response.copy(url = response.url.replace("://unknown-host", "://$resolved"))
+            }
+        }
+        if (!config.matchesUrl(effective.url)) return
         try {
-            listener.onResponseReceived(response)
+            listener.onResponseReceived(effective)
         } catch (e: RemoteException) {
             Log.w(TAG, "RemoteException dispatching onResponseReceived: ${e.message}")
         }

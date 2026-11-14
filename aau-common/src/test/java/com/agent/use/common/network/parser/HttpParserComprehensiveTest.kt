@@ -413,4 +413,192 @@ class HttpParserComprehensiveTest {
         assertEquals("https://service.example.com/first", noHintRequests[1].url)
         assertEquals("https://service.example.com/second", noHintRequests[2].url)
     }
+
+    @Test
+    fun testTlsStreamParserBackfillsUnknownHostAcrossConnectionsAndSetCookie() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val responses = mutableListOf<HttpResponseEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) { requests.add(event) }
+            override fun onResponseReceived(event: HttpResponseEvent) { responses.add(event) }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+
+        // URL filter specifically requires both host + path ("xiaohongshu.*comment") to prove backfill occurs BEFORE filtering.
+        val streamParser = TlsStreamParser(
+            config = NetworkCaptureConfig(
+                targetPackage = "com.xingin.xhs",
+                urlFilterPattern = "xiaohongshu.*comment"
+            ),
+            listener = listener
+        )
+
+        // Connection 1 sends a request whose path (/user) does NOT match filter, but establishes host edith.xiaohongshu.com
+        val conn1Headers = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(hpackLiteralInc(1, "edith.xiaohongshu.com")) // :authority
+            write(hpackLiteralInc(4, "/api/sns/v1/user")) // :path
+        }.toByteArray()
+        val conn1Payload = Http2PlaintextParser.CLIENT_PREFACE + h2Frame(
+            Http2PlaintextParser.FRAME_TYPE_HEADERS,
+            Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM,
+            1,
+            conn1Headers
+        )
+        streamParser.onOutboundData("ebpf_1_0x1000", conn1Payload)
+        assertEquals("Filtered-out path must still update lastKnownHost, not dispatch yet", 0, requests.size)
+
+        // Connection 2 sends HTTP/2 request with dynamic-miss :authority and path /api/sns/v2/comment/page
+        val conn2Headers = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(0x80 or 62) // dynamic miss (:authority omitted)
+            write(hpackLiteralInc(4, "/api/sns/v2/comment/page")) // :path
+        }.toByteArray()
+        val conn2Payload = Http2PlaintextParser.CLIENT_PREFACE + h2Frame(
+            Http2PlaintextParser.FRAME_TYPE_HEADERS,
+            Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM,
+            1,
+            conn2Headers
+        )
+        streamParser.onOutboundData("ebpf_1_0x2000", conn2Payload)
+        assertEquals(1, requests.size)
+        assertEquals("https://edith.xiaohongshu.com/api/sns/v2/comment/page", requests[0].url)
+
+        // Fresh parser with NO prior connection learns host from Set-Cookie Domain= in HTTP/2 response
+        val cookieRequests = mutableListOf<HttpRequestEvent>()
+        val cookieResponses = mutableListOf<HttpResponseEvent>()
+        val cookieStreamParser = TlsStreamParser(
+            config = NetworkCaptureConfig(targetPackage = "com.xingin.xhs"),
+            listener = object : INetworkEventListener.Stub() {
+                override fun onRequestWillBeSent(event: HttpRequestEvent) { cookieRequests.add(event) }
+                override fun onResponseReceived(event: HttpResponseEvent) { cookieResponses.add(event) }
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+                override fun onErrorOccurred(requestId: String, error: String) {}
+            }
+        )
+        cookieStreamParser.onOutboundData("ebpf_1_0x3000", conn2Payload)
+        assertEquals(1, cookieRequests.size)
+        assertEquals("https://unknown-host/api/sns/v2/comment/page", cookieRequests[0].url)
+
+        val respHeaders = ByteArrayOutputStream().apply {
+            write(0x88) // :status: 200
+            write(hpackLiteralInc(55, "sid=abc; Domain=.xiaohongshu.com; Path=/")) // static 55 = set-cookie
+        }.toByteArray()
+        val respFrame = h2Frame(
+            Http2PlaintextParser.FRAME_TYPE_HEADERS,
+            Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM,
+            1,
+            respHeaders
+        )
+        cookieStreamParser.onInboundData("ebpf_1_0x3000", respFrame)
+        assertEquals(1, cookieResponses.size)
+        assertEquals("https://xiaohongshu.com/api/sns/v2/comment/page", cookieResponses[0].url)
+    }
+
+    @Test
+    fun testCronetStreamEventsAndPreDecompressedGzipBody() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val responses = mutableListOf<HttpResponseEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) { requests.add(event) }
+            override fun onResponseReceived(event: HttpResponseEvent) { responses.add(event) }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+        val tlsParser = TlsStreamParser(NetworkCaptureConfig(targetPackage = "com.xingin.xhs"), listener)
+        val connId = "ebpf_1001_0x70001000"
+
+        tlsParser.onCronetRequest(
+            connId,
+            "https://edith.xiaohongshu.com/api/sns/v10/comment/page?note_id=123".toByteArray(StandardCharsets.UTF_8)
+        )
+        assertEquals(1, requests.size)
+        assertEquals("https://edith.xiaohongshu.com/api/sns/v10/comment/page?note_id=123", requests[0].url)
+
+        val rawHeaders = "HTTP/1.1 200 OK\u0000content-type: application/json\u0000content-encoding: br\u0000\u0000"
+            .toByteArray(StandardCharsets.ISO_8859_1)
+        val hdrPayload = ByteArray(4 + rawHeaders.size)
+        hdrPayload[0] = (200 and 0xFF).toByte()
+        hdrPayload[1] = ((200 ushr 8) and 0xFF).toByte()
+        hdrPayload[2] = 0
+        hdrPayload[3] = 0
+        System.arraycopy(rawHeaders, 0, hdrPayload, 4, rawHeaders.size)
+        tlsParser.onCronetResponseStarted(connId, hdrPayload)
+
+        val jsonPart1 = """{"code":0,"data":{"comments":["""
+        val jsonPart2 = """{"id":"c1","content":"test"}]}}"""
+        tlsParser.onCronetReadCompleted(connId, jsonPart1.toByteArray(StandardCharsets.UTF_8))
+        tlsParser.onCronetReadCompleted(connId, jsonPart2.toByteArray(StandardCharsets.UTF_8))
+        tlsParser.onCronetFinish(connId)
+
+        assertEquals(1, responses.size)
+        assertEquals(200, responses[0].statusCode)
+        assertEquals("application/json", responses[0].mimeType)
+        assertEquals(requests[0].requestId, responses[0].requestId)
+        val cached = tlsParser.getResponseBody(responses[0].requestId)
+        assertNotNull(cached)
+        assertEquals(jsonPart1 + jsonPart2, String(cached!!, StandardCharsets.UTF_8))
+    }
+
+    @Test
+    fun testHttp2ResponseDispatchedWhenContentLengthReachedBeforeEndStream() {
+        val requests = mutableListOf<HttpRequestEvent>()
+        val responses = mutableListOf<HttpResponseEvent>()
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) { requests.add(event) }
+            override fun onResponseReceived(event: HttpResponseEvent) { responses.add(event) }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+        val tlsParser = TlsStreamParser(NetworkCaptureConfig(targetPackage = "com.xingin.xhs"), listener)
+        val connId = "ebpf_1001_0x70002000"
+
+        val reqHeaders = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(hpackLiteralInc(1, "edith.xiaohongshu.com"))
+            write(hpackLiteralInc(4, "/api/sns/v1/note/feed"))
+        }.toByteArray()
+        tlsParser.onOutboundData(
+            connId,
+            Http2PlaintextParser.CLIENT_PREFACE + h2Frame(
+                Http2PlaintextParser.FRAME_TYPE_HEADERS,
+                Http2PlaintextParser.FLAG_END_HEADERS or Http2PlaintextParser.FLAG_END_STREAM,
+                1,
+                reqHeaders
+            )
+        )
+        assertEquals(1, requests.size)
+
+        val bodyBytes = """{"ok":1}""".toByteArray(StandardCharsets.UTF_8)
+        val clName = "content-length".toByteArray(StandardCharsets.ISO_8859_1)
+        val clVal = bodyBytes.size.toString().toByteArray(StandardCharsets.ISO_8859_1)
+        val respHeaders = ByteArrayOutputStream().apply {
+            write(0x88) // :status: 200
+            write(0x00) // literal without indexing, new name
+            write(clName.size)
+            write(clName)
+            write(clVal.size)
+            write(clVal)
+        }.toByteArray()
+        tlsParser.onInboundData(
+            connId,
+            h2Frame(Http2PlaintextParser.FRAME_TYPE_HEADERS, Http2PlaintextParser.FLAG_END_HEADERS, 1, respHeaders)
+        )
+        assertEquals(0, responses.size)
+
+        // DATA frame WITHOUT FLAG_END_STREAM, but byte count == Content-Length
+        tlsParser.onInboundData(
+            connId,
+            h2Frame(Http2PlaintextParser.FRAME_TYPE_DATA, 0, 1, bodyBytes)
+        )
+        assertEquals(1, responses.size)
+        assertEquals(200, responses[0].statusCode)
+        val cached = tlsParser.getResponseBody(responses[0].requestId)
+        assertNotNull(cached)
+        assertArrayEquals(bodyBytes, cached)
+    }
 }

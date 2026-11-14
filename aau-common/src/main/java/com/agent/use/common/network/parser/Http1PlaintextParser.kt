@@ -351,9 +351,7 @@ class Http1PlaintextParser(
         dispatchedCount.incrementAndGet()
         val rawBody = req.bodyStream.toByteArray()
         val decodedBody = HttpContentDecoder.decompressIfNeeded(rawBody, req.headers)
-        val postDataStr = if (decodedBody.isNotEmpty()) {
-            decodedBody.toString(StandardCharsets.UTF_8)
-        } else null
+        val postDataStr = GrpcDecoder.formatRequestPostData(decodedBody, req.headers)
 
         onParsedRequest(
             HttpRequestEvent(

@@ -167,10 +167,23 @@ object HttpContentDecoder {
     }
 }
 
+internal fun isUsableHost(host: String?): Boolean {
+    if (host.isNullOrBlank()) return false
+    val trimmed = host.trim()
+    if (trimmed.equals("unknown-host", ignoreCase = true) ||
+        trimmed.equals("localhost", ignoreCase = true) ||
+        trimmed.equals("null", ignoreCase = true) ||
+        trimmed == "*"
+    ) {
+        return false
+    }
+    return trimmed.none { it.isWhitespace() || it.isISOControl() }
+}
+
 internal fun extractHost(urlOrHost: String?): String? {
     if (urlOrHost.isNullOrBlank()) return null
     val trimmed = urlOrHost.trim()
-    return try {
+    val extracted = try {
         if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
             val uri = java.net.URI(trimmed)
             uri.host?.takeIf { it.isNotEmpty() }
@@ -186,4 +199,43 @@ internal fun extractHost(urlOrHost: String?): String? {
             trimmed.substringBefore('/').substringBefore(':').takeIf { it.isNotEmpty() }
         }
     }
+    return extracted?.takeIf { isUsableHost(it) }
+}
+
+internal fun extractHostFromHeaders(headers: List<HttpHeader>): String? {
+    val directHeaderNames = listOf(
+        ":authority",
+        "host",
+        "x-forwarded-host",
+        "origin",
+        "referer",
+        "location",
+        "content-location",
+        "access-control-allow-origin"
+    )
+    for (headerName in directHeaderNames) {
+        for (h in headers) {
+            if (h.name.equals(headerName, ignoreCase = true)) {
+                val candidate = extractHost(h.value)
+                if (candidate != null) return candidate
+            }
+        }
+    }
+    for (h in headers) {
+        if (h.name.equals("set-cookie", ignoreCase = true)) {
+            val attrs = h.value.split(';')
+            for (attr in attrs) {
+                val trimmed = attr.trim()
+                if (trimmed.startsWith("domain=", ignoreCase = true)) {
+                    val rawDomain = trimmed.substringAfter('=')
+                        .trim()
+                        .trim('"', '\'')
+                        .trimStart('.')
+                    val candidate = extractHost(rawDomain)
+                    if (candidate != null) return candidate
+                }
+            }
+        }
+    }
+    return null
 }
