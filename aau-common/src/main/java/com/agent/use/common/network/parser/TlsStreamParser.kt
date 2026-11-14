@@ -7,6 +7,8 @@ import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
+import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.NetworkTrafficMiddleware
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Collections
@@ -17,10 +19,12 @@ import java.util.concurrent.atomic.AtomicLong
  * Shared plaintext TLS/HTTP stream demultiplexer that auto-detects HTTP/2 vs HTTP/1.x,
  * buffers response bodies before firing `onResponseReceived`, and applies [NetworkCaptureConfig] URL filtering.
  */
-class TlsStreamParser(
+class TlsStreamParser @JvmOverloads constructor(
     private val config: NetworkCaptureConfig,
     private val listener: INetworkEventListener,
-    private val defaultConnectionHostHint: String? = null
+    private val defaultConnectionHostHint: String? = null,
+    private val middlewares: List<NetworkTrafficMiddleware> =
+        NetworkCapturePluginRegistry.resolveMiddlewares(config.targetPackage)
 ) {
 
     companion object {
@@ -443,6 +447,12 @@ class TlsStreamParser(
                 effective = request.copy(url = request.url.replace("://unknown-host", "://$resolved"))
             }
         }
+        for (middleware in middlewares) {
+            effective = middleware.onRequest(config.targetPackage, effective)
+        }
+        extractHost(effective.url)?.takeIf { isUsableHost(it) }?.let { host ->
+            lastKnownHost = host
+        }
         if (!config.matchesUrl(effective.url)) return
         try {
             listener.onRequestWillBeSent(effective)
@@ -461,6 +471,33 @@ class TlsStreamParser(
             if (resolved != null && isUsableHost(resolved)) {
                 lastKnownHost = resolved
                 effective = response.copy(url = response.url.replace("://unknown-host", "://$resolved"))
+            }
+        }
+        if (middlewares.isNotEmpty()) {
+            var currentBody = getResponseBody(effective.requestId)
+            val initialBody = currentBody
+            for (middleware in middlewares) {
+                val (nextEvent, nextBody) = middleware.onResponse(config.targetPackage, effective, currentBody)
+                effective = nextEvent
+                currentBody = nextBody
+            }
+            extractHost(effective.url)?.takeIf { isUsableHost(it) }?.let { host ->
+                lastKnownHost = host
+            }
+            if (currentBody !== initialBody && !currentBody.contentEquals(initialBody)) {
+                if (currentBody == null) {
+                    responseBodies.remove(effective.requestId)
+                    effective = effective.copy(contentLength = 0L)
+                } else {
+                    val out = ByteArrayOutputStream()
+                    val maxBytes = config.maxBodySizeBytes.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                    val toWrite = minOf(currentBody.size, maxBytes)
+                    if (toWrite > 0) {
+                        out.write(currentBody, 0, toWrite)
+                    }
+                    responseBodies[effective.requestId] = out
+                    effective = effective.copy(contentLength = out.size().toLong())
+                }
             }
         }
         if (!config.matchesUrl(effective.url)) return

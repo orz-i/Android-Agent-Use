@@ -5,6 +5,8 @@ import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
+import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.NetworkTrafficMiddleware
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -600,5 +602,168 @@ class HttpParserComprehensiveTest {
         val cached = tlsParser.getResponseBody(responses[0].requestId)
         assertNotNull(cached)
         assertArrayEquals(bodyBytes, cached)
+    }
+
+    @Test
+    fun testNetworkCapturePluginRegistryCliArgsAndJsonOverrides() {
+        NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        try {
+            val xhsArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.xingin.xhs")
+            assertTrue(xhsArgs.contains("--ssl-offsets"))
+            assertTrue(xhsArgs.contains("libcronet.114.0.5735.38.so:0x4ea720:0x4ea438:0x4eb0c8"))
+            assertTrue(xhsArgs.contains("--cronet-offsets"))
+            assertTrue(xhsArgs.contains("libcronet.114.0.5735.38.so:0x226c34:0x206dd4:0x206f34:0x206ffc"))
+            assertTrue(xhsArgs.contains("--cronet-abi"))
+            assertTrue(xhsArgs.contains("0x20,0x10,0"))
+            assertTrue(xhsArgs.contains("--cronet-slots"))
+            assertTrue(xhsArgs.contains("3,4,5"))
+            assertTrue(xhsArgs.contains("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"))
+
+            val otherArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.example.other")
+            assertTrue(!otherArgs.contains("--ssl-offsets"))
+            assertTrue(!otherArgs.contains("--cronet-offsets"))
+            assertTrue(otherArgs.contains("--cronet-abi"))
+            assertTrue(otherArgs.contains("0x20,0x10,0"))
+            assertTrue(otherArgs.contains("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"))
+
+            val json = """
+                {
+                  "com.example.other": {
+                    "sslOffsetRules": [
+                      {
+                        "libSubstring": "libcronet.130.0.0.1.so",
+                        "writeOffset": "0x1234",
+                        "readOffset": "0x5678",
+                        "sniOffset": "0x9abc"
+                      }
+                    ],
+                    "cronetOffsetRules": [
+                      {
+                        "libSubstring": "libcronet.130.0.0.1.so",
+                        "createOffset": "0x1110",
+                        "responseStartedOffset": "0x2220",
+                        "readCompletedOffset": "0x3330",
+                        "succeededOffset": "0x4440"
+                      }
+                    ],
+                    "cronetAbiRule": {
+                      "rawHeadersOffset": "0x28",
+                      "ioBufferDataOffset": "0x18",
+                      "stringLayoutMode": 1,
+                      "vtableSlots": [4, 5, 6],
+                      "jniSignatures": ["(Ljava/lang/Object;JLjava/lang/String;I)J"]
+                    }
+                  }
+                }
+            """.trimIndent()
+            val count = NetworkCapturePluginRegistry.loadJsonOverrides(json)
+            assertEquals(1, count)
+
+            val overriddenArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.example.other")
+            assertTrue(overriddenArgs.contains("libcronet.130.0.0.1.so:0x1234:0x5678:0x9abc"))
+            assertTrue(overriddenArgs.contains("libcronet.130.0.0.1.so:0x1110:0x2220:0x3330:0x4440"))
+            assertTrue(overriddenArgs.contains("0x28,0x18,1"))
+            assertTrue(overriddenArgs.contains("4,5,6"))
+            assertTrue(overriddenArgs.contains("(Ljava/lang/Object;JLjava/lang/String;I)J"))
+        } finally {
+            NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        }
+    }
+
+    @Test
+    fun testTlsStreamParserRunsPluginMiddlewaresForRequestAndResponse() {
+        // 1. Built-in XiaohongshuTrafficMiddleware resolves remaining /api/sns/ unknown-host only for com.xingin.xhs
+        val xhsRequests = ArrayList<HttpRequestEvent>()
+        val xhsResponses = ArrayList<HttpResponseEvent>()
+        val xhsParser = TlsStreamParser(
+            NetworkCaptureConfig(targetPackage = "com.xingin.xhs"),
+            object : INetworkEventListener.Stub() {
+                override fun onRequestWillBeSent(event: HttpRequestEvent) { xhsRequests.add(event) }
+                override fun onResponseReceived(event: HttpResponseEvent) { xhsResponses.add(event) }
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+                override fun onErrorOccurred(requestId: String, error: String) {}
+            }
+        )
+        xhsParser.onOutboundData(
+            "conn-xhs-1",
+            "GET /api/sns/v10/comment/page HTTP/1.1\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        xhsParser.onInboundData(
+            "conn-xhs-1",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        assertEquals(1, xhsRequests.size)
+        assertEquals(1, xhsResponses.size)
+        assertEquals("https://edith.xiaohongshu.com/api/sns/v10/comment/page", xhsResponses[0].url)
+
+        val otherRequests = ArrayList<HttpRequestEvent>()
+        val otherResponses = ArrayList<HttpResponseEvent>()
+        val otherParser = TlsStreamParser(
+            NetworkCaptureConfig(targetPackage = "com.example.other"),
+            object : INetworkEventListener.Stub() {
+                override fun onRequestWillBeSent(event: HttpRequestEvent) { otherRequests.add(event) }
+                override fun onResponseReceived(event: HttpResponseEvent) { otherResponses.add(event) }
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+                override fun onErrorOccurred(requestId: String, error: String) {}
+            }
+        )
+        otherParser.onOutboundData(
+            "conn-other-1",
+            "GET /api/sns/v10/comment/page HTTP/1.1\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        otherParser.onInboundData(
+            "conn-other-1",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        assertEquals(1, otherRequests.size)
+        assertEquals(1, otherResponses.size)
+        assertEquals("https://unknown-host/api/sns/v10/comment/page", otherResponses[0].url)
+
+        // 2. Custom middleware transforms request, response metadata, and cached response body
+        val customMw = object : NetworkTrafficMiddleware {
+            override val id: String = "test.decoder"
+            override fun onRequest(targetPackage: String, event: HttpRequestEvent): HttpRequestEvent =
+                event.copy(url = event.url + "?mw=1")
+
+            override fun onResponse(
+                targetPackage: String,
+                event: HttpResponseEvent,
+                body: ByteArray?
+            ): Pair<HttpResponseEvent, ByteArray?> {
+                val decoded = body?.let {
+                    ("decoded:" + String(it, StandardCharsets.UTF_8)).toByteArray(StandardCharsets.UTF_8)
+                }
+                return event.copy(statusText = "Decoded") to decoded
+            }
+        }
+
+        val mwRequests = ArrayList<HttpRequestEvent>()
+        val mwResponses = ArrayList<HttpResponseEvent>()
+        val mwParser = TlsStreamParser(
+            NetworkCaptureConfig(targetPackage = "com.example.other"),
+            object : INetworkEventListener.Stub() {
+                override fun onRequestWillBeSent(event: HttpRequestEvent) { mwRequests.add(event) }
+                override fun onResponseReceived(event: HttpResponseEvent) { mwResponses.add(event) }
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+                override fun onErrorOccurred(requestId: String, error: String) {}
+            },
+            middlewares = listOf(customMw)
+        )
+        mwParser.onOutboundData(
+            "conn-mw-1",
+            "GET /items HTTP/1.1\r\nHost: api.example.com\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        mwParser.onInboundData(
+            "conn-mw-1",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        assertEquals(1, mwRequests.size)
+        assertEquals("https://api.example.com/items?mw=1", mwRequests[0].url)
+        assertEquals(1, mwResponses.size)
+        assertEquals("Decoded", mwResponses[0].statusText)
+        assertEquals("decoded:hello".length.toLong(), mwResponses[0].contentLength)
+        val decodedBody = mwParser.getResponseBody(mwResponses[0].requestId)
+        assertNotNull(decodedBody)
+        assertEquals("decoded:hello", String(decodedBody!!, StandardCharsets.UTF_8))
     }
 }
