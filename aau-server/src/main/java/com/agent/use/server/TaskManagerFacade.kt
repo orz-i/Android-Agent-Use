@@ -6,12 +6,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.util.Log
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
+import com.agent.use.common.shell.AgentShellEngine
+import com.agent.use.common.shell.ColdStart
+import com.agent.use.common.shell.MainScreenLog
+import com.agent.use.common.shell.MainScreenWatch
+import com.agent.use.common.shell.ShareIntent
+import com.agent.use.common.shell.ShellLinks
 
 @SuppressLint("PrivateApi")
 class TaskManagerFacade(
@@ -29,9 +31,13 @@ class TaskManagerFacade(
         Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)!!
     }
 
-    // 主屏任务变更监听与监控
-    private var watchUntilUptimeMs: Long = 0L
-    private val recordedArrivals = CopyOnWriteArrayList<RecordedArrival>()
+    private val mainScreenWatch: MainScreenWatch by lazy {
+        MainScreenWatch(
+            taskManager = { taskManager },
+            tasks = ::mainLogTasks,
+            tag = TAG,
+        )
+    }
 
     data class RecordedArrival(
         val taskId: Int,
@@ -40,28 +46,14 @@ class TaskManagerFacade(
         val uptimeMs: Long,
     )
 
+    @Deprecated("Handled automatically by MainScreenWatch", ReplaceWith("watchMainScreen(windowMs)"))
     fun recordMainArrival(taskId: Int, packageName: String, userId: Int) {
-        val now = SystemClock.uptimeMillis()
-        if (now <= watchUntilUptimeMs) {
-            recordedArrivals.add(RecordedArrival(taskId, packageName, userId, now))
-        }
+        // Kept for binary/source compatibility; MainScreenWatch records arrivals via ITaskStackListener.
     }
 
-    fun watchMainScreen(windowMs: Int): Int {
-        val topTask = topTaskId(0)
-        watchUntilUptimeMs = SystemClock.uptimeMillis() + windowMs
-        return topTask
-    }
+    fun watchMainScreen(windowMs: Int): Int = mainScreenWatch.watch(windowMs)
 
-    fun mainArrivals(sinceUptimeMs: Long): Bundle {
-        val b = Bundle()
-        val list = recordedArrivals.filter { it.uptimeMs >= sinceUptimeMs }
-        b.putIntArray("taskIds", list.map { it.taskId }.toIntArray())
-        b.putStringArray("packages", list.map { it.packageName }.toTypedArray())
-        b.putIntArray("users", list.map { it.userId }.toIntArray())
-        b.putLongArray("times", list.map { it.uptimeMs }.toLongArray())
-        return b
-    }
+    fun mainArrivals(sinceUptimeMs: Long): Bundle = mainScreenWatch.arrivals(sinceUptimeMs)
 
     fun allTasks(): List<Any> = runCatching {
         val method = taskManager.javaClass.methods.first {
@@ -87,7 +79,7 @@ class TaskManagerFacade(
     fun topActivity(displayId: Int): String? =
         tasksOn(displayId).firstOrNull()?.let {
             runCatching {
-                (TASK_INFO.getField("topActivity").get(it) as? ComponentName)?.flattenToShortString()
+                (TASK_INFO.getField("topActivity").get(it) as? ComponentName)?.className
             }.getOrNull()
         }
 
@@ -106,9 +98,9 @@ class TaskManagerFacade(
     fun displayOfPackage(packageName: String, userId: Int? = null): Int =
         allTasks().firstOrNull {
             runCatching {
-                val pkg = (TASK_INFO.getField("topActivity").get(it) as? ComponentName)?.packageName
+                val pkgs = taskPackages(it)
                 val u = TASK_INFO.getField("userId").getInt(it)
-                pkg == packageName && (userId == null || u == userId)
+                AgentShellEngine.sameCopy(pkgs, u, packageName, userId)
             }.getOrDefault(false)
         }?.let { runCatching { TASK_INFO.getField("displayId").getInt(it) }.getOrNull() } ?: -1
 
@@ -116,19 +108,16 @@ class TaskManagerFacade(
         allTasks().firstOrNull { runCatching { TASK_INFO.getField("taskId").getInt(it) == taskId }.getOrDefault(false) }
             ?.let { runCatching { TASK_INFO.getField("userId").getInt(it) }.getOrNull() } ?: -1
 
-    fun visibleOnMainScreen(packageName: String, userId: Int): Boolean {
-        val mainTasks = tasksOn(0)
-        return mainTasks.any {
+    fun visibleOnMainScreen(packageName: String, userId: Int): Boolean =
+        tasksOn(MainScreenLog.MAIN).any {
             runCatching {
-                val pkg = (TASK_INFO.getField("topActivity").get(it) as? ComponentName)?.packageName
+                val pkgs = taskPackages(it)
                 val u = TASK_INFO.getField("userId").getInt(it)
-                pkg == packageName && (userId == 0 || u == userId)
+                AgentShellEngine.sameCopy(pkgs, u, packageName, userId)
             }.getOrDefault(false)
         }
-    }
 
     fun moveTask(taskId: Int, displayId: Int): Boolean = try {
-        // 调用 IActivityTaskManager.moveRootTaskToDisplay 或 moveTaskToDisplay
         val method = taskManager.javaClass.methods.firstOrNull {
             it.name == "moveRootTaskToDisplay" && it.parameterTypes.size == 2
         } ?: taskManager.javaClass.methods.first {
@@ -143,21 +132,32 @@ class TaskManagerFacade(
 
     /** 启动应用到虚拟屏 */
     fun startApp(displayId: Int, packageName: String, userId: Int): Int {
-        if (!ownDisplay(displayId)) return 3 // START_ERROR
-        if (visibleOnMainScreen(packageName, userId)) return 1 // START_IN_USE_ON_MAIN
+        if (!ownDisplay(displayId)) return AgentShellEngine.START_ERROR
+        if (visibleOnMainScreen(packageName, userId)) return AgentShellEngine.START_IN_USE_ON_MAIN
 
         val pm = context.packageManager
-        val intent = pm.getLaunchIntentForPackage(packageName) ?: return 2 // START_NOT_FOUND
+        val intent = pm.getLaunchIntentForPackage(packageName) ?: return AgentShellEngine.START_NOT_FOUND
         return startIntent(displayId, intent)
     }
 
-    /** 冷启动应用 */
+    /** 冷启动应用（按 ColdStart 策略避免误杀其他屏幕上的同副本） */
     fun restartApp(displayId: Int, packageName: String, userId: Int): Int {
-        if (!ownDisplay(displayId)) return 3
-        if (visibleOnMainScreen(packageName, userId)) return 1
-
-        execCmd.exec("am", "force-stop", "--user", "$userId", packageName)
-        return startApp(displayId, packageName, userId)
+        if (!ownDisplay(displayId)) return AgentShellEngine.START_ERROR
+        val displays = allTasks().mapNotNull { t ->
+            runCatching {
+                val pkgs = taskPackages(t)
+                val u = TASK_INFO.getField("userId").getInt(t)
+                if (AgentShellEngine.sameCopy(pkgs, u, packageName, userId)) TASK_INFO.getField("displayId").getInt(t) else null
+            }.getOrNull()
+        }
+        return when (ColdStart.decide(displays, displayId, visibleOnMainScreen(packageName, userId))) {
+            ColdStart.IN_USE -> AgentShellEngine.START_IN_USE_ON_MAIN
+            ColdStart.WARM -> startApp(displayId, packageName, userId)
+            ColdStart.RESTART -> {
+                execCmd.exec("am", "force-stop", "--user", "$userId", packageName)
+                startApp(displayId, packageName, userId)
+            }
+        }
     }
 
     /** 启动 Intent */
@@ -169,14 +169,15 @@ class TaskManagerFacade(
         }.toBundle()
 
         context.startActivity(intent, options)
-        0 // START_OK
+        AgentShellEngine.START_OK
     } catch (t: Throwable) {
         Log.w(TAG, "startIntent failed", t)
-        3 // START_ERROR
+        AgentShellEngine.START_ERROR
     }
 
     /** 打开 URI */
     fun startView(displayId: Int, action: String?, uri: String?, packageName: String?): Int {
+        ShellLinks.refuse(action, uri, packageName)?.let { return it }
         val intent = Intent(action ?: Intent.ACTION_VIEW).apply {
             if (uri != null) data = Uri.parse(uri)
             if (packageName != null) setPackage(packageName)
@@ -185,14 +186,8 @@ class TaskManagerFacade(
     }
 
     /** 文本分享 */
-    fun startShare(displayId: Int, packageName: String, text: String): Int {
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, text)
-            setPackage(packageName)
-        }
-        return startIntent(displayId, intent)
-    }
+    fun startShare(displayId: Int, packageName: String, text: String): Int =
+        startIntent(displayId, ShareIntent.of(packageName, text))
 
     /** 优雅完成并清理虚拟屏上的任务 */
     fun finishDisplay(displayId: Int, keepPackages: Array<String>?, closePackages: Array<String>?): Bundle {
@@ -218,4 +213,23 @@ class TaskManagerFacade(
         b.putString("note", "Cleaned up display $displayId")
         return b
     }
+
+    private fun mainLogTasks(): List<MainScreenLog.Task> = allTasks().mapNotNull { t ->
+        runCatching {
+            val top = TASK_INFO.getField("topActivity").get(t) as? ComponentName
+            val base = runCatching { TASK_INFO.getField("baseActivity").get(t) as? ComponentName }.getOrNull()
+            MainScreenLog.Task(
+                taskId = TASK_INFO.getField("taskId").getInt(t),
+                displayId = TASK_INFO.getField("displayId").getInt(t),
+                packageName = top?.packageName ?: base?.packageName,
+                userId = TASK_INFO.getField("userId").getInt(t),
+                topActivity = top?.className,
+            )
+        }.getOrNull()
+    }
+
+    private fun taskPackages(task: Any): List<String> = listOfNotNull(
+        runCatching { (TASK_INFO.getField("topActivity").get(task) as? ComponentName)?.packageName }.getOrNull(),
+        runCatching { (TASK_INFO.getField("baseActivity").get(task) as? ComponentName)?.packageName }.getOrNull(),
+    )
 }

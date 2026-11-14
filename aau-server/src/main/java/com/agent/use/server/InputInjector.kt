@@ -1,7 +1,6 @@
 package com.agent.use.server
 
 import android.annotation.SuppressLint
-import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -9,6 +8,9 @@ import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import com.agent.use.common.shell.AgentShellEngine
+import com.agent.use.common.shell.AsciiTextKeys
+import com.agent.use.common.shell.ShellPressKeys
 
 @SuppressLint("PrivateApi")
 class InputInjector(
@@ -18,34 +20,14 @@ class InputInjector(
     companion object {
         private const val TAG = "InputInjector"
 
-        const val INJECT_MODE_ASYNC = 0
-        const val INJECT_MODE_WAIT_FOR_RESULT = 1
-        const val INJECT_MODE_WAIT_FOR_FINISH = 2
+        const val INJECT_MODE_ASYNC = AgentShellEngine.INJECT_MODE_ASYNC
+        const val INJECT_MODE_WAIT_FOR_RESULT = AgentShellEngine.INJECT_MODE_WAIT_FOR_RESULT
+        const val INJECT_MODE_WAIT_FOR_FINISH = AgentShellEngine.INJECT_MODE_WAIT_FOR_FINISH
 
         private const val VIRTUAL_KEYBOARD = -1
         private const val TAP_INTERVAL_MS = 50L
         private const val STROKE_MAX_POINTS = 1024
         private const val STROKE_MAX_MS = 10_000L
-
-        // 按键注入白名单，防止误触全局关机/音量等物理键
-        private val ALLOWED_KEYS = setOf(
-            KeyEvent.KEYCODE_BACK,
-            KeyEvent.KEYCODE_DEL,
-            KeyEvent.KEYCODE_FORWARD_DEL,
-            KeyEvent.KEYCODE_DPAD_UP,
-            KeyEvent.KEYCODE_DPAD_DOWN,
-            KeyEvent.KEYCODE_DPAD_LEFT,
-            KeyEvent.KEYCODE_DPAD_RIGHT,
-            KeyEvent.KEYCODE_DPAD_CENTER,
-            KeyEvent.KEYCODE_ENTER,
-            KeyEvent.KEYCODE_TAB,
-            KeyEvent.KEYCODE_SPACE,
-            KeyEvent.KEYCODE_ESCAPE,
-            KeyEvent.KEYCODE_PAGE_UP,
-            KeyEvent.KEYCODE_PAGE_DOWN,
-            KeyEvent.KEYCODE_MOVE_HOME,
-            KeyEvent.KEYCODE_MOVE_END,
-        )
     }
 
     /** API 34+ (Android 14) 使用 InputManagerGlobal，低版本使用 InputManager */
@@ -85,12 +67,13 @@ class InputInjector(
         val up = MotionEvent.obtain(now, now + TAP_INTERVAL_MS, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat(), 0).apply {
             source = InputDevice.SOURCE_TOUCHSCREEN
         }
+        val mode = AgentShellEngine.injectMode(key = false, waitForFinish = false)
         return try {
-            if (!inject(down, displayId, INJECT_MODE_ASYNC)) {
-                execCmd.exec("input", "-d", "$displayId", "tap", "$x", "$y").first == 0
-            } else {
-                inject(up, displayId, INJECT_MODE_ASYNC) || inject(up, displayId, INJECT_MODE_ASYNC)
-            }
+            AgentShellEngine.sendPair(
+                down = { inject(down, displayId, mode) },
+                up = { inject(up, displayId, mode) },
+                fallback = { execCmd.exec("input", "-d", "$displayId", "tap", "$x", "$y").first == 0 },
+            )
         } finally {
             down.recycle()
             up.recycle()
@@ -116,12 +99,13 @@ class InputInjector(
             )
         }
 
+        val mode = AgentShellEngine.injectMode(key = false, waitForFinish = false)
         fun sendPoint(i: Int, action: Int): Boolean {
             val scheduled = downTime + times[i]
             val wait = scheduled - SystemClock.uptimeMillis()
             if (wait > 0) SystemClock.sleep(wait)
             val e = createEvent(i, action)
-            return try { inject(e, displayId, INJECT_MODE_ASYNC) } finally { e.recycle() }
+            return try { inject(e, displayId, mode) } finally { e.recycle() }
         }
 
         if (!sendPoint(0, MotionEvent.ACTION_DOWN)) return false
@@ -133,7 +117,8 @@ class InputInjector(
 
     /** 基础按键事件注入 */
     fun injectKey(displayId: Int, keyCode: Int): Boolean {
-        if (keyCode !in ALLOWED_KEYS && keyCode !in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 &&
+        if (!ShellPressKeys.isAllowed(keyCode) &&
+            keyCode !in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 &&
             keyCode !in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z
         ) {
             Log.w(TAG, "Key $keyCode not in allowed whitelist")
@@ -142,20 +127,22 @@ class InputInjector(
         val now = SystemClock.uptimeMillis()
         val down = KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, 0, VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD)
         val up = KeyEvent.changeAction(down, KeyEvent.ACTION_UP)
-        return if (!inject(down, displayId, INJECT_MODE_WAIT_FOR_RESULT)) {
-            execCmd.exec("input", "-d", "$displayId", "keyevent", "$keyCode").first == 0
-        } else {
-            inject(up, displayId, INJECT_MODE_WAIT_FOR_RESULT) || inject(up, displayId, INJECT_MODE_WAIT_FOR_RESULT)
-        }
+        val mode = AgentShellEngine.injectMode(key = true, waitForFinish = false)
+        return AgentShellEngine.sendPair(
+            down = { inject(down, displayId, mode) },
+            up = { inject(up, displayId, mode) },
+            fallback = { execCmd.exec("input", "-d", "$displayId", "keyevent", "$keyCode").first == 0 },
+        )
     }
 
     /** 组合键注入 (Ctrl+A, Ctrl+V) */
     fun injectCtrlKey(displayId: Int, keyCode: Int): Int {
-        if (!ownDisplay(displayId)) return 0
-        if (keyCode != KeyEvent.KEYCODE_A && keyCode != KeyEvent.KEYCODE_V) return 0
+        if (!ownDisplay(displayId)) return AsciiTextKeys.NOT_SENT
+        if (keyCode != KeyEvent.KEYCODE_A && keyCode != KeyEvent.KEYCODE_V) return AsciiTextKeys.NOT_SENT
 
         val now = SystemClock.uptimeMillis()
         val meta = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+        val mode = AgentShellEngine.injectMode(key = true, waitForFinish = false)
         fun event(code: Int, action: Int, modifiers: Int) = KeyEvent(
             now, SystemClock.uptimeMillis(), action, code, 0, modifiers,
             VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD
@@ -163,30 +150,38 @@ class InputInjector(
 
         var modifierDown = false
         try {
-            if (!inject(event(KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.ACTION_DOWN, 0), displayId, INJECT_MODE_WAIT_FOR_RESULT)) return 0
+            if (!inject(event(KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.ACTION_DOWN, 0), displayId, mode)) {
+                return AsciiTextKeys.NOT_SENT
+            }
             modifierDown = true
-            if (!inject(event(keyCode, KeyEvent.ACTION_DOWN, meta), displayId, INJECT_MODE_WAIT_FOR_RESULT)) return 0
+            if (!inject(event(keyCode, KeyEvent.ACTION_DOWN, meta), displayId, mode)) {
+                return AsciiTextKeys.NOT_SENT
+            }
             val up = event(keyCode, KeyEvent.ACTION_UP, meta)
-            return if (inject(up, displayId, INJECT_MODE_WAIT_FOR_RESULT) || inject(up, displayId, INJECT_MODE_WAIT_FOR_RESULT)) 1 else 2
+            return if (inject(up, displayId, mode) || inject(up, displayId, mode)) {
+                AsciiTextKeys.DISPATCHED
+            } else {
+                AsciiTextKeys.UNCONFIRMED
+            }
         } finally {
             if (modifierDown) {
                 val up = event(KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.ACTION_UP, 0)
-                inject(up, displayId, INJECT_MODE_WAIT_FOR_RESULT)
+                inject(up, displayId, mode)
             }
         }
     }
 
     /** 定向输入 ASCII 字符流 */
     fun injectAsciiText(displayId: Int, taskId: Int, packageName: String, text: String): Int {
-        if (!ownDisplay(displayId) || taskId < 0 || text.isEmpty()) return 0
+        if (!ownDisplay(displayId) || taskId < 0 || !AsciiTextKeys.supports(text)) return AsciiTextKeys.NOT_SENT
         val kcm = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
-        val events = kcm.getEvents(text.toCharArray()) ?: return 0
+        val events = kcm.getEvents(text.toCharArray()) ?: return AsciiTextKeys.NOT_SENT
+        val mode = AgentShellEngine.injectMode(key = true, waitForFinish = true)
 
         for (event in events) {
             event.source = InputDevice.SOURCE_KEYBOARD
-            val sent = inject(event, displayId, INJECT_MODE_WAIT_FOR_FINISH)
-            if (!sent) return 2 // 投递不确定
+            if (!inject(event, displayId, mode)) return AsciiTextKeys.UNCONFIRMED
         }
-        return 1 // 全部成功
+        return AsciiTextKeys.DISPATCHED
     }
 }
