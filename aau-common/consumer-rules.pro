@@ -1,2 +1,3 @@
-# Proguard rules for consumer of agent-display-common
+# Proguard rules for consumer of aau-common
+-keep class com.agent.use.common.** { *; }
 -keep class com.agent.display.common.** { *; }
