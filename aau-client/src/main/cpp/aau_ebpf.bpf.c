@@ -140,6 +140,22 @@ struct bpf_map_def event_scratch = {
     .map_flags = 0,
 };
 
+struct cronet_abi_config {
+    __u32 raw_headers_offset;   // default 0x20
+    __u32 iobuf_data_offset;    // default 0x10
+    __u32 string_layout_mode;   // 0 = libc++ alt layout (byte[23] & 0x80), 1 = std LSB layout (byte[0] & 1)
+    __u32 reserved;
+};
+
+SEC("maps")
+struct bpf_map_def cronet_abi_map = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(struct cronet_abi_config),
+    .max_entries = 1,
+    .map_flags = 0,
+};
+
 // max_entries == 0 tells loader to allocate num_cpus slots
 SEC("maps")
 struct bpf_map_def events = {
@@ -325,15 +341,19 @@ int probe_ssl_set_sni(struct pt_regs *ctx) {
 }
 
 struct libcxx_alt_string {
-    __u64 first;   // short: chars[0..7]; long: const char *data
-    __u64 second;  // short: chars[8..15]; long: __u64 size
-    __u8 tail[8];  // tail[7] (offset 23): short => len (bit7==0), long => MSB cap (bit7==1)
+    __u64 first;   // alt short: chars[0..7], alt long: const char *data; std short: len<<1|0 + chars[0..6], std long: cap|1
+    __u64 second;  // alt long / std long: __u64 size
+    union {
+        __u8 tail[8];  // tail[7] (offset 23): alt short => len, alt long => MSB cap (bit7==1)
+        __u64 third;   // std long: const char *data
+    };
 };
 
 static __inline __attribute__((always_inline)) __u32 read_alt_libcxx_string(
     __u8 *dst,
     __u32 max_copy,
-    const void *str_ptr
+    const void *str_ptr,
+    __u32 layout_mode
 ) {
     if (!dst || !str_ptr || max_copy == 0) {
         return 0;
@@ -345,28 +365,54 @@ static __inline __attribute__((always_inline)) __u32 read_alt_libcxx_string(
         return 0;
     }
 
-    __u8 flag = s.tail[7];
-    if ((flag & 0x80U) == 0U) {
-        __u32 slen = (__u32)(flag & 0x7FU);
-        if (slen == 0U || slen > 22U) {
-            return 0;
+    const void *data_ptr = 0;
+    __u64 raw_len = 0ULL;
+
+    if (layout_mode == 1U) {
+        if ((s.first & 1ULL) == 0ULL) {
+            __u32 slen = (__u32)((s.first & 0xFFULL) >> 1);
+            if (slen == 0U || slen > 22U) {
+                return 0;
+            }
+            __u32 copy_len = slen;
+            if (copy_len > max_copy) {
+                copy_len = max_copy;
+            }
+            copy_len &= 0x1FU;
+            if (copy_len == 0U || copy_len > 22U) {
+                return 0;
+            }
+            if (bpf_probe_read_user(dst, copy_len, (const __u8 *)str_ptr + 1) != 0) {
+                return 0;
+            }
+            return copy_len;
         }
-        __u32 copy_len = slen;
-        if (copy_len > max_copy) {
-            copy_len = max_copy;
+        data_ptr = (const void *)(unsigned long)s.third;
+        raw_len = s.second;
+    } else {
+        __u8 flag = s.tail[7];
+        if ((flag & 0x80U) == 0U) {
+            __u32 slen = (__u32)(flag & 0x7FU);
+            if (slen == 0U || slen > 22U) {
+                return 0;
+            }
+            __u32 copy_len = slen;
+            if (copy_len > max_copy) {
+                copy_len = max_copy;
+            }
+            copy_len &= 0x1FU;
+            if (copy_len == 0U || copy_len > 22U) {
+                return 0;
+            }
+            if (bpf_probe_read_user(dst, copy_len, str_ptr) != 0) {
+                return 0;
+            }
+            return copy_len;
         }
-        copy_len &= 0x1FU;
-        if (copy_len == 0U || copy_len > 22U) {
-            return 0;
-        }
-        if (bpf_probe_read_user(dst, copy_len, str_ptr) != 0) {
-            return 0;
-        }
-        return copy_len;
+        data_ptr = (const void *)(unsigned long)s.first;
+        raw_len = s.second;
     }
 
-    const void *data_ptr = (const void *)(unsigned long)s.first;
-    __u64 raw_len = s.second;
     if (!data_ptr || raw_len == 0ULL || raw_len > 65536ULL) {
         return 0;
     }
@@ -399,12 +445,15 @@ int probe_cronet_create(struct pt_regs *ctx) {
     }
 
     __u32 zero = 0;
+    struct cronet_abi_config *abi = bpf_map_lookup_elem(&cronet_abi_map, &zero);
+    __u32 str_mode = abi ? abi->string_layout_mode : 0U;
+
     struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
     if (!ev) {
         return 0;
     }
 
-    __u32 url_len = read_alt_libcxx_string(ev->data, 2048U, gurl_ptr);
+    __u32 url_len = read_alt_libcxx_string(ev->data, 2048U, gurl_ptr, str_mode);
     url_len &= 0xFFFU;
     if (url_len == 0U || url_len > 2048U) {
         return 0;
@@ -443,6 +492,13 @@ int probe_cronet_resp_started(struct pt_regs *ctx) {
     }
 
     __u32 zero = 0;
+    struct cronet_abi_config *abi = bpf_map_lookup_elem(&cronet_abi_map, &zero);
+    __u32 raw_hdr_off = 0x20U;
+    if (abi && abi->raw_headers_offset > 0U && abi->raw_headers_offset <= 256U) {
+        raw_hdr_off = abi->raw_headers_offset & 0xFFU;
+    }
+    __u32 str_mode = abi ? abi->string_layout_mode : 0U;
+
     struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
     if (!ev) {
         return 0;
@@ -451,8 +507,7 @@ int probe_cronet_resp_started(struct pt_regs *ctx) {
     *(__u32 *)ev->data = status_code;
     __u32 hdr_len = 0;
     if (hdrs_ptr) {
-        // net::HttpResponseHeaders::raw_headers_ is at offset +0x20 on 64-bit
-        hdr_len = read_alt_libcxx_string(ev->data + 4, 4095U, hdrs_ptr + 0x20);
+        hdr_len = read_alt_libcxx_string(ev->data + 4, 4095U, hdrs_ptr + raw_hdr_off, str_mode);
         hdr_len &= 0xFFFU;
         if (hdr_len > 4095U) {
             hdr_len = 0U;
@@ -492,9 +547,15 @@ int probe_cronet_read_completed(struct pt_regs *ctx) {
         return 0;
     }
 
+    __u32 zero = 0;
+    struct cronet_abi_config *abi = bpf_map_lookup_elem(&cronet_abi_map, &zero);
+    __u32 iobuf_off = 0x10U;
+    if (abi && abi->iobuf_data_offset > 0U && abi->iobuf_data_offset <= 256U) {
+        iobuf_off = abi->iobuf_data_offset & 0xFFU;
+    }
+
     const void *data_ptr = 0;
-    // net::IOBuffer::data_ is at offset +0x10 on 64-bit
-    if (bpf_probe_read_user(&data_ptr, sizeof(data_ptr), iobuf_ptr + 0x10) != 0 || !data_ptr) {
+    if (bpf_probe_read_user(&data_ptr, sizeof(data_ptr), iobuf_ptr + iobuf_off) != 0 || !data_ptr) {
         return 0;
     }
 

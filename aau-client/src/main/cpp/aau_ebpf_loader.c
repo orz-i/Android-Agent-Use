@@ -34,12 +34,46 @@
 #define MAX_ATTACHED_LIBS 16
 #define MAX_LIB_DIRS 16
 #define MAX_BATCH_EVENTS 512
+#define MAX_OFFSET_RULES 16
+#define MAX_CRONET_SIGS 8
+
+typedef struct {
+    char lib_substr[128];
+    uint64_t write_off;
+    uint64_t read_off;
+    uint64_t sni_off;
+} ssl_offset_rule;
+
+typedef struct {
+    char lib_substr[128];
+    uint64_t create_off;
+    uint64_t hdr_off;
+    uint64_t body_off;
+    uint64_t fin_off;
+} cronet_offset_rule;
+
+typedef struct {
+    uint32_t raw_headers_offset;
+    uint32_t iobuf_data_offset;
+    uint32_t string_layout_mode;
+    uint32_t reserved;
+} cronet_abi_config;
 
 static volatile sig_atomic_t g_stop = 0;
 static char g_tracefs_dir[256] = {0};
 static char g_probe_prefix[64] = {0};
 static char g_lib_dirs[MAX_LIB_DIRS][512];
 static int g_lib_dir_count = 0;
+static ssl_offset_rule g_ssl_rules[MAX_OFFSET_RULES];
+static int g_ssl_rule_count = 0;
+static cronet_offset_rule g_cronet_rules[MAX_OFFSET_RULES];
+static int g_cronet_rule_count = 0;
+static char g_custom_cronet_sigs[MAX_CRONET_SIGS][128];
+static int g_custom_cronet_sig_count = 0;
+static int g_cronet_slot_hdr = 3;
+static int g_cronet_slot_body = 4;
+static int g_cronet_slot_fin = 5;
+static cronet_abi_config g_cronet_abi = {0x20U, 0x10U, 0U, 0U};
 
 typedef struct {
     char path[512];
@@ -481,14 +515,22 @@ static int resolve_stripped_boringssl_offsets(
     return rc;
 }
 
-static int resolve_cronet_offsets(
+static int resolve_cronet_offsets_for_sig(
     const char *path,
+    const char *jni_sig,
+    int slot_hdr,
+    int slot_body,
+    int slot_fin,
     uint64_t *out_create,
     uint64_t *out_resp_started,
     uint64_t *out_read_completed,
     uint64_t *out_succeeded
 ) {
-    if (!path || !ascii_strcasestr_contains(path, "cronet")) return -1;
+    if (!path || !jni_sig || !jni_sig[0] || !ascii_strcasestr_contains(path, "cronet")) return -1;
+    int max_slot = slot_hdr;
+    if (slot_body > max_slot) max_slot = slot_body;
+    if (slot_fin > max_slot) max_slot = slot_fin;
+    if (slot_hdr < 0 || slot_body < 0 || slot_fin < 0 || max_slot >= 16) return -1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -503,8 +545,8 @@ static int resolve_cronet_offsets(
     if (base == MAP_FAILED) return -1;
 
     int rc = -1;
-    static const char jni_sig[] = "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J";
-    const uint8_t *sig_hit = (const uint8_t *)memmem(base, map_size, jni_sig, sizeof(jni_sig));
+    size_t sig_bytes = strlen(jni_sig) + 1;
+    const uint8_t *sig_hit = (const uint8_t *)memmem(base, map_size, jni_sig, sig_bytes);
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
 
     if (sig_hit &&
@@ -605,15 +647,15 @@ static int resolve_cronet_offsets(
 
                         uint64_t vt_off = 0;
                         if (elf64_vaddr_to_offset(eh, phdrs, vt_va, 0, &vt_off) != 0 ||
-                            vt_off + 6 * sizeof(int32_t) > map_size) {
+                            vt_off + (size_t)(max_slot + 1) * sizeof(int32_t) > map_size) {
                             continue;
                         }
 
                         const int32_t *slots = (const int32_t *)(base + vt_off);
-                        uint64_t targets[6];
+                        uint64_t targets[16];
                         int valid_vt = 1;
-                        for (int s = 0; s < 6; s++) {
-                            if (slots[s] <= 0) {
+                        for (int s = 0; s <= max_slot; s++) {
+                            if (slots[s] == 0) {
                                 valid_vt = 0;
                                 break;
                             }
@@ -651,9 +693,9 @@ static int resolve_cronet_offsets(
                         if (req_ctor_va != 0) {
                             uint64_t off_create = 0, off_hdr = 0, off_body = 0, off_fin = 0;
                             if (elf64_vaddr_to_offset(eh, phdrs, req_ctor_va, 1, &off_create) == 0 &&
-                                elf64_vaddr_to_offset(eh, phdrs, targets[3], 1, &off_hdr) == 0 &&
-                                elf64_vaddr_to_offset(eh, phdrs, targets[4], 1, &off_body) == 0 &&
-                                elf64_vaddr_to_offset(eh, phdrs, targets[5], 1, &off_fin) == 0) {
+                                elf64_vaddr_to_offset(eh, phdrs, targets[slot_hdr], 1, &off_hdr) == 0 &&
+                                elf64_vaddr_to_offset(eh, phdrs, targets[slot_body], 1, &off_body) == 0 &&
+                                elf64_vaddr_to_offset(eh, phdrs, targets[slot_fin], 1, &off_fin) == 0) {
                                 *out_create = off_create;
                                 *out_resp_started = off_hdr;
                                 *out_read_completed = off_body;
@@ -671,6 +713,30 @@ static int resolve_cronet_offsets(
 
     munmap((void *)base, map_size);
     return rc;
+}
+
+static int resolve_cronet_offsets(
+    const char *path,
+    uint64_t *out_create,
+    uint64_t *out_resp_started,
+    uint64_t *out_read_completed,
+    uint64_t *out_succeeded
+) {
+    for (int i = 0; i < g_custom_cronet_sig_count; i++) {
+        if (resolve_cronet_offsets_for_sig(
+                path, g_custom_cronet_sigs[i],
+                g_cronet_slot_hdr, g_cronet_slot_body, g_cronet_slot_fin,
+                out_create, out_resp_started, out_read_completed, out_succeeded
+            ) == 0) {
+            return 0;
+        }
+    }
+    static const char default_sig[] = "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J";
+    return resolve_cronet_offsets_for_sig(
+        path, default_sig,
+        g_cronet_slot_hdr, g_cronet_slot_body, g_cronet_slot_fin,
+        out_create, out_resp_started, out_read_completed, out_succeeded
+    );
 }
 #endif
 
@@ -693,6 +759,7 @@ typedef struct {
 typedef struct {
     int target_uid_map_fd;
     int events_map_fd;
+    int cronet_abi_map_fd;
     int prog_write_fd;
     int prog_read_enter_fd;
     int prog_read_exit_fd;
@@ -821,6 +888,7 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
 
         if (strcmp(mname, "target_uid_map") == 0) out->target_uid_map_fd = fd;
         else if (strcmp(mname, "events") == 0) out->events_map_fd = fd;
+        else if (strcmp(mname, "cronet_abi_map") == 0) out->cronet_abi_map_fd = fd;
         map_count++;
     }
 
@@ -1152,24 +1220,56 @@ static int try_attach_library(const char *path, bpf_bundle *bundle, int num_cpus
 
     uint64_t off_write = 0, off_read = 0, off_sni = 0;
     int has_ssl = 0;
-    if (resolve_elf_symbol_offset(path, "SSL_write", &off_write) == 0 &&
-        resolve_elf_symbol_offset(path, "SSL_read", &off_read) == 0) {
-        has_ssl = 1;
-        resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &off_sni);
+    for (int r = 0; r < g_ssl_rule_count; r++) {
+        if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
+            g_ssl_rules[r].write_off != 0 && g_ssl_rules[r].read_off != 0) {
+            off_write = g_ssl_rules[r].write_off;
+            off_read = g_ssl_rules[r].read_off;
+            off_sni = g_ssl_rules[r].sni_off;
+            has_ssl = 1;
+            break;
+        }
     }
+    if (!has_ssl) {
+        if (resolve_elf_symbol_offset(path, "SSL_write", &off_write) == 0 &&
+            resolve_elf_symbol_offset(path, "SSL_read", &off_read) == 0) {
+            has_ssl = 1;
+            resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &off_sni);
+        }
 #if defined(__LP64__) && defined(__aarch64__)
-    else if (resolve_stripped_boringssl_offsets(path, &off_write, &off_read, &off_sni) == 0) {
-        has_ssl = 1;
+        else if (resolve_stripped_boringssl_offsets(path, &off_write, &off_read, &off_sni) == 0) {
+            has_ssl = 1;
+        }
+#endif
     }
 
+#if defined(__LP64__) && defined(__aarch64__)
     uint64_t off_cr_req = 0, off_cr_hdr = 0, off_cr_body = 0, off_cr_fin = 0;
-    int has_cronet = (
+    int cronet_progs_ready = (
         bundle->prog_cronet_create_fd >= 0 &&
         bundle->prog_cronet_resp_started_fd >= 0 &&
         bundle->prog_cronet_read_completed_fd >= 0 &&
-        bundle->prog_cronet_succeeded_fd >= 0 &&
-        resolve_cronet_offsets(path, &off_cr_req, &off_cr_hdr, &off_cr_body, &off_cr_fin) == 0
+        bundle->prog_cronet_succeeded_fd >= 0
     );
+    int has_cronet = 0;
+    if (cronet_progs_ready) {
+        for (int r = 0; r < g_cronet_rule_count; r++) {
+            if (strstr(path, g_cronet_rules[r].lib_substr) != NULL &&
+                g_cronet_rules[r].create_off != 0 && g_cronet_rules[r].hdr_off != 0 &&
+                g_cronet_rules[r].body_off != 0 && g_cronet_rules[r].fin_off != 0) {
+                off_cr_req = g_cronet_rules[r].create_off;
+                off_cr_hdr = g_cronet_rules[r].hdr_off;
+                off_cr_body = g_cronet_rules[r].body_off;
+                off_cr_fin = g_cronet_rules[r].fin_off;
+                has_cronet = 1;
+                break;
+            }
+        }
+        if (!has_cronet &&
+            resolve_cronet_offsets(path, &off_cr_req, &off_cr_hdr, &off_cr_body, &off_cr_fin) == 0) {
+            has_cronet = 1;
+        }
+    }
 #else
     int has_cronet = 0;
 #endif
@@ -1493,6 +1593,79 @@ int main(int argc, char **argv) {
             if (g_lib_dir_count < MAX_LIB_DIRS) {
                 snprintf(g_lib_dirs[g_lib_dir_count++], sizeof(g_lib_dirs[0]), "%s", ld);
             }
+        } else if (strcmp(argv[i], "--ssl-offsets") == 0 && i + 1 < argc) {
+            const char *spec = argv[++i];
+            if (g_ssl_rule_count < MAX_OFFSET_RULES) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s", spec);
+                char *p1 = strchr(buf, ':');
+                char *p2 = p1 ? strchr(p1 + 1, ':') : NULL;
+                char *p3 = p2 ? strchr(p2 + 1, ':') : NULL;
+                if (p1 && p2) {
+                    *p1 = '\0';
+                    *p2 = '\0';
+                    if (p3) *p3 = '\0';
+                    ssl_offset_rule *r = &g_ssl_rules[g_ssl_rule_count];
+                    snprintf(r->lib_substr, sizeof(r->lib_substr), "%s", buf);
+                    r->write_off = (uint64_t)strtoull(p1 + 1, NULL, 0);
+                    r->read_off = (uint64_t)strtoull(p2 + 1, NULL, 0);
+                    r->sni_off = p3 ? (uint64_t)strtoull(p3 + 1, NULL, 0) : 0ULL;
+                    if (r->lib_substr[0] && r->write_off > 0 && r->read_off > 0) {
+                        g_ssl_rule_count++;
+                    }
+                }
+            }
+        } else if (strcmp(argv[i], "--cronet-offsets") == 0 && i + 1 < argc) {
+            const char *spec = argv[++i];
+            if (g_cronet_rule_count < MAX_OFFSET_RULES) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s", spec);
+                char *p1 = strchr(buf, ':');
+                char *p2 = p1 ? strchr(p1 + 1, ':') : NULL;
+                char *p3 = p2 ? strchr(p2 + 1, ':') : NULL;
+                char *p4 = p3 ? strchr(p3 + 1, ':') : NULL;
+                if (p1 && p2 && p3 && p4) {
+                    *p1 = '\0'; *p2 = '\0'; *p3 = '\0'; *p4 = '\0';
+                    cronet_offset_rule *r = &g_cronet_rules[g_cronet_rule_count];
+                    snprintf(r->lib_substr, sizeof(r->lib_substr), "%s", buf);
+                    r->create_off = (uint64_t)strtoull(p1 + 1, NULL, 0);
+                    r->hdr_off = (uint64_t)strtoull(p2 + 1, NULL, 0);
+                    r->body_off = (uint64_t)strtoull(p3 + 1, NULL, 0);
+                    r->fin_off = (uint64_t)strtoull(p4 + 1, NULL, 0);
+                    if (r->lib_substr[0] && r->create_off > 0 && r->hdr_off > 0 && r->body_off > 0 && r->fin_off > 0) {
+                        g_cronet_rule_count++;
+                    }
+                }
+            }
+        } else if (strcmp(argv[i], "--cronet-sig") == 0 && i + 1 < argc) {
+            const char *sig = argv[++i];
+            if (g_custom_cronet_sig_count < MAX_CRONET_SIGS && sig[0]) {
+                snprintf(g_custom_cronet_sigs[g_custom_cronet_sig_count++], sizeof(g_custom_cronet_sigs[0]), "%s", sig);
+            }
+        } else if (strcmp(argv[i], "--cronet-slots") == 0 && i + 1 < argc) {
+            int s_hdr = 3, s_body = 4, s_fin = 5;
+            if (sscanf(argv[++i], "%d,%d,%d", &s_hdr, &s_body, &s_fin) == 3 &&
+                s_hdr >= 0 && s_body >= 0 && s_fin >= 0 &&
+                s_hdr < 16 && s_body < 16 && s_fin < 16) {
+                g_cronet_slot_hdr = s_hdr;
+                g_cronet_slot_body = s_body;
+                g_cronet_slot_fin = s_fin;
+            }
+        } else if (strcmp(argv[i], "--cronet-abi") == 0 && i + 1 < argc) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%s", argv[++i]);
+            char *c1 = strchr(buf, ',');
+            char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+            if (c1 && c2) {
+                *c1 = '\0';
+                *c2 = '\0';
+                uint32_t hdr_o = (uint32_t)strtoul(buf, NULL, 0);
+                uint32_t iob_o = (uint32_t)strtoul(c1 + 1, NULL, 0);
+                uint32_t mode = (uint32_t)strtoul(c2 + 1, NULL, 0);
+                if (hdr_o > 0 && hdr_o <= 256U) g_cronet_abi.raw_headers_offset = hdr_o;
+                if (iob_o > 0 && iob_o <= 256U) g_cronet_abi.iobuf_data_offset = iob_o;
+                g_cronet_abi.string_layout_mode = mode;
+            }
         }
     }
 
@@ -1529,6 +1702,18 @@ int main(int argc, char **argv) {
     if (sys_bpf(BPF_MAP_UPDATE_ELEM, &uattr, sizeof(uattr)) != 0) {
         fprintf(stderr, "ERR:map_update_uid:errno=%d\n", errno);
         return 6;
+    }
+
+    if (bundle.cronet_abi_map_fd >= 0) {
+        union bpf_attr aattr;
+        memset(&aattr, 0, sizeof(aattr));
+        aattr.map_fd = (uint32_t)bundle.cronet_abi_map_fd;
+        aattr.key = (uint64_t)(uintptr_t)&zero;
+        aattr.value = (uint64_t)(uintptr_t)&g_cronet_abi;
+        aattr.flags = BPF_ANY;
+        if (sys_bpf(BPF_MAP_UPDATE_ELEM, &aattr, sizeof(aattr)) != 0) {
+            fprintf(stderr, "WARN:map_update_cronet_abi:errno=%d\n", errno);
+        }
     }
 
     // Setup per-CPU perf ring buffers
