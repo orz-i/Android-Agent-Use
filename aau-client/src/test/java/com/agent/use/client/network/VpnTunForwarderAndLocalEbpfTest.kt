@@ -12,6 +12,7 @@ import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
+import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -575,6 +576,20 @@ class VpnTunForwarderAndLocalEbpfTest {
             String(engine.getResponseBody(responses[0].requestId)!!, StandardCharsets.UTF_8)
         )
         engine.stopCapture()
+    }
+
+    @Test
+    fun testBuildSuCommandQuotesCronetSignatureAndPluginArgs() {
+        val pluginArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.xingin.xhs")
+        val suCmd = LocalRootEbpfCaptureEngine.buildSuCommand(
+            binaryPath = "/data/local/tmp/libaau_ebpf_helper.so",
+            uid = 10234,
+            libDir = "/data/app/com.xingin.xhs/lib/arm64",
+            extraArgs = pluginArgs
+        )
+        assertTrue(suCmd.startsWith("\"/data/local/tmp/libaau_ebpf_helper.so\" '--uid' '10234' '--lib-dir' '/data/app/com.xingin.xhs/lib/arm64'"))
+        assertTrue(suCmd.contains("'--cronet-sig' '(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J'"))
+        assertTrue(suCmd.contains("'--cronet-abi' '0x20,0x10,0'"))
     }
 
     private class FakeProcess(

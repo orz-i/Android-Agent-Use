@@ -10,6 +10,7 @@ import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
 import com.agent.use.common.network.parser.TlsStreamParser
+import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
 import java.io.BufferedReader
 import java.io.DataInputStream
 import java.io.EOFException
@@ -138,23 +139,56 @@ class LocalRootEbpfCaptureEngine(
             return null
         }
 
+        internal const val PLUGIN_OVERRIDE_FILE_NAME = "aau_capture_plugins.json"
+
+        internal fun shellQuoteArg(arg: String): String =
+            "'" + arg.replace("'", "'\\''") + "'"
+
+        internal fun buildHelperCommandArgs(
+            uid: Int,
+            libDir: String? = null,
+            extraArgs: List<String> = emptyList()
+        ): List<String> = buildList {
+            add("--uid")
+            add(uid.toString())
+            if (!libDir.isNullOrBlank()) {
+                add("--lib-dir")
+                add(libDir)
+            }
+            addAll(extraArgs)
+        }
+
+        internal fun buildSuCommand(
+            binaryPath: String,
+            uid: Int,
+            libDir: String? = null,
+            extraArgs: List<String> = emptyList()
+        ): String {
+            val safePath = binaryPath.replace("\"", "")
+            val quotedArgs = buildHelperCommandArgs(uid, libDir, extraArgs)
+                .joinToString(" ") { shellQuoteArg(it) }
+            return "\"$safePath\" $quotedArgs"
+        }
+
         @JvmOverloads
-        fun startHelperProcess(binaryPath: String, uid: Int, libDir: String? = null): Process {
+        fun startHelperProcess(
+            binaryPath: String,
+            uid: Int,
+            libDir: String? = null,
+            extraArgs: List<String> = emptyList()
+        ): Process {
             val isAlreadyRoot = try {
                 AndroidProcess.myUid() == 0
             } catch (_: Throwable) {
                 false
             }
-            val libArgs = if (!libDir.isNullOrBlank()) listOf("--lib-dir", libDir) else emptyList()
             return if (isAlreadyRoot) {
-                val cmd = mutableListOf(binaryPath, "--uid", uid.toString())
-                cmd.addAll(libArgs)
+                val cmd = mutableListOf(binaryPath)
+                cmd.addAll(buildHelperCommandArgs(uid, libDir, extraArgs))
                 ProcessBuilder(cmd).start()
             } else {
                 val suPath = findSuBinary() ?: "su"
-                val safePath = binaryPath.replace("\"", "")
-                val extra = if (!libDir.isNullOrBlank()) " --lib-dir \"$libDir\"" else ""
-                val cmd = "\"$safePath\" --uid $uid$extra"
+                val cmd = buildSuCommand(binaryPath, uid, libDir, extraArgs)
                 ProcessBuilder(suPath, "-c", cmd).start()
             }
         }
@@ -204,15 +238,28 @@ class LocalRootEbpfCaptureEngine(
             return false
         }
 
+        context?.filesDir?.let { dir ->
+            val overrideFile = File(dir, PLUGIN_OVERRIDE_FILE_NAME)
+            if (overrideFile.isFile) {
+                try {
+                    val loaded = NetworkCapturePluginRegistry.loadJsonOverrides(overrideFile.readText())
+                    Log.i(TAG, "Loaded $loaded JSON capture plugin override(s) from ${overrideFile.absolutePath}")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
+                }
+            }
+        }
+
         val streamParser = TlsStreamParser(config, listener)
         parser = streamParser
 
         val libDir = libDirResolver(config.targetPackage)
+        val pluginArgs = NetworkCapturePluginRegistry.resolveCliArgs(config.targetPackage)
         val process = try {
             when {
                 processStarterWithLib != null -> processStarterWithLib!!.invoke(binaryFile.absolutePath, targetUid, libDir)
                 processStarter != null -> processStarter.invoke(binaryFile.absolutePath, targetUid)
-                else -> startHelperProcess(binaryFile.absolutePath, targetUid, libDir)
+                else -> startHelperProcess(binaryFile.absolutePath, targetUid, libDir, pluginArgs)
             }
         } catch (t: Throwable) {
             lastError = "ebpf_process_spawn_failed:${t.message}"
