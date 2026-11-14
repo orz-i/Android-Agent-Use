@@ -19,6 +19,7 @@ import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -59,6 +60,11 @@ class LocalRootEbpfCaptureEngine(
         internal const val WIRE_HEADER_SIZE = 28
         internal const val DIRECTION_OUTBOUND_WRITE = 1
         internal const val DIRECTION_INBOUND_READ = 2
+        internal const val DIRECTION_SNI_HOSTNAME = 3
+        internal const val DIRECTION_CRONET_REQ = 4
+        internal const val DIRECTION_CRONET_RESP_HDR = 5
+        internal const val DIRECTION_CRONET_BODY = 6
+        internal const val DIRECTION_CRONET_FINISH = 7
         private const val MAX_FRAME_PAYLOAD = 64 * 1024
         private const val STARTUP_TIMEOUT_MS = 5000L
 
@@ -67,9 +73,8 @@ class LocalRootEbpfCaptureEngine(
             "/system/bin/su",
             "/sbin/su",
             "/su/bin/su",
-            "/magisk/.core/bin/su",
-            "/data/adb/ksu/bin/su",
-            "/data/adb/ap/bin/su"
+            "/vendor/bin/su",
+            "/debug_ramdisk/su"
         )
 
         fun resolveDefaultBinary(context: Context): File? {
@@ -127,7 +132,8 @@ class LocalRootEbpfCaptureEngine(
 
         fun findSuBinary(): String? {
             for (path in KNOWN_SU_PATHS) {
-                if (File(path).exists()) return path
+                val file = File(path)
+                if (file.exists() && file.canExecute()) return path
             }
             return null
         }
@@ -170,6 +176,9 @@ class LocalRootEbpfCaptureEngine(
     private var stderrThread: Thread? = null
     @Volatile
     private var stdoutThread: Thread? = null
+    private val attachedLibraries = CopyOnWriteArrayList<String>()
+
+    fun attachedLibrariesSnapshot(): List<String> = attachedLibraries.toList()
 
     override fun startCapture(config: NetworkCaptureConfig?, listener: INetworkEventListener?): Boolean {
         if (config == null || listener == null) {
@@ -179,6 +188,7 @@ class LocalRootEbpfCaptureEngine(
 
         stopCapture()
         lastError = null
+        attachedLibraries.clear()
 
         val targetUid = if (config.targetUid > 0) config.targetUid else uidResolver(config.targetPackage)
         if (targetUid <= 0) {
@@ -224,12 +234,39 @@ class LocalRootEbpfCaptureEngine(
                     while (!stopSignal.get()) {
                         val line = br.readLine() ?: break
                         if (line.startsWith("READY:")) {
+                            val readyInfo = line.removePrefix("READY:").trim()
+                            if (readyInfo.contains(".so")) {
+                                attachedLibraries.addIfAbsent(readyInfo)
+                            }
+                            startupErrRef.set(null)
                             readyRef.set(true)
                             readyLatch.countDown()
+                            safeLogD("native ready: $line")
+                        } else if (line.startsWith("ATTACHED:")) {
+                            val libInfo = line.removePrefix("ATTACHED:").trim()
+                            if (libInfo.isNotEmpty()) {
+                                attachedLibraries.addIfAbsent(libInfo)
+                            }
+                            safeLogD("native attached: $libInfo")
+                        } else if (line.startsWith("ATTACHED_CRONET:")) {
+                            val libInfo = line.removePrefix("ATTACHED_CRONET:").trim()
+                            if (libInfo.isNotEmpty()) {
+                                attachedLibraries.addIfAbsent("cronet:$libInfo")
+                            }
+                            safeLogD("native attached cronet: $libInfo")
+                        } else if (line.startsWith("WARN:")) {
+                            synchronized(errLines) {
+                                if (errLines.size < 16) errLines.add(line)
+                            }
+                            safeLogD("native warning: $line")
                         } else if (line.startsWith("ERR:")) {
                             val errCode = line.removePrefix("ERR:").trim()
-                            startupErrRef.compareAndSet(null, errCode)
-                            readyLatch.countDown()
+                            if (!readyRef.get()) {
+                                startupErrRef.compareAndSet(null, errCode)
+                                readyLatch.countDown()
+                            } else {
+                                safeLogD("native error after ready: $errCode")
+                            }
                         } else if (line.isNotBlank()) {
                             synchronized(errLines) {
                                 if (errLines.size < 16) errLines.add(line)
@@ -349,6 +386,18 @@ class LocalRootEbpfCaptureEngine(
             when (direction) {
                 DIRECTION_OUTBOUND_WRITE -> streamParser.onOutboundData(connId, payload)
                 DIRECTION_INBOUND_READ -> streamParser.onInboundData(connId, payload)
+                DIRECTION_SNI_HOSTNAME -> {
+                    val nulIdx = payload.indexOf(0.toByte())
+                    val endIdx = if (nulIdx >= 0) nulIdx else payload.size
+                    val sniHost = String(payload, 0, endIdx, StandardCharsets.US_ASCII).trim()
+                    if (sniHost.isNotEmpty()) {
+                        streamParser.setConnectionHostHint(connId, sniHost)
+                    }
+                }
+                DIRECTION_CRONET_REQ -> streamParser.onCronetRequest(connId, payload)
+                DIRECTION_CRONET_RESP_HDR -> streamParser.onCronetResponseStarted(connId, payload)
+                DIRECTION_CRONET_BODY -> streamParser.onCronetReadCompleted(connId, payload)
+                DIRECTION_CRONET_FINISH -> streamParser.onCronetFinish(connId)
             }
         }
     }
@@ -362,6 +411,7 @@ class LocalRootEbpfCaptureEngine(
         stderrThread = null
         stdoutThread?.interrupt()
         stdoutThread = null
+        attachedLibraries.clear()
         parser?.clear()
         parser = null
     }

@@ -21,6 +21,11 @@ typedef signed long long __s64;
 
 #define DIRECTION_OUTBOUND_WRITE 1U
 #define DIRECTION_INBOUND_READ 2U
+#define DIRECTION_SNI_HOSTNAME 3U
+#define DIRECTION_CRONET_REQ 4U
+#define DIRECTION_CRONET_RESP_HDR 5U
+#define DIRECTION_CRONET_BODY 6U
+#define DIRECTION_CRONET_FINISH 7U
 #define MAX_DATA_CHUNK 16383U
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
@@ -42,6 +47,7 @@ struct pt_regs {
 #define PT_REGS_PARM1(x) ((x)->regs[0])
 #define PT_REGS_PARM2(x) ((x)->regs[1])
 #define PT_REGS_PARM3(x) ((x)->regs[2])
+#define PT_REGS_PARM4(x) ((x)->regs[3])
 #define PT_REGS_RC(x)    ((x)->regs[0])
 #elif defined(__TARGET_ARCH_x86_64)
 struct pt_regs {
@@ -51,6 +57,7 @@ struct pt_regs {
 #define PT_REGS_PARM1(x) ((x)->rdi)
 #define PT_REGS_PARM2(x) ((x)->rsi)
 #define PT_REGS_PARM3(x) ((x)->rdx)
+#define PT_REGS_PARM4(x) ((x)->rcx)
 #define PT_REGS_RC(x)    ((x)->rax)
 #elif defined(__TARGET_ARCH_arm)
 struct pt_regs {
@@ -59,6 +66,7 @@ struct pt_regs {
 #define PT_REGS_PARM1(x) ((__u64)(x)->uregs[0])
 #define PT_REGS_PARM2(x) ((__u64)(x)->uregs[1])
 #define PT_REGS_PARM3(x) ((__u64)(x)->uregs[2])
+#define PT_REGS_PARM4(x) ((__u64)(x)->uregs[3])
 #define PT_REGS_RC(x)    ((__u64)(x)->uregs[0])
 #elif defined(__TARGET_ARCH_x86)
 struct pt_regs {
@@ -72,6 +80,7 @@ static __inline __u64 bpf_read_x86_stack_arg(struct pt_regs *ctx, __u32 slot) {
 #define PT_REGS_PARM1(x) bpf_read_x86_stack_arg((x), 1)
 #define PT_REGS_PARM2(x) bpf_read_x86_stack_arg((x), 2)
 #define PT_REGS_PARM3(x) bpf_read_x86_stack_arg((x), 3)
+#define PT_REGS_PARM4(x) bpf_read_x86_stack_arg((x), 4)
 #define PT_REGS_RC(x)    ((__u64)(x)->ax)
 #else
 #error "Unsupported __TARGET_ARCH_* for aau_ebpf.bpf.c"
@@ -265,6 +274,264 @@ int probe_ssl_read_exit(struct pt_regs *ctx) {
 
     __s32 ret = (__s32)PT_REGS_RC(ctx);
     emit_ssl_chunk(ctx, uid, ssl, buf, ret, DIRECTION_INBOUND_READ);
+    return 0;
+}
+
+SEC("uprobe/ssl_set_sni")
+int probe_ssl_set_sni(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 ssl = (__u64)PT_REGS_PARM1(ctx);
+    const char *name = (const char *)(unsigned long)PT_REGS_PARM2(ctx);
+    if (!ssl || !name) {
+        return 0;
+    }
+
+    __u32 zero = 0;
+    struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!ev) {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    ev->hdr.pid = (__u32)(pid_tgid >> 32);
+    ev->hdr.uid = uid;
+    ev->hdr.ssl_ptr = ssl;
+    ev->hdr.direction = DIRECTION_SNI_HOSTNAME;
+    ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        ((__u64 *)ev->data)[i] = 0;
+    }
+
+    if (bpf_probe_read_user(ev->data, 255, name) != 0) {
+        if (bpf_probe_read_user(ev->data, 63, name) != 0) {
+            return 0;
+        }
+    }
+    ev->data[255] = '\0';
+    if (ev->data[0] == '\0') {
+        return 0;
+    }
+
+    ev->hdr.length = 256U;
+    __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + 256U;
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+    return 0;
+}
+
+struct libcxx_alt_string {
+    __u64 first;   // short: chars[0..7]; long: const char *data
+    __u64 second;  // short: chars[8..15]; long: __u64 size
+    __u8 tail[8];  // tail[7] (offset 23): short => len (bit7==0), long => MSB cap (bit7==1)
+};
+
+static __inline __attribute__((always_inline)) __u32 read_alt_libcxx_string(
+    __u8 *dst,
+    __u32 max_copy,
+    const void *str_ptr
+) {
+    if (!dst || !str_ptr || max_copy == 0) {
+        return 0;
+    }
+
+    struct libcxx_alt_string s;
+    __builtin_memset(&s, 0, sizeof(s));
+    if (bpf_probe_read_user(&s, sizeof(s), str_ptr) != 0) {
+        return 0;
+    }
+
+    __u8 flag = s.tail[7];
+    if ((flag & 0x80U) == 0U) {
+        __u32 slen = (__u32)(flag & 0x7FU);
+        if (slen == 0U || slen > 22U) {
+            return 0;
+        }
+        __u32 copy_len = slen;
+        if (copy_len > max_copy) {
+            copy_len = max_copy;
+        }
+        copy_len &= 0x1FU;
+        if (copy_len == 0U || copy_len > 22U) {
+            return 0;
+        }
+        if (bpf_probe_read_user(dst, copy_len, str_ptr) != 0) {
+            return 0;
+        }
+        return copy_len;
+    }
+
+    const void *data_ptr = (const void *)(unsigned long)s.first;
+    __u64 raw_len = s.second;
+    if (!data_ptr || raw_len == 0ULL || raw_len > 65536ULL) {
+        return 0;
+    }
+    __u32 copy_len = (__u32)raw_len;
+    if (copy_len > max_copy) {
+        copy_len = max_copy;
+    }
+    copy_len &= 0xFFFU;
+    if (copy_len == 0U || copy_len > 4095U) {
+        return 0;
+    }
+    if (bpf_probe_read_user(dst, copy_len, data_ptr) != 0) {
+        return 0;
+    }
+    return copy_len;
+}
+
+// Hook CronetURLRequest::CronetURLRequest(..., Callback* adapter [x2], const GURL& url [x3], ...)
+SEC("uprobe/cronet_create")
+int probe_cronet_create(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 adapter = (__u64)PT_REGS_PARM3(ctx);
+    const void *gurl_ptr = (const void *)(unsigned long)PT_REGS_PARM4(ctx);
+    if (!adapter || !gurl_ptr) {
+        return 0;
+    }
+
+    __u32 zero = 0;
+    struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!ev) {
+        return 0;
+    }
+
+    __u32 url_len = read_alt_libcxx_string(ev->data, 2048U, gurl_ptr);
+    url_len &= 0xFFFU;
+    if (url_len == 0U || url_len > 2048U) {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    ev->hdr.pid = (__u32)(pid_tgid >> 32);
+    ev->hdr.uid = uid;
+    ev->hdr.ssl_ptr = adapter;
+    ev->hdr.direction = DIRECTION_CRONET_REQ;
+    ev->hdr.length = url_len;
+    ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+
+    __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + url_len;
+    emit_size &= 0x1FFFU;
+    if (emit_size <= sizeof(struct tls_event_hdr) || emit_size > sizeof(struct tls_event)) {
+        return 0;
+    }
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+    return 0;
+}
+
+// Hook CronetURLRequestAdapter::OnResponseStarted(adapter [x0], int http_status_code [w1], ..., const net::HttpResponseHeaders* headers [x3], ...)
+SEC("uprobe/cronet_resp_started")
+int probe_cronet_resp_started(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 adapter = (__u64)PT_REGS_PARM1(ctx);
+    __u32 status_code = (__u32)PT_REGS_PARM2(ctx);
+    const char *hdrs_ptr = (const char *)(unsigned long)PT_REGS_PARM4(ctx);
+    if (!adapter) {
+        return 0;
+    }
+
+    __u32 zero = 0;
+    struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!ev) {
+        return 0;
+    }
+
+    *(__u32 *)ev->data = status_code;
+    __u32 hdr_len = 0;
+    if (hdrs_ptr) {
+        // net::HttpResponseHeaders::raw_headers_ is at offset +0x20 on 64-bit
+        hdr_len = read_alt_libcxx_string(ev->data + 4, 4095U, hdrs_ptr + 0x20);
+        hdr_len &= 0xFFFU;
+        if (hdr_len > 4095U) {
+            hdr_len = 0U;
+        }
+    }
+
+    __u32 payload_len = 4U + hdr_len;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    ev->hdr.pid = (__u32)(pid_tgid >> 32);
+    ev->hdr.uid = uid;
+    ev->hdr.ssl_ptr = adapter;
+    ev->hdr.direction = DIRECTION_CRONET_RESP_HDR;
+    ev->hdr.length = payload_len;
+    ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+
+    __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + payload_len;
+    emit_size &= 0x1FFFU;
+    if (emit_size <= sizeof(struct tls_event_hdr) || emit_size > sizeof(struct tls_event)) {
+        return 0;
+    }
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+    return 0;
+}
+
+// Hook CronetURLRequestAdapter::OnReadCompleted(adapter [x0], net::IOBuffer* read_buffer [x1], int bytes_read [w2])
+SEC("uprobe/cronet_read_completed")
+int probe_cronet_read_completed(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 adapter = (__u64)PT_REGS_PARM1(ctx);
+    const char *iobuf_ptr = (const char *)(unsigned long)PT_REGS_PARM2(ctx);
+    __s32 bytes_read = (__s32)PT_REGS_PARM3(ctx);
+    if (!adapter || !iobuf_ptr || bytes_read <= 0) {
+        return 0;
+    }
+
+    const void *data_ptr = 0;
+    // net::IOBuffer::data_ is at offset +0x10 on 64-bit
+    if (bpf_probe_read_user(&data_ptr, sizeof(data_ptr), iobuf_ptr + 0x10) != 0 || !data_ptr) {
+        return 0;
+    }
+
+    emit_ssl_chunk(ctx, uid, adapter, data_ptr, bytes_read, DIRECTION_CRONET_BODY);
+    return 0;
+}
+
+// Hook CronetURLRequestAdapter::OnSucceeded(adapter [x0], ...)
+SEC("uprobe/cronet_succeeded")
+int probe_cronet_succeeded(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 adapter = (__u64)PT_REGS_PARM1(ctx);
+    if (!adapter) {
+        return 0;
+    }
+
+    __u32 zero = 0;
+    struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!ev) {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    ev->hdr.pid = (__u32)(pid_tgid >> 32);
+    ev->hdr.uid = uid;
+    ev->hdr.ssl_ptr = adapter;
+    ev->hdr.direction = DIRECTION_CRONET_FINISH;
+    ev->hdr.length = 4U;
+    ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+    *(__u32 *)ev->data = 0U;
+
+    __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + 4U;
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
     return 0;
 }
 

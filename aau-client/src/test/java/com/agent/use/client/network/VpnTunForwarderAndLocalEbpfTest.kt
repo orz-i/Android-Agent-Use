@@ -379,6 +379,204 @@ class VpnTunForwarderAndLocalEbpfTest {
         failingMgr.close()
     }
 
+    @Test
+    fun testLocalRootEbpfSniFrameBackfillsHttp2HostAndIgnoresWarnLines() {
+        val tmpBin = File.createTempFile("libaau_ebpf_sni_test", ".so").apply { deleteOnExit() }
+        val targetUid = 10333
+        val sslPtr = 0x7C002000L
+
+        // 256-byte NUL-padded SNI hostname matching probe_ssl_set_sni output
+        val sniPayload = ByteArray(256)
+        val sniAscii = "edith.xiaohongshu.com".toByteArray(StandardCharsets.US_ASCII)
+        System.arraycopy(sniAscii, 0, sniPayload, 0, sniAscii.size)
+        val sniFrame = aaueFrame(
+            pid = 5678,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_SNI_HOSTNAME,
+            sslPtr = sslPtr,
+            payload = sniPayload
+        )
+
+        // HTTP/2 preface + HEADERS frame omitting :authority (dynamic miss 0x80|62), path=/api/sns/v2/comment/page
+        fun h2FrameLocal(type: Int, flags: Int, streamId: Int, payload: ByteArray): ByteArray {
+            val out = ByteArrayOutputStream(9 + payload.size)
+            out.write((payload.size ushr 16) and 0xFF)
+            out.write((payload.size ushr 8) and 0xFF)
+            out.write(payload.size and 0xFF)
+            out.write(type and 0xFF)
+            out.write(flags and 0xFF)
+            out.write((streamId ushr 24) and 0x7F)
+            out.write((streamId ushr 16) and 0xFF)
+            out.write((streamId ushr 8) and 0xFF)
+            out.write(streamId and 0xFF)
+            out.write(payload)
+            return out.toByteArray()
+        }
+        val pathStr = "/api/sns/v2/comment/page".toByteArray(StandardCharsets.UTF_8)
+        val reqHeaders = ByteArrayOutputStream().apply {
+            write(0x82) // :method: GET
+            write(0x87) // :scheme: https
+            write(0x80 or 62) // :authority dynamic miss
+            write(0x40 or 4) // :path literal inc
+            write(pathStr.size)
+            write(pathStr)
+        }.toByteArray()
+        val reqBytes = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1) +
+            h2FrameLocal(0x1, 0x05, 1, reqHeaders)
+        val outFrame = aaueFrame(
+            pid = 5678,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_OUTBOUND_WRITE,
+            sslPtr = sslPtr,
+            payload = reqBytes
+        )
+
+        val jsonBody = """{"comments":[{"id":"c1"}]}""".toByteArray(StandardCharsets.UTF_8)
+        val inBytes = h2FrameLocal(0x1, 0x04, 1, byteArrayOf(0x88.toByte())) +
+            h2FrameLocal(0x0, 0x01, 1, jsonBody)
+        val inFrame = aaueFrame(
+            pid = 5678,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_INBOUND_READ,
+            sslPtr = sslPtr,
+            payload = inBytes
+        )
+
+        val requests = CopyOnWriteArrayList<HttpRequestEvent>()
+        val responses = CopyOnWriteArrayList<HttpResponseEvent>()
+        val respLatch = CountDownLatch(1)
+
+        val engine = LocalRootEbpfCaptureEngine(
+            context = null,
+            binaryPathResolver = { tmpBin },
+            uidResolver = { targetUid },
+            processStarter = { _, _ ->
+                FakeProcess(
+                    stdoutBytes = sniFrame + outFrame + inFrame,
+                    stderrText = "WARN:perf_event_open_tp(/apex/com.android.conscrypt/lib/libssl.so):errno=22(Invalid argument)\nREADY:/apex/com.android.conscrypt/lib64/libssl.so\n",
+                    exitCode = 0
+                )
+            }
+        )
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) { requests.add(event) }
+            override fun onResponseReceived(event: HttpResponseEvent) {
+                responses.add(event)
+                respLatch.countDown()
+            }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+
+        val started = engine.startCapture(
+            NetworkCaptureConfig(targetPackage = "com.xingin.xhs", mode = CaptureMode.EBPF),
+            listener
+        )
+        assertTrue("WARN before READY must not abort eBPF capture", started)
+        assertEquals(CaptureMode.ACTIVE_MODE_EBPF, engine.activeMode)
+        assertEquals(null, engine.lastError)
+        assertTrue(respLatch.await(3, TimeUnit.SECONDS))
+        assertEquals(1, requests.size)
+        assertEquals("https://edith.xiaohongshu.com/api/sns/v2/comment/page", requests[0].url)
+        assertEquals("""{"comments":[{"id":"c1"}]}""", String(engine.getResponseBody(responses[0].requestId)!!, StandardCharsets.UTF_8))
+        engine.stopCapture()
+    }
+
+    @Test
+    fun testLocalRootEbpfCronetFramesAndAttachedLibraries() {
+        val tmpBin = File.createTempFile("libaau_ebpf_cronet_test", ".so").apply { deleteOnExit() }
+        val targetUid = 10429
+        val adapterPtr = 0x7D004000L
+
+        val reqUrl = "https://edith.xiaohongshu.com/api/sns/v10/comment/page".toByteArray(StandardCharsets.UTF_8)
+        val reqFrame = aaueFrame(
+            pid = 7788,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_CRONET_REQ,
+            sslPtr = adapterPtr,
+            payload = reqUrl
+        )
+
+        val rawHeaders = "HTTP/1.1 200 OK\u0000content-type: application/json\u0000\u0000"
+            .toByteArray(StandardCharsets.ISO_8859_1)
+        val hdrPayload = ByteArray(4 + rawHeaders.size)
+        hdrPayload[0] = (200 and 0xFF).toByte()
+        hdrPayload[1] = 0
+        hdrPayload[2] = 0
+        hdrPayload[3] = 0
+        System.arraycopy(rawHeaders, 0, hdrPayload, 4, rawHeaders.size)
+        val hdrFrame = aaueFrame(
+            pid = 7788,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_CRONET_RESP_HDR,
+            sslPtr = adapterPtr,
+            payload = hdrPayload
+        )
+
+        val bodyBytes = """{"comments":[{"id":"c_cronet"}]}""".toByteArray(StandardCharsets.UTF_8)
+        val bodyFrame = aaueFrame(
+            pid = 7788,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_CRONET_BODY,
+            sslPtr = adapterPtr,
+            payload = bodyBytes
+        )
+
+        val finishFrame = aaueFrame(
+            pid = 7788,
+            uid = targetUid,
+            direction = LocalRootEbpfCaptureEngine.DIRECTION_CRONET_FINISH,
+            sslPtr = adapterPtr,
+            payload = ByteArray(4)
+        )
+
+        val requests = CopyOnWriteArrayList<HttpRequestEvent>()
+        val responses = CopyOnWriteArrayList<HttpResponseEvent>()
+        val respLatch = CountDownLatch(1)
+
+        val engine = LocalRootEbpfCaptureEngine(
+            context = null,
+            binaryPathResolver = { tmpBin },
+            uidResolver = { targetUid },
+            processStarter = { _, _ ->
+                FakeProcess(
+                    stdoutBytes = reqFrame + hdrFrame + bodyFrame + finishFrame,
+                    stderrText = "ATTACHED:/data/app/com.xingin.xhs/lib/arm64/libcronet.114.0.5735.38.so\n" +
+                        "ATTACHED_CRONET:/data/app/com.xingin.xhs/lib/arm64/libcronet.114.0.5735.38.so\n" +
+                        "READY:/apex/com.android.conscrypt/lib64/libssl.so\n",
+                    exitCode = 0
+                )
+            }
+        )
+        val listener = object : INetworkEventListener.Stub() {
+            override fun onRequestWillBeSent(event: HttpRequestEvent) { requests.add(event) }
+            override fun onResponseReceived(event: HttpResponseEvent) {
+                responses.add(event)
+                respLatch.countDown()
+            }
+            override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+            override fun onErrorOccurred(requestId: String, error: String) {}
+        }
+
+        val started = engine.startCapture(
+            NetworkCaptureConfig(targetPackage = "com.xingin.xhs", mode = CaptureMode.EBPF),
+            listener
+        )
+        assertTrue(started)
+        assertTrue(respLatch.await(3, TimeUnit.SECONDS))
+        val libs = engine.attachedLibrariesSnapshot()
+        assertTrue(libs.any { it.contains("libcronet.114.0.5735.38.so") })
+        assertTrue(libs.any { it.startsWith("cronet:") && it.contains("libcronet.114.0.5735.38.so") })
+        assertEquals(1, requests.size)
+        assertEquals("https://edith.xiaohongshu.com/api/sns/v10/comment/page", requests[0].url)
+        assertEquals(200, responses[0].statusCode)
+        assertEquals(
+            """{"comments":[{"id":"c_cronet"}]}""",
+            String(engine.getResponseBody(responses[0].requestId)!!, StandardCharsets.UTF_8)
+        )
+        engine.stopCapture()
+    }
+
     private class FakeProcess(
         stdoutBytes: ByteArray,
         stderrText: String,
