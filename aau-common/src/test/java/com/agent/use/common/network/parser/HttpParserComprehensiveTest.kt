@@ -19,6 +19,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import java.util.Base64
 import java.util.zip.GZIPOutputStream
 
 class HttpParserComprehensiveTest {
@@ -825,12 +826,13 @@ class HttpParserComprehensiveTest {
 
         val mwRequests = ArrayList<HttpRequestEvent>()
         val mwResponses = ArrayList<HttpResponseEvent>()
+        val mwChunks = ArrayList<ByteArray>()
         val mwParser = TlsStreamParser(
             NetworkCaptureConfig(targetPackage = "com.example.other"),
             object : INetworkEventListener.Stub() {
                 override fun onRequestWillBeSent(event: HttpRequestEvent) { mwRequests.add(event) }
                 override fun onResponseReceived(event: HttpResponseEvent) { mwResponses.add(event) }
-                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) {}
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) { mwChunks.add(chunk) }
                 override fun onErrorOccurred(requestId: String, error: String) {}
             },
             middlewares = listOf(customMw)
@@ -848,8 +850,57 @@ class HttpParserComprehensiveTest {
         assertEquals(1, mwResponses.size)
         assertEquals("Decoded", mwResponses[0].statusText)
         assertEquals("decoded:hello".length.toLong(), mwResponses[0].contentLength)
+        assertEquals(1, mwChunks.size)
+        assertEquals("decoded:hello", String(mwChunks[0], StandardCharsets.UTF_8))
         val decodedBody = mwParser.getResponseBody(mwResponses[0].requestId)
         assertNotNull(decodedBody)
         assertEquals("decoded:hello", String(decodedBody!!, StandardCharsets.UTF_8))
+
+        // 3. Built-in Douyin plugin + middleware decodes Zstd/Brotli mislabeled responses and emits post-middleware chunks
+        val dyJson = """{"status_code":0,"aweme_list":[{"desc":"抖音插件测试"}]}"""
+        val dyZstd = com.github.luben.zstd.Zstd.compress(dyJson.toByteArray(StandardCharsets.UTF_8))
+        val dyResponses = ArrayList<HttpResponseEvent>()
+        val dyChunks = ArrayList<ByteArray>()
+        val dyParser = TlsStreamParser(
+            NetworkCaptureConfig(targetPackage = "com.ss.android.ugc.aweme"),
+            object : INetworkEventListener.Stub() {
+                override fun onRequestWillBeSent(event: HttpRequestEvent) {}
+                override fun onResponseReceived(event: HttpResponseEvent) { dyResponses.add(event) }
+                override fun onDataChunkReceived(requestId: String, chunk: ByteArray) { dyChunks.add(chunk) }
+                override fun onErrorOccurred(requestId: String, error: String) {}
+            }
+        )
+        dyParser.onOutboundData(
+            "conn-dy-1",
+            "GET /aweme/v1/feed/ HTTP/1.1\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        dyParser.onInboundData(
+            "conn-dy-1",
+            ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ${dyZstd.size}\r\n\r\n")
+                .toByteArray(StandardCharsets.ISO_8859_1) + dyZstd
+        )
+        assertEquals(1, dyResponses.size)
+        assertEquals("https://aweme.snssdk.com/aweme/v1/feed/", dyResponses[0].url)
+        assertEquals("application/json; charset=utf-8", dyResponses[0].mimeType)
+        assertEquals(1, dyChunks.size)
+        assertEquals(dyJson, String(dyChunks[0], StandardCharsets.UTF_8))
+        assertEquals(dyJson, String(dyParser.getResponseBody(dyResponses[0].requestId)!!, StandardCharsets.UTF_8))
+
+        // 4. Built-in Douyin plugin inspects Zstd dictionary frame and adds decode hint header
+        val fakeDictZstd = byteArrayOf(0x28, 0xB5.toByte(), 0x2F, 0xFD.toByte(), 0x23, 0x05, 0x00, 0x00, 0x00, 0xAA.toByte())
+        dyParser.onOutboundData(
+            "conn-dy-dict",
+            "GET /aweme/v2/comment/list/ HTTP/1.1\r\nHost: aweme.snssdk.com\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+        )
+        dyParser.onInboundData(
+            "conn-dy-dict",
+            ("HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: ${fakeDictZstd.size}\r\n\r\n")
+                .toByteArray(StandardCharsets.ISO_8859_1) + fakeDictZstd
+        )
+        assertEquals(2, dyResponses.size)
+        assertEquals(
+            "zstd-dict:0x5",
+            dyResponses[1].headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value
+        )
     }
 }

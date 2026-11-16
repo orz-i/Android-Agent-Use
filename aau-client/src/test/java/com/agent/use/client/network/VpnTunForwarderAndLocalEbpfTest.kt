@@ -590,6 +590,9 @@ class VpnTunForwarderAndLocalEbpfTest {
         assertTrue(suCmd.startsWith("\"/data/local/tmp/libaau_ebpf_helper.so\" '--uid' '10234' '--lib-dir' '/data/app/com.xingin.xhs/lib/arm64'"))
         assertTrue(suCmd.contains("'--cronet-sig' '(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J'"))
         assertTrue(suCmd.contains("'--cronet-abi' '0x20,0x10,0'"))
+
+        val dyArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.ss.android.ugc.aweme")
+        assertTrue(dyArgs.contains("(Ljava/lang/Object;JLjava/lang/String;IIZZZIZIIJ)J"))
     }
 
     @Test

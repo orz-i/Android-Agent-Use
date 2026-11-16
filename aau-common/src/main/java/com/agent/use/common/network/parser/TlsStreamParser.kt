@@ -287,19 +287,16 @@ class TlsStreamParser @JvmOverloads constructor(
         cronetStreams.remove(connectionId, state)
         dispatchCronetRequestIfNeeded(state)
 
-        // Cronet's OnReadCompleted delivers decompressed bytes even when raw_headers_ retains Content-Encoding.
-        // Only run gzip decompression if the bytes still have the gzip magic header (0x1f 0x8b).
-        val isGzipMagic = rawBytes.size >= 2 &&
-            (rawBytes[0].toInt() and 0xFF) == 0x1F &&
-            (rawBytes[1].toInt() and 0xFF) == 0x8B
-        val finalBody = if (isGzipMagic) {
-            HttpContentDecoder.decompressIfNeeded(rawBytes, state.responseHeaders)
+        val isGzipMagic = HttpContentDecoder.hasGzipMagic(rawBytes)
+        val isZstdMagic = HttpContentDecoder.hasZstdMagic(rawBytes)
+        val finalBody = if (isGzipMagic || isZstdMagic) {
+            HttpContentDecoder.decompressByMagicOrEncoding(rawBytes)
         } else {
             rawBytes
         }
 
         if (finalBody.isNotEmpty()) {
-            dispatchBodyChunk(state.requestId, finalBody)
+            stageResponseBody(state.requestId, finalBody)
         }
 
         val effectiveLength = if (finalBody.isNotEmpty()) {
@@ -423,7 +420,7 @@ class TlsStreamParser @JvmOverloads constructor(
             connectionHostHint = connectionHostHints[connectionId] ?: lastKnownHost ?: defaultConnectionHostHint,
             onParsedRequest = ::dispatchRequest,
             onParsedResponse = ::dispatchResponse,
-            onBodyChunk = ::dispatchBodyChunk
+            onBodyChunk = ::stageResponseBody
         )
 
     private fun createHttp2Parser(connectionId: String): Http2PlaintextParser =
@@ -432,7 +429,7 @@ class TlsStreamParser @JvmOverloads constructor(
             connectionHostHint = connectionHostHints[connectionId] ?: lastKnownHost ?: defaultConnectionHostHint,
             onParsedRequest = ::dispatchRequest,
             onParsedResponse = ::dispatchResponse,
-            onBodyChunk = ::dispatchBodyChunk
+            onBodyChunk = ::stageResponseBody
         )
 
     private fun dispatchRequest(request: HttpRequestEvent) {
@@ -486,7 +483,7 @@ class TlsStreamParser @JvmOverloads constructor(
             }
             if (currentBody !== initialBody && !currentBody.contentEquals(initialBody)) {
                 if (currentBody == null) {
-                    responseBodies.remove(effective.requestId)
+                    synchronized(responseBodies) { responseBodies.remove(effective.requestId) }
                     effective = effective.copy(contentLength = 0L)
                 } else {
                     val out = ByteArrayOutputStream()
@@ -495,12 +492,20 @@ class TlsStreamParser @JvmOverloads constructor(
                     if (toWrite > 0) {
                         out.write(currentBody, 0, toWrite)
                     }
-                    responseBodies[effective.requestId] = out
+                    synchronized(responseBodies) { responseBodies[effective.requestId] = out }
                     effective = effective.copy(contentLength = out.size().toLong())
                 }
             }
         }
         if (!config.matchesUrl(effective.url)) return
+        val finalBody = getResponseBody(effective.requestId)
+        if (finalBody != null && finalBody.isNotEmpty()) {
+            try {
+                listener.onDataChunkReceived(effective.requestId, finalBody)
+            } catch (e: RemoteException) {
+                Log.w(TAG, "RemoteException dispatching onDataChunkReceived: ${e.message}")
+            }
+        }
         try {
             listener.onResponseReceived(effective)
         } catch (e: RemoteException) {
@@ -508,7 +513,7 @@ class TlsStreamParser @JvmOverloads constructor(
         }
     }
 
-    private fun dispatchBodyChunk(requestId: String, chunk: ByteArray) {
+    private fun stageResponseBody(requestId: String, chunk: ByteArray) {
         val bodyStream = synchronized(responseBodies) {
             responseBodies.getOrPut(requestId) { ByteArrayOutputStream() }
         }
@@ -518,11 +523,6 @@ class TlsStreamParser @JvmOverloads constructor(
                 val toWrite = minOf(chunk.size, allowed)
                 if (toWrite > 0) bodyStream.write(chunk, 0, toWrite)
             }
-        }
-        try {
-            listener.onDataChunkReceived(requestId, chunk)
-        } catch (e: RemoteException) {
-            Log.w(TAG, "RemoteException dispatching onDataChunkReceived: ${e.message}")
         }
     }
 }

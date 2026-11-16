@@ -1,7 +1,10 @@
 package com.agent.use.common.network.plugin
 
+import com.agent.use.common.network.HttpHeader
 import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
+import com.agent.use.common.network.getIgnoreCase
+import com.agent.use.common.network.parser.HttpContentDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -351,10 +354,115 @@ object XiaohongshuCapturePlugin : NetworkCapturePlugin {
         listOf(XiaohongshuTrafficMiddleware)
 }
 
+object DouyinTrafficMiddleware : NetworkTrafficMiddleware {
+    override val id: String = "builtin.douyin.middleware"
+
+    private val handledPackages = setOf(
+        "com.ss.android.ugc.aweme",
+        "com.ss.android.ugc.aweme.lite",
+        "com.ss.android.article.news",
+        "com.ss.android.article.lite"
+    )
+
+    override fun onResponse(
+        targetPackage: String,
+        event: HttpResponseEvent,
+        body: ByteArray?
+    ): Pair<HttpResponseEvent, ByteArray?> {
+        if (targetPackage !in handledPackages) return event to body
+
+        var nextEvent = event
+        var nextBody = body
+
+        // Resolve TTNet unknown-host API paths when SNI / Host header was omitted on resumed connections
+        if (nextEvent.url.contains("://unknown-host/")) {
+            val hostHint = nextEvent.headers.getIgnoreCase("x-tt-host")
+                ?: nextEvent.headers.getIgnoreCase(":authority")
+                ?: nextEvent.headers.getIgnoreCase("host")
+                ?: if (nextEvent.url.contains("/aweme/v")) "aweme.snssdk.com" else null
+            if (!hostHint.isNullOrBlank()) {
+                nextEvent = nextEvent.copy(url = nextEvent.url.replace("://unknown-host", "://$hostHint"))
+            }
+        }
+
+        if (nextBody != null && nextBody.isNotEmpty()) {
+            if (HttpContentDecoder.hasZstdMagic(nextBody)) {
+                val zstdInfo = HttpContentDecoder.inspectZstdFrame(nextBody)
+                val unpacked = HttpContentDecoder.decompressZstd(nextBody)
+                if (unpacked != null && !unpacked.contentEquals(nextBody)) {
+                    nextBody = unpacked
+                } else if (zstdInfo.hasDictionaryId) {
+                    val hintVal = "zstd-dict:${zstdInfo.dictId?.let { "0x" + it.toString(16) } ?: "unknown"}"
+                    if (nextEvent.headers.none { it.name.equals("x-aau-decode-hint", ignoreCase = true) }) {
+                        nextEvent = nextEvent.copy(headers = nextEvent.headers + HttpHeader("x-aau-decode-hint", hintVal))
+                    }
+                }
+            } else {
+                val encoding = nextEvent.headers.getIgnoreCase("content-encoding")?.lowercase().orEmpty()
+                if (encoding.contains("br") && !looksLikeJson(nextBody)) {
+                    HttpContentDecoder.decompressBrotli(nextBody)?.let { nextBody = it }
+                } else if (encoding.contains("zstd")) {
+                    HttpContentDecoder.decompressZstd(nextBody)?.let { nextBody = it }
+                }
+            }
+
+            if (looksLikeJson(nextBody) &&
+                (nextEvent.mimeType.isNullOrBlank() || nextEvent.mimeType.equals("application/octet-stream", ignoreCase = true))
+            ) {
+                nextEvent = nextEvent.copy(mimeType = "application/json; charset=utf-8")
+            }
+        }
+
+        return nextEvent to nextBody
+    }
+
+    private fun looksLikeJson(bytes: ByteArray): Boolean {
+        for (b in bytes) {
+            val c = b.toInt() and 0xFF
+            if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) continue
+            return c == '{'.code || c == '['.code
+        }
+        return false
+    }
+}
+
+object DouyinCapturePlugin : NetworkCapturePlugin {
+    override val id: String = "builtin.douyin"
+
+    private val targetPackages = setOf(
+        "com.ss.android.ugc.aweme",
+        "com.ss.android.ugc.aweme.lite",
+        "com.ss.android.article.news",
+        "com.ss.android.article.lite"
+    )
+
+    override val defaultPackages: List<String> = listOf("com.ss.android.ugc.aweme")
+
+    override fun matchesPackage(targetPackage: String): Boolean = targetPackage in targetPackages
+
+    override fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile =
+        EbpfProbeProfile(
+            cronetAbiRule = EbpfCronetAbiRule(
+                rawHeadersOffset = 0x20,
+                ioBufferDataOffset = 0x10,
+                stringLayoutMode = 0,
+                vtableSlots = Triple(3, 4, 5),
+                jniSignatures = listOf(
+                    "(Ljava/lang/Object;JLjava/lang/String;IIZZZIZIIJ)J",
+                    "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"
+                )
+            )
+        )
+
+    override fun provideMiddlewares(targetPackage: String): List<NetworkTrafficMiddleware> =
+        listOf(DouyinTrafficMiddleware)
+}
+
 object NetworkCapturePluginRegistry {
     private val plugins = CopyOnWriteArrayList<NetworkCapturePlugin>().apply {
         add(GenericCronetCapturePlugin)
         add(XiaohongshuCapturePlugin)
+        add(DouyinCapturePlugin)
     }
 
     private val jsonProfileOverrides = ConcurrentHashMap<String, EbpfProbeProfile>()

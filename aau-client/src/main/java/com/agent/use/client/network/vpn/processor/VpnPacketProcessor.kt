@@ -15,6 +15,8 @@ import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
 import com.agent.use.common.network.getIgnoreCase
+import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.NetworkTrafficMiddleware
 
 /**
  * TUN 虚拟网卡原始 IP 数据包分发与拦截处理引擎。
@@ -30,7 +32,9 @@ class VpnPacketProcessor(
     private val config: NetworkCaptureConfig,
     private val listener: INetworkEventListener,
     val dnsCache: DnsSessionCache = DnsSessionCache(),
-    val sessionTracker: TcpSessionTracker = TcpSessionTracker()
+    val sessionTracker: TcpSessionTracker = TcpSessionTracker(),
+    private val middlewares: List<NetworkTrafficMiddleware> =
+        NetworkCapturePluginRegistry.resolveMiddlewares(config.targetPackage)
 ) {
     companion object {
         private const val TAG = "VpnPacketProcessor"
@@ -196,7 +200,7 @@ class VpnPacketProcessor(
                         }
                     } else null
 
-                    val requestEvent = HttpRequestEvent(
+                    var requestEvent = HttpRequestEvent(
                         requestId = result.requestId,
                         timestamp = System.currentTimeMillis(),
                         url = url,
@@ -205,6 +209,9 @@ class VpnPacketProcessor(
                         postData = postDataText,
                         isTls = false
                     )
+                    for (middleware in middlewares) {
+                        requestEvent = middleware.onRequest(config.targetPackage, requestEvent)
+                    }
                     safeDispatch { listener.onRequestWillBeSent(requestEvent) }
                 }
             }
@@ -265,24 +272,34 @@ class VpnPacketProcessor(
         val fallbackPortSuffix = if (tcpPacket.srcPort == 80) "" else ":${tcpPacket.srcPort}"
         val url = session.activeRequestUrl ?: "http://$fallbackHost$fallbackPortSuffix/"
 
-        if (config.matchesUrl(url)) {
-            if (resp.body.isNotEmpty()) {
-                sessionTracker.cacheResponseBody(result.requestId, resp.body)
-                safeDispatch { listener.onDataChunkReceived(result.requestId, resp.body) }
-            }
+        var effectiveBody: ByteArray? = resp.body
+        var effectiveEvent = HttpResponseEvent(
+            requestId = result.requestId,
+            timestamp = System.currentTimeMillis(),
+            url = url,
+            statusCode = resp.statusCode,
+            statusText = resp.statusText,
+            headers = resp.headers,
+            mimeType = resp.mimeType,
+            contentLength = if (resp.body.isNotEmpty()) resp.body.size.toLong() else resp.contentLength,
+            fromCache = false
+        )
+        for (middleware in middlewares) {
+            val (nextEvent, nextBody) = middleware.onResponse(config.targetPackage, effectiveEvent, effectiveBody)
+            effectiveEvent = nextEvent
+            effectiveBody = nextBody
+        }
+        val finalBody = effectiveBody ?: ByteArray(0)
+        if (finalBody.size.toLong() != effectiveEvent.contentLength && (effectiveBody !== resp.body)) {
+            effectiveEvent = effectiveEvent.copy(contentLength = finalBody.size.toLong())
+        }
 
-            val responseEvent = HttpResponseEvent(
-                requestId = result.requestId,
-                timestamp = System.currentTimeMillis(),
-                url = url,
-                statusCode = resp.statusCode,
-                statusText = resp.statusText,
-                headers = resp.headers,
-                mimeType = resp.mimeType,
-                contentLength = if (resp.body.isNotEmpty()) resp.body.size.toLong() else resp.contentLength,
-                fromCache = false
-            )
-            safeDispatch { listener.onResponseReceived(responseEvent) }
+        if (config.matchesUrl(effectiveEvent.url)) {
+            if (finalBody.isNotEmpty()) {
+                sessionTracker.cacheResponseBody(result.requestId, finalBody)
+                safeDispatch { listener.onDataChunkReceived(result.requestId, finalBody) }
+            }
+            safeDispatch { listener.onResponseReceived(effectiveEvent) }
         }
     }
 
