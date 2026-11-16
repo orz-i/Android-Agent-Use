@@ -51,7 +51,7 @@
 | **输入法 (IME)** | 输入框获取焦点时，在用户的主屏幕上弹出虚拟键盘 | **本地化隔离** (`DISPLAY_IME_POLICY_LOCAL=0`)，输入法仅在虚拟屏弹起 |
 | **声音处理** | 全局音频转发或外放，无法针对单个后台任务静音 | **AppOps 级别静音** (`PLAY_AUDIO=ignore`)，后台应用绝不爆音，支持安全恢复 |
 | **图像消费形态** | H.264/H.265/AV1 视频压缩编码流 (30~60fps) | **ImageReader 零拷贝直读**，≤10fps 动态限速丢帧队列，直接提取 Bitmap/PNG |
-| **主屏冲突避让** | 无法感知，容易覆盖用户正在使用的前台 App | **冲突避让与回捞**：主屏在用时拒绝启动，意外溢出弹窗自动调用 `moveTask` 回捞 |
+| **任务常驻托管** | 无法感知，容易覆盖用户正在使用的前台 App | **常驻托管与来源归因**：主屏在用时避让，`CustodyEngine` 常驻监听任务栈并结合 `LaunchOriginResolver` 精确判定回捞或用户主动切换 |
 | **语义与无障碍** | 纯像素流，无法获取 Android 语义视图树 | **集成 a11y 插件**，支持不可变语义节点树提取与高精度坐标/文本双重定位 |
 | **多用户支持** | 仅按单一主用户展示应用 | 深度支持**分身应用、工作资料 (Dual App / Work Profile)** 的识别与调度 |
 
@@ -87,7 +87,7 @@ flowchart TD
         Rotation["DisplayOrientationWatcher (ITaskStackListener 自动纠偏)"]
         Audio["AudioMuteLedger (AppOps 持久化账本与自愈)"]
         Input["InputInjector (InputManagerGlobal / InputManager 反射)"]
-        TaskManager["TaskManagerFacade (主屏防扰 / 冲突探测 / 任务回捞)"]
+        TaskManager["TaskManagerFacade (任务常驻托管 / 来源解析 / 任务调度)"]
 
         Server --> VD
         Server --> Rotation

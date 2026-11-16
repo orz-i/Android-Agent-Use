@@ -49,7 +49,7 @@ With the rise of Vision-Language Models (VLMs) and autonomous mobile agents, con
 | **Virtual Keyboard (IME)** | Pops up soft keyboard on user's main screen | **Local IME Isolation** (`DISPLAY_IME_POLICY_LOCAL=0`), keyboard only in virtual display |
 | **Audio Control** | Global audio stream capture or playback; no per-app control | **AppOps Audio Mute** (`PLAY_AUDIO=ignore`), preventing sudden background audio |
 | **Image Pipeline** | H.264/H.265/AV1 video stream encoding (30~60fps) | **Direct ImageReader Zero-Copy**, ≤10fps dynamic rate-limiting queue, direct Bitmap/PNG |
-| **Main Screen Collision** | Cannot detect collisions; will override active foreground app | **Conflict Avoidance & Pullback**: rejects start if app active on main; pulls back escaping popups |
+| **Task Custody & Collision** | Cannot detect collisions; will override active foreground app | **Always-On Custody & Origin**: avoids main-screen conflict and streams live arrivals/vanishes with `LaunchOrigin` attribution |
 | **Accessibility Semantics** | Pure video pixels; no semantic view hierarchy | **Integrated a11y Extension** with immutable syntax tree and coordinate/text dual dispatch |
 | **Multi-User Support** | Single primary user view | Native support for **Dual Apps / Work Profiles (Cloned Apps)** |
 
@@ -85,7 +85,7 @@ flowchart TD
         Rotation["DisplayOrientationWatcher (ITaskStackListener)"]
         Audio["AudioMuteLedger (AppOps Persistence & Restore)"]
         Input["InputInjector (InputManagerGlobal / InputManager Reflection)"]
-        TaskManager["TaskManagerFacade (Main Conflict Guard & Task Migration)"]
+        TaskManager["TaskManagerFacade (Display Custody & Task Migration)"]
 
         Server --> VD
         Server --> Rotation
