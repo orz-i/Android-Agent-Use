@@ -139,7 +139,7 @@ class LocalRootEbpfCaptureEngine(
             return null
         }
 
-        internal const val PLUGIN_OVERRIDE_FILE_NAME = "aau_capture_plugins.json"
+        const val PLUGIN_OVERRIDE_FILE_NAME = "aau_capture_plugins.json"
 
         internal fun shellQuoteArg(arg: String): String =
             "'" + arg.replace("'", "'\\''") + "'"
@@ -242,7 +242,7 @@ class LocalRootEbpfCaptureEngine(
             val overrideFile = File(dir, PLUGIN_OVERRIDE_FILE_NAME)
             if (overrideFile.isFile) {
                 try {
-                    val loaded = NetworkCapturePluginRegistry.loadJsonOverrides(overrideFile.readText())
+                    val loaded = NetworkCapturePluginRegistry.replaceJsonOverrides(overrideFile.readText())
                     Log.i(TAG, "Loaded $loaded JSON capture plugin override(s) from ${overrideFile.absolutePath}")
                 } catch (t: Throwable) {
                     Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
