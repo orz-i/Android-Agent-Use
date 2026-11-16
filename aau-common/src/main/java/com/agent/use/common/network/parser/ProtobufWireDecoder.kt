@@ -48,6 +48,30 @@ object ProtobufWireDecoder {
         return sb.toString()
     }
 
+    /**
+     * Heuristic variant for untyped/mislabeled payloads: avoids false-matching tiny random binary
+     * by requiring at least 2 fields or a printable string/nested message.
+     */
+    fun decodeToJsonIfLikely(data: ByteArray): String? {
+        if (data.size < 2) return null
+        val parsed = tryParseMessage(data, 0, data.size, depth = 0) ?: return null
+        if (!isStronglyPlausible(parsed)) return null
+        val sb = StringBuilder(256)
+        appendMessageJson(sb, parsed)
+        return sb.toString()
+    }
+
+    private fun isStronglyPlausible(msg: DecodedMessage): Boolean {
+        if (msg.fields.size >= 2) return true
+        return msg.fields.values.flatten().any { v ->
+            when (v) {
+                is DecodedValue.Str -> v.text.length >= 2
+                is DecodedValue.SubMessage -> v.message.fields.isNotEmpty()
+                else -> false
+            }
+        }
+    }
+
     private fun tryParseMessage(data: ByteArray, start: Int, end: Int, depth: Int): DecodedMessage? {
         if (depth > MAX_DEPTH || start > end) return null
         val msg = DecodedMessage()

@@ -221,4 +221,117 @@ class GrpcDecoderTest {
         assertTrue(decodedResp.contains(""""1":"note_123""""))
         assertTrue(decodedResp.contains(""""2":8131"""))
     }
+
+    @Test
+    fun testHttpContentDecoderSupportsBrotliZstdMultiStageAndCharset() {
+        val sampleJson = """{"ok":true,"msg":"抖音brotli测试"}"""
+        val brotliBytes = Base64.getDecoder().decode("ixKAeyJvayI6dHJ1ZSwibXNnIjoi5oqW6Z+zYnJvdGxp5rWL6K+VIn0D")
+        val unbrotlied = HttpContentDecoder.decompressIfNeeded(
+            brotliBytes,
+            listOf(HttpHeader("Content-Encoding", "br"))
+        )
+        assertEquals(sampleJson, String(unbrotlied, StandardCharsets.UTF_8))
+
+        val rawBytes = sampleJson.toByteArray(StandardCharsets.UTF_8)
+        val zstdBytes = com.github.luben.zstd.Zstd.compress(rawBytes)
+        val unzstd = HttpContentDecoder.decompressIfNeeded(
+            zstdBytes,
+            listOf(HttpHeader("Content-Encoding", "zstd"))
+        )
+        assertEquals(sampleJson, String(unzstd, StandardCharsets.UTF_8))
+
+        // Multi-stage: first zstd, then gzip -> header "zstd, gzip" decodes gzip first then zstd
+        val gzAfterZstd = ByteArrayOutputStream().apply {
+            GZIPOutputStream(this).use { it.write(zstdBytes) }
+        }.toByteArray()
+        val unstacked = HttpContentDecoder.decompressIfNeeded(
+            gzAfterZstd,
+            listOf(HttpHeader("Content-Encoding", "zstd, gzip"))
+        )
+        assertEquals(sampleJson, String(unstacked, StandardCharsets.UTF_8))
+
+        // RFC 8878 Zstd dictionary frame inspection (single-segment=1 bit5, dict_id_flag=3 -> 4-byte LE dictId)
+        val dictFrame = byteArrayOf(
+            0x28, 0xB5.toByte(), 0x2F, 0xFD.toByte(),
+            0x23, // single_segment=1, dict_id_flag=3 (4 bytes)
+            0x78, 0x56, 0x34, 0x12, // dictId = 0x12345678
+            0x01, 0x00, 0x00
+        )
+        val info = HttpContentDecoder.inspectZstdFrame(dictFrame)
+        assertTrue(info.isZstdMagic)
+        assertTrue(info.hasDictionaryId)
+        assertEquals(0x12345678L, info.dictId)
+
+        // GBK charset resolution
+        val gbkText = """{"title":"中文GBK编码"}"""
+        val gbkBytes = gbkText.toByteArray(java.nio.charset.Charset.forName("GB18030"))
+        val decodedGbk = GrpcDecoder.formatResponseBodyAsString(gbkBytes, "application/json; charset=gbk")
+        assertEquals(gbkText, decodedGbk)
+    }
+
+    @Test
+    fun testThriftWireDecoderBinaryAndCompactAndSmartFallbacks() {
+        // 1. Thrift TCompactProtocol struct:
+        // field 1 (delta=1, type=BINARY=8 -> 0x18): "douyin"
+        // field 2 (delta=1, type=I32=5 -> 0x15): zigzag(100) -> 200 (varint: 0xC8 0x01)
+        // field 3 (delta=1, type=BOOL_TRUE=1 -> 0x11)
+        // STOP (0x00)
+        val compactThrift = byteArrayOf(
+            0x18, 0x06, 'd'.code.toByte(), 'o'.code.toByte(), 'u'.code.toByte(), 'y'.code.toByte(), 'i'.code.toByte(), 'n'.code.toByte(),
+            0x15, 0xC8.toByte(), 0x01,
+            0x11,
+            0x00
+        )
+        val compactJson = ThriftWireDecoder.decodeToJson(compactThrift)
+        assertNotNull(compactJson)
+        assertTrue(compactJson!!.contains(""""_protocol":"thrift-compact""""))
+        assertTrue(compactJson.contains(""""1":"douyin""""))
+        assertTrue(compactJson.contains(""""2":100"""))
+        assertTrue(compactJson.contains(""""3":true"""))
+
+        // Format via application/x-thrift content-type
+        val thriftBodyStr = GrpcDecoder.formatResponseBodyAsString(compactThrift, "application/x-thrift")
+        assertTrue(thriftBodyStr!!.contains(""""1":"douyin""""))
+
+        // 2. Thrift TBinaryProtocol struct:
+        // type=STRING(11), fid=1, len=4, "feed"; type=I32(8), fid=2, val=42; STOP(0)
+        val binThrift = byteArrayOf(
+            11, 0, 1, 0, 0, 0, 4, 'f'.code.toByte(), 'e'.code.toByte(), 'e'.code.toByte(), 'd'.code.toByte(),
+            8, 0, 2, 0, 0, 0, 42,
+            0
+        )
+        val binJson = ThriftWireDecoder.decodeToJson(binThrift)
+        assertNotNull(binJson)
+        assertTrue(binJson!!.contains(""""_protocol":"thrift-binary""""))
+        assertTrue(binJson.contains(""""1":"feed""""))
+        assertTrue(binJson.contains(""""2":42"""))
+
+        // 3. Mislabeled application/octet-stream raw protobuf should auto-decode to JSON cleanly
+        val rawPb = pbString(1, "aweme_123") + pbVarint(2, 777)
+        val sniffedPb = GrpcDecoder.formatResponseBodyAsString(rawPb, "application/octet-stream")
+        assertTrue(sniffedPb!!.contains(""""1":"aweme_123""""))
+        assertTrue(sniffedPb.contains(""""2":777"""))
+
+        // 4. Cronet already-decompressed JSON with Content-Encoding: br header must NOT corrupt JSON
+        val cronetJson = """{"status_code":0,"extra":"cronet_ok"}""".toByteArray(StandardCharsets.UTF_8)
+        assertEquals(
+            """{"status_code":0,"extra":"cronet_ok"}""",
+            GrpcDecoder.formatResponseBodyAsString(
+                body = cronetJson,
+                contentType = "application/json",
+                contentEncoding = "br"
+            )
+        )
+
+        // 5. Undecodable Zstd dictionary payload -> structured diagnostic JSON instead of mojibake
+        val fakeZstdDict = byteArrayOf(0x28, 0xB5.toByte(), 0x2F, 0xFD.toByte(), 0x23, 0x0A, 0x00, 0x00, 0x00, 0xFF.toByte())
+        val diag = GrpcDecoder.formatResponseBodyAsString(fakeZstdDict, "application/json", contentEncoding = "zstd")
+        assertNotNull(diag)
+        assertTrue(diag!!.contains(""""_binaryPayload":true"""))
+        assertTrue(diag.contains("zstd_dictionary_frame(dictId=0xa)"))
+        assertFalse(diag.contains('\uFFFD'))
+
+        // Random corrupt bytes must NOT false-match Thrift
+        assertNull(ThriftWireDecoder.decodeToJson(byteArrayOf(0x7A, 0x11, 0x9F.toByte(), 0x02, 0x44)))
+    }
 }

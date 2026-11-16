@@ -45,9 +45,12 @@ kotlin {
 dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.brotli.dec)
+    implementation("com.github.luben:zstd-jni:${libs.versions.zstdJni.get()}@aar")
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)
+    testImplementation(libs.zstd.jni)
 }
 
 afterEvaluate {

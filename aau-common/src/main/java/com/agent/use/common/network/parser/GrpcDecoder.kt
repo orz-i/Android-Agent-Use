@@ -3,6 +3,9 @@ package com.agent.use.common.network.parser
 import com.agent.use.common.network.HttpHeader
 import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 
@@ -40,42 +43,63 @@ object GrpcDecoder {
     }
 
     /**
-     * Returns true when [contentType] identifies a raw Protobuf payload (`application/x-protobuf`, `application/protobuf`).
+     * Returns true when [contentType] identifies a raw Protobuf payload.
      */
     fun isProtobufContentType(contentType: String?): Boolean {
         if (contentType.isNullOrBlank()) return false
         val mediaType = contentType.substringBefore(';').trim().lowercase()
         return mediaType == "application/x-protobuf" ||
             mediaType == "application/protobuf" ||
-            mediaType == "application/vnd.google.protobuf"
+            mediaType == "application/vnd.google.protobuf" ||
+            mediaType == "application/x-tt-pb" ||
+            mediaType.endsWith("+proto") ||
+            mediaType.endsWith("+protobuf")
+    }
+
+    /**
+     * Returns true when [contentType] identifies an Apache Thrift payload.
+     */
+    fun isThriftContentType(contentType: String?): Boolean {
+        if (contentType.isNullOrBlank()) return false
+        val mediaType = contentType.substringBefore(';').trim().lowercase()
+        return mediaType == "application/x-thrift" ||
+            mediaType == "application/thrift" ||
+            mediaType.startsWith("application/vnd.apache.thrift") ||
+            mediaType.endsWith("+thrift")
     }
 
     /**
      * Formats captured outbound request body bytes for [HttpRequestEvent.postData],
-     * decoding gRPC / raw Protobuf payloads when indicated by headers instead of emitting binary mojibake.
+     * decoding gRPC, Protobuf, Thrift, and charset-aware text without emitting binary mojibake.
      */
     fun formatRequestPostData(body: ByteArray, headers: List<HttpHeader>): String? {
         if (body.isEmpty()) return null
         val contentType = findHeader(headers, "content-type")
+        val contentEncoding = findHeader(headers, "content-encoding")
         if (isGrpcContentType(contentType)) {
             return decodeToJson(body, contentType, headers)
         }
-        if (isProtobufContentType(contentType)) {
-            ProtobufWireDecoder.decodeToJson(body)?.let { return it }
-        }
-        return body.toString(StandardCharsets.UTF_8)
+        return formatNonGrpcBytes(
+            body = body,
+            contentType = contentType,
+            contentEncoding = contentEncoding
+        )
     }
 
     /**
      * Formats captured inbound response body bytes as readable text for callers:
-     * decodes gRPC / gRPC-Web frames and wire-format Protobuf payloads into structured JSON when applicable.
+     * decodes gRPC / gRPC-Web frames, charset-aware text (`UTF-8` / `GBK` / `GB18030`),
+     * compressed leftovers (`gzip`, `deflate`, `br`, `zstd`), wire Protobuf/Thrift payloads,
+     * and emits structured binary diagnostics instead of mojibake when still binary/encrypted.
      */
+    @JvmOverloads
     fun formatResponseBodyAsString(
         body: ByteArray?,
         contentType: String?,
         grpcEncoding: String? = null,
         grpcStatus: String? = null,
-        grpcMessage: String? = null
+        grpcMessage: String? = null,
+        contentEncoding: String? = null
     ): String? {
         if (isGrpcContentType(contentType)) {
             if (body == null && grpcStatus == null && grpcMessage == null) return null
@@ -88,10 +112,73 @@ object GrpcDecoder {
             )
         }
         if (body == null) return null
+        if (body.isEmpty()) return ""
+        return formatNonGrpcBytes(
+            body = body,
+            contentType = contentType,
+            contentEncoding = contentEncoding
+        )
+    }
+
+    private fun formatNonGrpcBytes(
+        body: ByteArray,
+        contentType: String?,
+        contentEncoding: String?
+    ): String {
+        val candidate = if (needsDecompressionPass(body, contentType, contentEncoding)) {
+            HttpContentDecoder.decompressByMagicOrEncoding(body, contentEncoding)
+        } else {
+            body
+        }
+
         if (isProtobufContentType(contentType)) {
+            ProtobufWireDecoder.decodeToJson(candidate)?.let { return it }
             ProtobufWireDecoder.decodeToJson(body)?.let { return it }
         }
-        return body.toString(StandardCharsets.UTF_8)
+        if (isThriftContentType(contentType)) {
+            ThriftWireDecoder.decodeToJson(candidate)?.let { return it }
+            ThriftWireDecoder.decodeToJson(body)?.let { return it }
+        }
+
+        val charset = HttpContentDecoder.resolveCharset(contentType)
+        decodeReadableText(candidate, charset)?.let { return it }
+
+        // If header claimed br/deflate/zstd but initial sniff missed or payload was mislabeled as binary
+        val secondPass = if (candidate.contentEquals(body) && !contentEncoding.isNullOrBlank()) {
+            HttpContentDecoder.decompressByMagicOrEncoding(body, contentEncoding)
+        } else {
+            candidate
+        }
+        if (!secondPass.contentEquals(candidate)) {
+            decodeReadableText(secondPass, charset)?.let { return it }
+        }
+
+        ProtobufWireDecoder.decodeToJsonIfLikely(secondPass)?.let { return it }
+        ThriftWireDecoder.decodeToJson(secondPass, requireStrongHeuristic = true)?.let { return it }
+
+        return formatBinaryDiagnosticJson(
+            rawBody = body,
+            decodedCandidate = secondPass,
+            contentType = contentType,
+            contentEncoding = contentEncoding
+        )
+    }
+
+    private fun needsDecompressionPass(
+        body: ByteArray,
+        contentType: String?,
+        contentEncoding: String?
+    ): Boolean {
+        if (HttpContentDecoder.hasGzipMagic(body) || HttpContentDecoder.hasZstdMagic(body)) {
+            return true
+        }
+        if (!contentEncoding.isNullOrBlank()) {
+            val charset = HttpContentDecoder.resolveCharset(contentType)
+            if (decodeReadableText(body, charset) == null) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -278,6 +365,8 @@ object GrpcDecoder {
         return when {
             enc == "gzip" || enc == "x-gzip" -> HttpContentDecoder.gunzip(payload)
             enc == "deflate" -> HttpContentDecoder.inflate(payload)
+            enc == "br" || enc == "brotli" -> HttpContentDecoder.unbrotli(payload)
+            enc == "zstd" || enc == "x-zstd" -> HttpContentDecoder.unzstd(payload)
             else -> payload
         }
     }
@@ -333,5 +422,78 @@ object GrpcDecoder {
             if (u < 0x20 && u != 0x09 && u != 0x0A && u != 0x0D) return false
         }
         return true
+    }
+
+    private fun decodeReadableText(bytes: ByteArray, charset: Charset): String? {
+        if (bytes.isEmpty()) return ""
+        return try {
+            val decoder = charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            val charBuf = decoder.decode(ByteBuffer.wrap(bytes))
+            val len = charBuf.length
+            var badCtrl = 0
+            for (i in 0 until len) {
+                val ch = charBuf[i]
+                if (ch == '\uFFFD' || ch == '\u0000') return null
+                if ((ch.code < 0x20 && ch != '\n' && ch != '\r' && ch != '\t') || ch.code == 0x7F) {
+                    badCtrl++
+                }
+            }
+            if (len > 0 && badCtrl * 20 > len) return null
+            charBuf.toString()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun formatBinaryDiagnosticJson(
+        rawBody: ByteArray,
+        decodedCandidate: ByteArray,
+        contentType: String?,
+        contentEncoding: String?
+    ): String {
+        val sample = if (decodedCandidate.isNotEmpty()) decodedCandidate else rawBody
+        val zstdInfo = HttpContentDecoder.inspectZstdFrame(sample)
+        val detectedFormat = when {
+            zstdInfo.isZstdMagic && zstdInfo.hasDictionaryId -> {
+                val dictHex = zstdInfo.dictId?.let { "0x" + it.toString(16) } ?: "unknown"
+                "zstd_dictionary_frame(dictId=$dictHex)"
+            }
+            zstdInfo.isZstdMagic -> "zstd_frame"
+            HttpContentDecoder.hasGzipMagic(sample) -> "gzip_frame"
+            HttpContentDecoder.hasZlibMagic(sample) -> "zlib_frame"
+            contentEncoding?.contains("br", ignoreCase = true) == true -> "brotli_or_corrupt_stream"
+            else -> "binary_or_encrypted_payload"
+        }
+        val hexCount = minOf(sample.size, 24)
+        val hexSb = StringBuilder(hexCount * 2)
+        val hexDigits = "0123456789abcdef"
+        for (i in 0 until hexCount) {
+            val b = sample[i].toInt() and 0xFF
+            hexSb.append(hexDigits[b ushr 4]).append(hexDigits[b and 0x0F])
+            if (i + 1 < hexCount) hexSb.append(' ')
+        }
+        val b64Slice = sample.copyOfRange(0, minOf(sample.size, 256))
+        val b64Preview = Base64.getEncoder().encodeToString(b64Slice)
+
+        val sb = StringBuilder(256)
+        sb.append("{\"_binaryPayload\":true,\"byteLength\":").append(rawBody.size)
+        contentType?.let {
+            sb.append(",\"contentType\":")
+            ProtobufWireDecoder.appendJsonString(sb, it)
+        }
+        contentEncoding?.let {
+            sb.append(",\"contentEncoding\":")
+            ProtobufWireDecoder.appendJsonString(sb, it)
+        }
+        sb.append(",\"detectedFormat\":")
+        ProtobufWireDecoder.appendJsonString(sb, detectedFormat)
+        sb.append(",\"magicHex\":")
+        ProtobufWireDecoder.appendJsonString(sb, hexSb.toString())
+        sb.append(",\"base64Preview\":")
+        ProtobufWireDecoder.appendJsonString(sb, b64Preview)
+        sb.append(",\"hint\":\"Binary, encrypted, or dictionary-compressed payload; call phone_get_network_response with asString=false for raw Base64.\"}")
+        return sb.toString()
     }
 }
