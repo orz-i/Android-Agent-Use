@@ -5,10 +5,14 @@ import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
+import com.agent.use.common.network.plugin.EbpfCronetOffsetRule
+import com.agent.use.common.network.plugin.EbpfProbeProfile
+import com.agent.use.common.network.plugin.EbpfSslOffsetRule
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
 import com.agent.use.common.network.plugin.NetworkTrafficMiddleware
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -665,6 +669,23 @@ class HttpParserComprehensiveTest {
             assertTrue(overriddenArgs.contains("0x28,0x18,1"))
             assertTrue(overriddenArgs.contains("4,5,6"))
             assertTrue(overriddenArgs.contains("(Ljava/lang/Object;JLjava/lang/String;I)J"))
+
+            val builtins = NetworkCapturePluginRegistry.listBuiltinProfiles()
+            assertTrue(builtins.containsKey("com.xingin.xhs"))
+            assertTrue(builtins.containsKey("*"))
+
+            val replacingXhs = EbpfProbeProfile(
+                sslOffsetRules = listOf(EbpfSslOffsetRule("libcronet.125.0.0.1.so", 0xaaaaL, 0xbbbbL, 0xccccL)),
+                cronetOffsetRules = listOf(EbpfCronetOffsetRule("libcronet.125.0.0.1.so", 0x1111L, 0x2222L, 0x3333L, 0x4444L)),
+                replaceBuiltinOffsets = true
+            )
+            val serialized = EbpfProbeProfile.toJson(mapOf("com.xingin.xhs" to replacingXhs))
+            val replacedCount = NetworkCapturePluginRegistry.replaceJsonOverrides(serialized)
+            assertEquals(1, replacedCount)
+            val replacedXhsArgs = NetworkCapturePluginRegistry.resolveCliArgs("com.xingin.xhs")
+            assertTrue(replacedXhsArgs.contains("libcronet.125.0.0.1.so:0xaaaa:0xbbbb:0xcccc"))
+            assertTrue(replacedXhsArgs.contains("libcronet.125.0.0.1.so:0x1111:0x2222:0x3333:0x4444"))
+            assertFalse(replacedXhsArgs.any { it.contains("114.0.5735.38") })
         } finally {
             NetworkCapturePluginRegistry.clearJsonProfileOverrides()
         }

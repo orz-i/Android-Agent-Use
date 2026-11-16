@@ -31,7 +31,8 @@ data class EbpfCronetAbiRule(
 data class EbpfProbeProfile(
     val sslOffsetRules: List<EbpfSslOffsetRule> = emptyList(),
     val cronetOffsetRules: List<EbpfCronetOffsetRule> = emptyList(),
-    val cronetAbiRule: EbpfCronetAbiRule? = null
+    val cronetAbiRule: EbpfCronetAbiRule? = null,
+    val replaceBuiltinOffsets: Boolean = false
 ) {
     fun toCliArgs(): List<String> {
         val args = ArrayList<String>()
@@ -113,13 +114,104 @@ data class EbpfProbeProfile(
                     val sigs = (m["jniSignatures"] as? List<Any?>).orEmpty().mapNotNull { it as? String }
                     EbpfCronetAbiRule(rawHdr, iobuf, strMode, slots, sigs)
                 }
+                val replaceBuiltins = (obj["replaceBuiltinOffsets"] as? Boolean) ?: false
                 result[pkg] = EbpfProbeProfile(
                     sslOffsetRules = sslRules,
                     cronetOffsetRules = cronetRules,
-                    cronetAbiRule = abiRule
+                    cronetAbiRule = abiRule,
+                    replaceBuiltinOffsets = replaceBuiltins
                 )
             }
             return result
+        }
+
+        fun parseOffset(raw: String): Long? = parseLongValue(raw)
+
+        fun formatOffset(value: Long): String = "0x${value.toString(16)}"
+
+        fun toJson(profiles: Map<String, EbpfProbeProfile>): String {
+            val sb = StringBuilder()
+            sb.append("{\n")
+            val entries = profiles.entries.toList()
+            entries.forEachIndexed { idx, (pkg, profile) ->
+                sb.append("  \"").append(escapeJson(pkg)).append("\": {\n")
+                var needComma = false
+                if (profile.replaceBuiltinOffsets) {
+                    sb.append("    \"replaceBuiltinOffsets\": true")
+                    needComma = true
+                }
+                if (profile.sslOffsetRules.isNotEmpty()) {
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"sslOffsetRules\": [\n")
+                    profile.sslOffsetRules.forEachIndexed { rIdx, rule ->
+                        sb.append("      {\n")
+                        sb.append("        \"libSubstring\": \"").append(escapeJson(rule.libSubstring)).append("\",\n")
+                        sb.append("        \"writeOffset\": \"").append(formatOffset(rule.writeOffset)).append("\",\n")
+                        sb.append("        \"readOffset\": \"").append(formatOffset(rule.readOffset)).append("\",\n")
+                        sb.append("        \"sniOffset\": \"").append(formatOffset(rule.sniOffset)).append("\"\n")
+                        sb.append("      }")
+                        if (rIdx + 1 < profile.sslOffsetRules.size) sb.append(",")
+                        sb.append("\n")
+                    }
+                    sb.append("    ]")
+                    needComma = true
+                }
+                if (profile.cronetOffsetRules.isNotEmpty()) {
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"cronetOffsetRules\": [\n")
+                    profile.cronetOffsetRules.forEachIndexed { rIdx, rule ->
+                        sb.append("      {\n")
+                        sb.append("        \"libSubstring\": \"").append(escapeJson(rule.libSubstring)).append("\",\n")
+                        sb.append("        \"createOffset\": \"").append(formatOffset(rule.createOffset)).append("\",\n")
+                        sb.append("        \"responseStartedOffset\": \"").append(formatOffset(rule.responseStartedOffset)).append("\",\n")
+                        sb.append("        \"readCompletedOffset\": \"").append(formatOffset(rule.readCompletedOffset)).append("\",\n")
+                        sb.append("        \"succeededOffset\": \"").append(formatOffset(rule.succeededOffset)).append("\"\n")
+                        sb.append("      }")
+                        if (rIdx + 1 < profile.cronetOffsetRules.size) sb.append(",")
+                        sb.append("\n")
+                    }
+                    sb.append("    ]")
+                    needComma = true
+                }
+                profile.cronetAbiRule?.let { abi ->
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"cronetAbiRule\": {\n")
+                    sb.append("      \"rawHeadersOffset\": \"").append(formatOffset(abi.rawHeadersOffset.toLong())).append("\",\n")
+                    sb.append("      \"ioBufferDataOffset\": \"").append(formatOffset(abi.ioBufferDataOffset.toLong())).append("\",\n")
+                    sb.append("      \"stringLayoutMode\": ").append(abi.stringLayoutMode).append(",\n")
+                    sb.append("      \"vtableSlots\": [")
+                        .append(abi.vtableSlots.first).append(", ")
+                        .append(abi.vtableSlots.second).append(", ")
+                        .append(abi.vtableSlots.third).append("],\n")
+                    sb.append("      \"jniSignatures\": [")
+                    abi.jniSignatures.forEachIndexed { sIdx, sig ->
+                        if (sIdx > 0) sb.append(", ")
+                        sb.append("\"").append(escapeJson(sig)).append("\"")
+                    }
+                    sb.append("]\n")
+                    sb.append("    }")
+                    needComma = true
+                }
+                if (needComma) sb.append("\n")
+                sb.append("  }")
+                if (idx + 1 < entries.size) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("}")
+            return sb.toString()
+        }
+
+        private fun escapeJson(raw: String): String = buildString(raw.length) {
+            for (c in raw) {
+                when (c) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    else -> append(c)
+                }
+            }
         }
 
         private fun parseLongValue(raw: Any?): Long? = when (raw) {
@@ -152,6 +244,8 @@ interface NetworkTrafficMiddleware {
 interface NetworkCapturePlugin {
     val id: String
 
+    val defaultPackages: List<String> get() = emptyList()
+
     fun matchesPackage(targetPackage: String): Boolean
 
     fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile? = null
@@ -161,6 +255,8 @@ interface NetworkCapturePlugin {
 
 object GenericCronetCapturePlugin : NetworkCapturePlugin {
     override val id: String = "builtin.generic_cronet"
+
+    override val defaultPackages: List<String> = listOf("*")
 
     override fun matchesPackage(targetPackage: String): Boolean = true
 
@@ -196,6 +292,8 @@ object XiaohongshuTrafficMiddleware : NetworkTrafficMiddleware {
 
 object XiaohongshuCapturePlugin : NetworkCapturePlugin {
     override val id: String = "builtin.xiaohongshu"
+
+    override val defaultPackages: List<String> = listOf("com.xingin.xhs")
 
     private const val XHS_CRONET_LIB = "libcronet.114.0.5735.38.so"
 
@@ -250,9 +348,27 @@ object NetworkCapturePluginRegistry {
         plugins.removeAll { it.id == pluginId }
     }
 
+    fun listBuiltinProfiles(): Map<String, EbpfProbeProfile> {
+        val result = LinkedHashMap<String, EbpfProbeProfile>()
+        for (plugin in plugins) {
+            for (pkg in plugin.defaultPackages) {
+                plugin.provideEbpfProfile(pkg)?.let { profile ->
+                    result[pkg] = profile
+                }
+            }
+        }
+        return result
+    }
+
+    fun listJsonProfileOverrides(): Map<String, EbpfProbeProfile> =
+        LinkedHashMap(jsonProfileOverrides)
+
     fun registerJsonProfileOverride(packageName: String, profile: EbpfProbeProfile) {
         jsonProfileOverrides[packageName] = profile
     }
+
+    fun removeJsonProfileOverride(packageName: String): Boolean =
+        jsonProfileOverrides.remove(packageName) != null
 
     fun clearJsonProfileOverrides() {
         jsonProfileOverrides.clear()
@@ -266,23 +382,39 @@ object NetworkCapturePluginRegistry {
         return parsed.size
     }
 
+    fun replaceJsonOverrides(jsonText: String): Int {
+        val parsed = EbpfProbeProfile.fromJson(jsonText)
+        jsonProfileOverrides.clear()
+        for ((pkg, profile) in parsed) {
+            jsonProfileOverrides[pkg] = profile
+        }
+        return parsed.size
+    }
+
     fun resolveEbpfProfile(targetPackage: String): EbpfProbeProfile {
+        val pkgOverride = jsonProfileOverrides[targetPackage]
+        val wildcardOverride = if (targetPackage != "*") jsonProfileOverrides["*"] else null
+        val replaceBuiltin = (pkgOverride?.replaceBuiltinOffsets == true) ||
+            (wildcardOverride?.replaceBuiltinOffsets == true)
+
         val matchedProfiles = ArrayList<EbpfProbeProfile>()
         val specificProfiles = ArrayList<EbpfProbeProfile>()
         for (plugin in plugins) {
             if (!plugin.matchesPackage(targetPackage)) continue
+            val isGeneric = plugin.id == GenericCronetCapturePlugin.id
+            if (replaceBuiltin && !isGeneric) continue
             val profile = plugin.provideEbpfProfile(targetPackage) ?: continue
             matchedProfiles.add(profile)
-            if (plugin.id != GenericCronetCapturePlugin.id) {
+            if (!isGeneric) {
                 specificProfiles.add(profile)
             }
         }
-        jsonProfileOverrides[targetPackage]?.let { overrideProfile ->
+        pkgOverride?.let { overrideProfile ->
             matchedProfiles.add(overrideProfile)
             specificProfiles.add(overrideProfile)
         }
-        jsonProfileOverrides["*"]?.let { wildcardOverride ->
-            matchedProfiles.add(wildcardOverride)
+        wildcardOverride?.let { wildcard ->
+            matchedProfiles.add(wildcard)
         }
 
         // Put overrides/specific rules first so libaau_ebpf.so checks them before generic fallbacks.
