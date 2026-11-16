@@ -80,6 +80,26 @@ data class EbpfProbeProfile(
         return args
     }
 
+    fun toAbiCliArgs(): List<String> {
+        val abi = cronetAbiRule ?: return emptyList()
+        val args = ArrayList<String>()
+        args.add("--cronet-abi")
+        args.add(
+            "0x${abi.rawHeadersOffset.toString(16)}," +
+                "0x${abi.ioBufferDataOffset.toString(16)}," +
+                "${abi.stringLayoutMode}"
+        )
+        args.add("--cronet-slots")
+        args.add("${abi.vtableSlots.first},${abi.vtableSlots.second},${abi.vtableSlots.third}")
+        for (sig in abi.jniSignatures) {
+            if (sig.isNotBlank()) {
+                args.add("--cronet-sig")
+                args.add(sig)
+            }
+        }
+        return args
+    }
+
     companion object {
         @Suppress("UNCHECKED_CAST")
         fun fromJson(json: String): Map<String, EbpfProbeProfile> {
@@ -446,6 +466,9 @@ object NetworkCapturePluginRegistry {
     fun resolveCliArgs(targetPackage: String): List<String> =
         resolveEbpfProfile(targetPackage).toCliArgs()
 
+    fun resolveDiscoveryAbiCliArgs(targetPackage: String): List<String> =
+        resolveEbpfProfile(targetPackage).toAbiCliArgs()
+
     fun resolveMiddlewares(targetPackage: String): List<NetworkTrafficMiddleware> {
         val seen = LinkedHashSet<String>()
         val result = ArrayList<NetworkTrafficMiddleware>()
@@ -458,6 +481,164 @@ object NetworkCapturePluginRegistry {
             }
         }
         return result
+    }
+}
+
+data class DiscoveredLibraryProbe(
+    val path: String,
+    val name: String,
+    val inAppDir: Boolean,
+    val sslSource: String,
+    val sslWriteOffset: Long?,
+    val sslReadOffset: Long?,
+    val sslSniOffset: Long?,
+    val cronetSource: String,
+    val cronetCreateOffset: Long?,
+    val cronetResponseStartedOffset: Long?,
+    val cronetReadCompletedOffset: Long?,
+    val cronetSucceededOffset: Long?
+) {
+    val hasSsl: Boolean
+        get() = sslSource != "none" && (sslWriteOffset ?: 0L) > 0L && (sslReadOffset ?: 0L) > 0L
+
+    val hasCronet: Boolean
+        get() = cronetSource != "none" &&
+            (cronetCreateOffset ?: 0L) > 0L &&
+            (cronetResponseStartedOffset ?: 0L) > 0L &&
+            (cronetReadCompletedOffset ?: 0L) > 0L &&
+            (cronetSucceededOffset ?: 0L) > 0L
+}
+
+data class EbpfDiscoveryReport(
+    val uid: Int,
+    val arch: String,
+    val scannedLibrariesCount: Int,
+    val rawHeadersOffset: Int,
+    val ioBufferDataOffset: Int,
+    val stringLayoutMode: Int,
+    val vtableSlots: Triple<Int, Int, Int>,
+    val libraries: List<DiscoveredLibraryProbe>,
+    val unmatchedAppLibs: List<String> = emptyList()
+) {
+    fun toSuggestedProfile(
+        jniSignatures: List<String> = listOf("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"),
+        replaceBuiltinOffsets: Boolean = true
+    ): EbpfProbeProfile? {
+        val sortedLibs = libraries.sortedWith(
+            compareByDescending<DiscoveredLibraryProbe> { it.inAppDir }
+                .thenByDescending { it.hasCronet }
+                .thenByDescending { it.hasSsl }
+        )
+        val sslRules = sortedLibs
+            .filter { it.hasSsl && (it.inAppDir || it.sslSource == "stripped_heuristic") }
+            .map {
+                EbpfSslOffsetRule(
+                    libSubstring = it.name,
+                    writeOffset = it.sslWriteOffset!!,
+                    readOffset = it.sslReadOffset!!,
+                    sniOffset = it.sslSniOffset ?: 0L
+                )
+            }
+        val cronetRules = sortedLibs
+            .filter { it.hasCronet }
+            .map {
+                EbpfCronetOffsetRule(
+                    libSubstring = it.name,
+                    createOffset = it.cronetCreateOffset!!,
+                    responseStartedOffset = it.cronetResponseStartedOffset!!,
+                    readCompletedOffset = it.cronetReadCompletedOffset!!,
+                    succeededOffset = it.cronetSucceededOffset!!
+                )
+            }
+        if (sslRules.isEmpty() && cronetRules.isEmpty()) {
+            return null
+        }
+        return EbpfProbeProfile(
+            sslOffsetRules = sslRules,
+            cronetOffsetRules = cronetRules,
+            cronetAbiRule = EbpfCronetAbiRule(
+                rawHeadersOffset = rawHeadersOffset,
+                ioBufferDataOffset = ioBufferDataOffset,
+                stringLayoutMode = stringLayoutMode,
+                vtableSlots = vtableSlots,
+                jniSignatures = jniSignatures
+            ),
+            replaceBuiltinOffsets = replaceBuiltinOffsets
+        )
+    }
+
+    companion object {
+        @Suppress("UNCHECKED_CAST")
+        fun fromJson(json: String): EbpfDiscoveryReport? {
+            val trimmed = json.trim()
+            val jsonStart = trimmed.indexOf('{')
+            if (jsonStart < 0) return null
+            val root = SimpleJsonReader(trimmed.substring(jsonStart)).parseValue() as? Map<String, Any?>
+                ?: return null
+            val uid = (root["uid"] as? Number)?.toInt() ?: 0
+            val arch = root["arch"] as? String ?: "unknown"
+            val scannedCount = (root["scannedLibrariesCount"] as? Number)?.toInt() ?: 0
+
+            val abiObj = root["abi"] as? Map<String, Any?>
+            val rawHeaders = (abiObj?.get("rawHeadersOffset")?.let { parseAnyLong(it) } ?: 0x20L).toInt()
+            val ioBufferData = (abiObj?.get("ioBufferDataOffset")?.let { parseAnyLong(it) } ?: 0x10L).toInt()
+            val strMode = (abiObj?.get("stringLayoutMode") as? Number)?.toInt() ?: 0
+            val slotList = (abiObj?.get("vtableSlots") as? List<Any?>).orEmpty()
+                .mapNotNull { (it as? Number)?.toInt() }
+            val slots = if (slotList.size >= 3) {
+                Triple(slotList[0], slotList[1], slotList[2])
+            } else {
+                Triple(3, 4, 5)
+            }
+
+            val libs = (root["libraries"] as? List<Any?>).orEmpty().mapNotNull { item ->
+                val m = item as? Map<String, Any?> ?: return@mapNotNull null
+                val path = m["path"] as? String ?: return@mapNotNull null
+                val name = m["name"] as? String ?: path.substringAfterLast('/')
+                val inAppDir = (m["inAppDir"] as? Boolean) ?: false
+                val sslSource = m["sslSource"] as? String ?: "none"
+                val cronetSource = m["cronetSource"] as? String ?: "none"
+                DiscoveredLibraryProbe(
+                    path = path,
+                    name = name,
+                    inAppDir = inAppDir,
+                    sslSource = sslSource,
+                    sslWriteOffset = parsePositiveHex(m["sslWriteOffset"]),
+                    sslReadOffset = parsePositiveHex(m["sslReadOffset"]),
+                    sslSniOffset = parseNonNegativeHex(m["sslSniOffset"]),
+                    cronetSource = cronetSource,
+                    cronetCreateOffset = parsePositiveHex(m["cronetCreateOffset"]),
+                    cronetResponseStartedOffset = parsePositiveHex(m["cronetResponseStartedOffset"]),
+                    cronetReadCompletedOffset = parsePositiveHex(m["cronetReadCompletedOffset"]),
+                    cronetSucceededOffset = parsePositiveHex(m["cronetSucceededOffset"])
+                )
+            }
+            val unmatched = (root["unmatchedAppLibs"] as? List<Any?>).orEmpty()
+                .mapNotNull { it as? String }
+            return EbpfDiscoveryReport(
+                uid = uid,
+                arch = arch,
+                scannedLibrariesCount = scannedCount,
+                rawHeadersOffset = rawHeaders,
+                ioBufferDataOffset = ioBufferData,
+                stringLayoutMode = strMode,
+                vtableSlots = slots,
+                libraries = libs,
+                unmatchedAppLibs = unmatched
+            )
+        }
+
+        private fun parseAnyLong(raw: Any?): Long? = when (raw) {
+            is Number -> raw.toLong()
+            is String -> EbpfProbeProfile.parseOffset(raw)
+            else -> null
+        }
+
+        private fun parsePositiveHex(raw: Any?): Long? =
+            parseAnyLong(raw)?.takeIf { it > 0L }
+
+        private fun parseNonNegativeHex(raw: Any?): Long? =
+            parseAnyLong(raw)?.takeIf { it >= 0L }
     }
 }
 

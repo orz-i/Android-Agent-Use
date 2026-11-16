@@ -6,6 +6,7 @@ import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
 import com.agent.use.common.network.plugin.EbpfCronetOffsetRule
+import com.agent.use.common.network.plugin.EbpfDiscoveryReport
 import com.agent.use.common.network.plugin.EbpfProbeProfile
 import com.agent.use.common.network.plugin.EbpfSslOffsetRule
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
@@ -689,6 +690,70 @@ class HttpParserComprehensiveTest {
         } finally {
             NetworkCapturePluginRegistry.clearJsonProfileOverrides()
         }
+    }
+
+    @Test
+    fun testEbpfDiscoveryReportFromJsonAndSuggestedProfile() {
+        val reportJson = """
+            {
+              "uid": 10234,
+              "arch": "arm64",
+              "abi": {
+                "rawHeadersOffset": "0x20",
+                "ioBufferDataOffset": "0x10",
+                "stringLayoutMode": 0,
+                "vtableSlots": [3, 4, 5]
+              },
+              "scannedLibrariesCount": 4,
+              "libraries": [
+                {
+                  "path": "/apex/com.android.conscrypt/lib64/libssl.so",
+                  "name": "libssl.so",
+                  "inAppDir": false,
+                  "sslSource": "dynsym",
+                  "sslWriteOffset": "0x1100",
+                  "sslReadOffset": "0x1200",
+                  "sslSniOffset": "0x1300",
+                  "cronetSource": "none",
+                  "cronetCreateOffset": "0x0",
+                  "cronetResponseStartedOffset": "0x0",
+                  "cronetReadCompletedOffset": "0x0",
+                  "cronetSucceededOffset": "0x0"
+                },
+                {
+                  "path": "/data/app/com.xingin.xhs/lib/arm64/libcronet.121.0.0.1.so",
+                  "name": "libcronet.121.0.0.1.so",
+                  "inAppDir": true,
+                  "sslSource": "stripped_heuristic",
+                  "sslWriteOffset": "0x4ea800",
+                  "sslReadOffset": "0x4ea500",
+                  "sslSniOffset": "0x4eb100",
+                  "cronetSource": "elf_heuristic",
+                  "cronetCreateOffset": "0x226d00",
+                  "cronetResponseStartedOffset": "0x206e00",
+                  "cronetReadCompletedOffset": "0x207000",
+                  "cronetSucceededOffset": "0x207100"
+                }
+              ],
+              "unmatchedAppLibs": ["libxhs_custom.so"]
+            }
+        """.trimIndent()
+
+        val report = EbpfDiscoveryReport.fromJson(reportJson)
+        assertNotNull(report)
+        assertEquals(10234, report!!.uid)
+        assertEquals("arm64", report.arch)
+        assertEquals(2, report.libraries.size)
+        assertEquals(listOf("libxhs_custom.so"), report.unmatchedAppLibs)
+
+        val suggested = report.toSuggestedProfile()
+        assertNotNull(suggested)
+        assertTrue(suggested!!.replaceBuiltinOffsets)
+        assertEquals(1, suggested.sslOffsetRules.size)
+        assertEquals("libcronet.121.0.0.1.so", suggested.sslOffsetRules[0].libSubstring)
+        assertEquals(0x4ea800L, suggested.sslOffsetRules[0].writeOffset)
+        assertEquals(1, suggested.cronetOffsetRules.size)
+        assertEquals(0x226d00L, suggested.cronetOffsetRules[0].createOffset)
     }
 
     @Test
