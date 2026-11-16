@@ -240,28 +240,26 @@ class ShellCapabilitiesTest {
     }
 
     @Test
-    fun mainScreenLogAndShellPoliciesAndEngineHelpers() {
-        val log = MainScreenLog()
-        log.scan(
-            listOf(
-                MainScreenLog.Task(1, 0, "com.home", 0, "com.home/.Main"),
-                MainScreenLog.Task(2, 5, "com.agent", 0, "com.agent/.Page"),
+    fun custodyTrackerAndShellPoliciesAndEngineHelpers() {
+        val tracker = CustodyTracker()
+        tracker.startDisplay(
+            displayId = 5,
+            snapshot = listOf(
+                CustodyTracker.TaskRow(1, 0, "com.home", 0, "com.home/.Main", primaryUid = 10001),
+                CustodyTracker.TaskRow(2, 5, "com.agent", 0, "com.agent/.Page", primaryUid = 10200),
             ),
             now = 1000L,
-            record = false,
         )
-        assertEquals(1, log.topTaskId)
-        log.scan(
-            listOf(
-                MainScreenLog.Task(2, 0, "com.agent", 0, "com.agent/.Page"),
+        val step = tracker.step(
+            snapshot = listOf(
+                CustodyTracker.TaskRow(2, 0, "com.agent", 0, "com.agent/.Page", primaryUid = 10200),
             ),
             now = 1200L,
-            record = true,
         )
-        val arrivals = log.since(1000L)
-        assertEquals(1, arrivals.size)
-        assertEquals(5, arrivals.single().from)
-        assertFalse(arrivals.single().sameTask)
+        assertEquals(1, step.arrivals.size)
+        assertEquals(5, step.arrivals.single().fromDisplayId)
+        assertFalse(step.arrivals.single().sameTask)
+        assertEquals(listOf(1), step.vanished.map { it.taskId })
 
         assertEquals(66, ShellPressKeys.resolve("KEYCODE_ENTER"))
         assertNull(ShellPressKeys.resolve("KEYCODE_POWER"))

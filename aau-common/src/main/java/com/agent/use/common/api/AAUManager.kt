@@ -2,13 +2,15 @@
 
 import android.content.Context
 import android.hardware.display.DisplayManager
+import android.os.Bundle
 import android.os.IBinder
 import android.os.RemoteException
 import android.util.Log
 import com.agent.use.common.CommandResult
 import com.agent.use.common.DisplayConfig
+import com.agent.use.common.IAgentCustodyListener
 import com.agent.use.common.IAgentShell
-import com.agent.use.common.MainArrivalsResult
+import com.agent.use.common.LaunchOrigin
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -107,25 +109,51 @@ class AAUManager private constructor(
         }
 
     /**
-     * 开启主屏监控窗口，记录未来 windowMs 毫秒内主屏顶层任务变动。
+     * 为指定托管虚拟屏开启常驻任务托管并注册事件监听器。
      */
-    fun watchMainScreen(windowMs: Int): Int =
+    fun startCustody(displayId: Int, listener: IAgentCustodyListener): Boolean =
         try {
-            shell.watchMainScreen(windowMs)
+            shell.startCustody(displayId, listener)
         } catch (e: RemoteException) {
-            Log.w(TAG, "watchMainScreen failed: ${e.message}")
-            -1
+            Log.w(TAG, "startCustody failed: ${e.message}")
+            false
         }
 
     /**
-     * 获取 sinceUptimeMs 之后主屏新冒出的任务列表。
+     * 停止指定托管虚拟屏的任务托管。
      */
-    fun getMainArrivals(sinceUptimeMs: Long): MainArrivalsResult =
+    fun stopCustody(displayId: Int) {
         try {
-            MainArrivalsResult.fromBundle(shell.mainArrivals(sinceUptimeMs))
+            shell.stopCustody(displayId)
         } catch (e: RemoteException) {
-            Log.w(TAG, "getMainArrivals failed: ${e.message}")
-            MainArrivalsResult(emptyList(), emptyList())
+            Log.w(TAG, "stopCustody failed: ${e.message}")
+        }
+    }
+
+    /**
+     * 查询指定任务的真实启动来源及归属托管屏信息（原始 Bundle 契约）。
+     */
+    fun launchOrigin(taskId: Int): Bundle =
+        try {
+            shell.launchOrigin(taskId) ?: LaunchOrigin.unknown().toBundle(taskId)
+        } catch (e: RemoteException) {
+            Log.w(TAG, "launchOrigin failed: ${e.message}")
+            LaunchOrigin.unknown().toBundle(taskId)
+        }
+
+    /**
+     * 方案 1：查询系统侧拦截弹窗对应的真实目标应用包名，未知返回 null。
+     */
+    fun resolveJumpTarget(
+        taskId: Int,
+        interstitialPackage: String? = null,
+        initiatorPackage: String? = null,
+    ): String? =
+        try {
+            shell.resolveJumpTarget(taskId, interstitialPackage, initiatorPackage)
+        } catch (e: RemoteException) {
+            Log.w(TAG, "resolveJumpTarget failed: ${e.message}")
+            null
         }
 
 

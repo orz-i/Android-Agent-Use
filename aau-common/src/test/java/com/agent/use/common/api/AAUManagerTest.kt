@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Bundle
 import android.os.IBinder
 import com.agent.use.common.DisplayConfig
+import com.agent.use.common.IAgentCustodyListener
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.network.INetworkCapture
 import org.junit.Assert.assertEquals
@@ -72,6 +73,15 @@ class AAUManagerTest {
 
         val wakeSuccess = manager.wakeAndDismissKeyguard()
         assertTrue(wakeSuccess)
+
+        val listener = object : IAgentCustodyListener.Stub() {
+            override fun onTaskArrived(e: Bundle?) {}
+            override fun onTaskVanished(taskId: Int, lastDisplayId: Int, at: Long) {}
+        }
+        assertTrue(manager.startCustody(5, listener))
+        assertNotNull(manager.launchOrigin(101))
+        manager.stopCustody(5)
+        assertTrue(manager.isVisibleOnMainScreen("com.present"))
 
         manager.close()
     }

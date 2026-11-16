@@ -8,12 +8,16 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import com.agent.use.common.IAgentCustodyListener
+import com.agent.use.common.LaunchOrigin
 import com.agent.use.common.shell.AgentShellEngine
 import com.agent.use.common.shell.ColdStart
-import com.agent.use.common.shell.MainScreenLog
-import com.agent.use.common.shell.MainScreenWatch
+import com.agent.use.common.shell.CustodyEngine
+import com.agent.use.common.shell.CustodyTracker
+import com.agent.use.common.shell.LaunchOriginResolver
 import com.agent.use.common.shell.ShareIntent
 import com.agent.use.common.shell.ShellLinks
+import com.agent.use.common.shell.TaskSnapshotReader
 
 @SuppressLint("PrivateApi")
 class TaskManagerFacade(
@@ -31,29 +35,41 @@ class TaskManagerFacade(
         Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)!!
     }
 
-    private val mainScreenWatch: MainScreenWatch by lazy {
-        MainScreenWatch(
+    private val taskSnapshotReader by lazy { TaskSnapshotReader(context) }
+    private val custodyLazy = lazy {
+        CustodyEngine(
             taskManager = { taskManager },
-            tasks = ::mainLogTasks,
+            tasks = { taskSnapshotReader.read(allTasks()) },
+            resolveOrigin = { taskId, pkg -> LaunchOriginResolver.resolve(taskId, pkg) { cmd -> execCmd.exec(*cmd) } },
+            canManageDisplay = { displayId -> displayId > CustodyTracker.MAIN_DISPLAY && ownDisplay(displayId) },
             tag = TAG,
         )
     }
+    private val custodyEngine by custodyLazy
 
-    data class RecordedArrival(
-        val taskId: Int,
-        val packageName: String,
-        val userId: Int,
-        val uptimeMs: Long,
-    )
+    fun startCustody(displayId: Int, listener: IAgentCustodyListener?): Boolean =
+        custodyEngine.startCustody(displayId, listener)
 
-    @Deprecated("Handled automatically by MainScreenWatch", ReplaceWith("watchMainScreen(windowMs)"))
-    fun recordMainArrival(taskId: Int, packageName: String, userId: Int) {
-        // Kept for binary/source compatibility; MainScreenWatch records arrivals via ITaskStackListener.
+    fun stopCustody(displayId: Int) {
+        if (custodyLazy.isInitialized()) {
+            custodyEngine.stopCustody(displayId)
+        }
     }
 
-    fun watchMainScreen(windowMs: Int): Int = mainScreenWatch.watch(windowMs)
+    fun launchOrigin(taskId: Int): Bundle =
+        if (custodyLazy.isInitialized()) {
+            custodyEngine.launchOrigin(taskId)
+        } else {
+            val pkg = runCatching { packageOfTask(taskId) }.getOrNull()
+            LaunchOriginResolver.resolve(taskId, pkg) { cmd -> execCmd.exec(*cmd) }
+                .toBundle(taskId, LaunchOrigin.NO_MANAGED_DISPLAY)
+        }
 
-    fun mainArrivals(sinceUptimeMs: Long): Bundle = mainScreenWatch.arrivals(sinceUptimeMs)
+    fun stopAllCustody() {
+        if (custodyLazy.isInitialized()) {
+            custodyEngine.close()
+        }
+    }
 
     fun allTasks(): List<Any> = runCatching {
         val method = taskManager.javaClass.methods.first {
@@ -109,7 +125,7 @@ class TaskManagerFacade(
             ?.let { runCatching { TASK_INFO.getField("userId").getInt(it) }.getOrNull() } ?: -1
 
     fun visibleOnMainScreen(packageName: String, userId: Int): Boolean =
-        tasksOn(MainScreenLog.MAIN).any {
+        tasksOn(CustodyTracker.MAIN_DISPLAY).any {
             runCatching {
                 val pkgs = taskPackages(it)
                 val u = TASK_INFO.getField("userId").getInt(it)
@@ -212,20 +228,6 @@ class TaskManagerFacade(
         b.putStringArray("closed", closedList.toTypedArray())
         b.putString("note", "Cleaned up display $displayId")
         return b
-    }
-
-    private fun mainLogTasks(): List<MainScreenLog.Task> = allTasks().mapNotNull { t ->
-        runCatching {
-            val top = TASK_INFO.getField("topActivity").get(t) as? ComponentName
-            val base = runCatching { TASK_INFO.getField("baseActivity").get(t) as? ComponentName }.getOrNull()
-            MainScreenLog.Task(
-                taskId = TASK_INFO.getField("taskId").getInt(t),
-                displayId = TASK_INFO.getField("displayId").getInt(t),
-                packageName = top?.packageName ?: base?.packageName,
-                userId = TASK_INFO.getField("userId").getInt(t),
-                topActivity = top?.className,
-            )
-        }.getOrNull()
     }
 
     private fun taskPackages(task: Any): List<String> = listOfNotNull(

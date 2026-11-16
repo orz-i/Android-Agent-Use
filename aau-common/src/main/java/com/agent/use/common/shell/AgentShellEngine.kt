@@ -33,6 +33,8 @@ import android.view.MotionEvent
 import android.view.Surface
 import com.agent.use.common.AppAudioKey
 import com.agent.use.common.DisplayConfig
+import com.agent.use.common.IAgentCustodyListener
+import com.agent.use.common.LaunchOrigin
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Method
@@ -110,7 +112,17 @@ open class AgentShellEngine(
         else runCatching { context.packageManager.getPackagesForUid(allowedUid)?.toSet() }.getOrNull().orEmpty()
     }
 
-    private val mainWatch by lazy { MainScreenWatch({ taskManager }, ::taskRows, tag) }
+    private val taskSnapshotReader by lazy { TaskSnapshotReader(context, myUser) }
+    private val custodyLazy = lazy {
+        CustodyEngine(
+            taskManager = { taskManager },
+            tasks = { taskSnapshotReader.read(allTasks()) },
+            resolveOrigin = { taskId, pkg -> LaunchOriginResolver.resolve(taskId, pkg, ::sh) },
+            canManageDisplay = { displayId -> displayId > Display.DEFAULT_DISPLAY },
+            tag = tag,
+        )
+    }
+    private val custodyEngine by custodyLazy
     private val deviceUnlock by lazy {
         DeviceUnlockInput(
             context = context,
@@ -183,6 +195,9 @@ open class AgentShellEngine(
 
     fun releaseDisplay(displayId: Int) {
         awake.stop(displayId)
+        if (custodyLazy.isInitialized()) {
+            runCatching { custodyEngine.stopCustody(displayId) }
+        }
         val (vd, watch) = synchronized(displays) {
             displays.remove(displayId) to (if (displays.isEmpty()) orientationWatch.also { orientationWatch = null } else null)
         }
@@ -198,6 +213,9 @@ open class AgentShellEngine(
                 ?: synchronized(muted) { muted.remove(key) }
         }
         awake.stopAll()
+        if (custodyLazy.isInitialized()) {
+            runCatching { custodyEngine.stopAll() }
+        }
         val (all, watch) = synchronized(displays) {
             displays.values.toList().also { displays.clear() } to orientationWatch.also { orientationWatch = null }
         }
@@ -208,6 +226,9 @@ open class AgentShellEngine(
 
     fun destroy() {
         releaseAll()
+        if (custodyLazy.isInitialized()) {
+            runCatching { custodyEngine.close() }
+        }
         exitProcessFn()
     }
 
@@ -640,7 +661,7 @@ open class AgentShellEngine(
     }
 
     fun topActivity(displayId: Int): String? = try {
-        if (!ownDisplay(displayId)) null else tasksOn(displayId).firstOrNull()?.let {
+        tasksOn(displayId).firstOrNull()?.let {
             (TASK_INFO.getField("topActivity").get(it) as? ComponentName)?.className
         }
     } catch (t: Throwable) {
@@ -935,7 +956,7 @@ open class AgentShellEngine(
     }
 
     // ==========================================
-    // 4. Main Screen Conflict Guard
+    // 4. Main Screen Guard & Display Custody
     // ==========================================
 
     fun visibleOnMainScreen(packageName: String, userId: Int): Boolean = try {
@@ -945,36 +966,101 @@ open class AgentShellEngine(
         true
     }
 
-    fun watchMainScreen(windowMs: Int): Int = try {
-        mainWatch.watch(windowMs)
+    fun startCustody(displayId: Int, listener: IAgentCustodyListener?): Boolean = try {
+        custodyEngine.startCustody(displayId, listener)
     } catch (t: Throwable) {
-        Log.e(tag, "watchMainScreen failed", t)
-        -1
+        Log.e(tag, "startCustody failed", t)
+        false
     }
 
-    fun mainArrivals(sinceUptimeMs: Long): Bundle? = try {
-        mainWatch.arrivals(sinceUptimeMs)
+    fun stopCustody(displayId: Int) {
+        try {
+            if (custodyLazy.isInitialized()) {
+                custodyEngine.stopCustody(displayId)
+            }
+        } catch (t: Throwable) {
+            Log.e(tag, "stopCustody failed", t)
+        }
+    }
+
+    fun launchOrigin(taskId: Int): Bundle = try {
+        custodyEngine.launchOrigin(taskId)
     } catch (t: Throwable) {
-        Log.e(tag, "mainArrivals failed", t)
+        Log.e(tag, "launchOrigin failed", t)
+        LaunchOrigin.unknown().toBundle(taskId, LaunchOrigin.NO_MANAGED_DISPLAY)
+    }
+
+    /**
+     * 方案 1：在弹窗文案未明确标出目标包名时，从 TaskInfo / dumpsys / 系统日志多源解析拦截目标包名。
+     */
+    fun resolveJumpTarget(
+        taskId: Int,
+        interstitialPackage: String?,
+        initiatorPackage: String?,
+    ): String? = try {
+        val baseIntent = if (taskId >= 0) {
+            runCatching {
+                task(taskId)?.let { TASK_INFO.getField("baseIntent").get(it) as? Intent }
+            }.getOrNull()
+        } else {
+            null
+        }
+        val intentSummary = baseIntent?.let {
+            JumpTargetResolver.IntentSummary(
+                packageName = it.`package`,
+                componentPackage = it.component?.packageName,
+                dataUri = it.dataString,
+            )
+        }
+        val cleanInitiator = initiatorPackage?.trim()?.takeIf { it.isNotEmpty() }
+        val initiatorUid = cleanInitiator?.let { pkg ->
+            runCatching { context.packageManager.getApplicationInfo(pkg, 0).uid }.getOrDefault(LaunchOrigin.UNKNOWN_UID)
+        } ?: LaunchOrigin.UNKNOWN_UID
+
+        JumpTargetResolver.resolve(
+            ctx = JumpTargetResolver.TargetLookupContext(
+                taskId = taskId,
+                interstitialPackage = interstitialPackage?.trim()?.takeIf { it.isNotEmpty() },
+                initiatorPackage = cleanInitiator,
+                initiatorUid = initiatorUid,
+            ),
+            baseIntent = intentSummary,
+            runShell = { cmd -> sh(*cmd) },
+            resolveSchemeUri = { rawUri ->
+                resolveUniqueSchemePackage(
+                    rawUri = rawUri,
+                    interstitialPackage = interstitialPackage,
+                    initiatorPackage = cleanInitiator,
+                )
+            },
+            isPackageInstalled = { pkg ->
+                runCatching {
+                    context.packageManager.getApplicationInfo(pkg, 0)
+                    true
+                }.getOrDefault(false)
+            },
+        )
+    } catch (t: Throwable) {
+        Log.w(tag, "resolveJumpTarget($taskId) failed", t)
         null
     }
 
-    private fun taskRows(): List<MainScreenLog.Task> {
-        val id = TASK_INFO.getField("taskId")
-        val display = TASK_INFO.getField("displayId")
-        val user = runCatching { TASK_INFO.getField("userId") }.getOrNull()
-        val type = runCatching { TASK_INFO.getField("topActivityType") }.getOrNull()
-        return allTasks().map { t ->
-            val top = TASK_INFO.getField("topActivity").get(t) as? ComponentName
-            MainScreenLog.Task(
-                taskId = id.getInt(t),
-                displayId = display.getInt(t),
-                packageName = top?.packageName ?: (TASK_INFO.getField("baseActivity").get(t) as? ComponentName)?.packageName,
-                userId = user?.getInt(t) ?: -1,
-                topActivity = top?.className,
-                standard = type?.getInt(t)?.let { it == ACTIVITY_TYPE_UNDEFINED || it == ACTIVITY_TYPE_STANDARD } ?: true,
-            )
-        }
+    private fun resolveUniqueSchemePackage(
+        rawUri: String,
+        interstitialPackage: String?,
+        initiatorPackage: String?,
+    ): String? {
+        val uri = runCatching { Uri.parse(rawUri) }.getOrNull() ?: return null
+        val viewIntent = Intent(Intent.ACTION_VIEW, uri)
+        val candidates = runCatching {
+            activitiesFor(viewIntent, type = null)?.map { it.first }
+        }.getOrNull()
+            .orEmpty()
+            .asSequence()
+            .filter { it.isNotBlank() && it != "android" && it != interstitialPackage && it != initiatorPackage }
+            .distinct()
+            .toList()
+        return candidates.singleOrNull()
     }
 
     // ==========================================

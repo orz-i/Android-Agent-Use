@@ -15,13 +15,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 面向对象的端到端 Agent 显示会话（DisplaySession）。
  *
  * 核心职责：
- * 统一编排 AgentDisplay、DisplayAwakeClient、MainScreenConflictManager 与 AgentAudioManager，
+ * 统一编排 AgentDisplay、DisplayAwakeClient、DisplayCustody 与 AgentAudioManager，
  * 支持优雅的 AutoCloseable / Kotlin use 作用域、与 Android Lifecycle 深度绑定、以及远程 Binder 崩溃监听。
  */
 class DisplaySession(
     val display: AgentDisplay,
     val awakeClient: DisplayAwakeClient,
-    val conflictManager: MainScreenConflictManager,
+    val custody: DisplayCustody,
     val audioManager: AgentAudioManager,
     val networkManager: AgentNetworkManager? = null,
     private val onRelease: (AgentDisplay) -> Unit = { it.close() }
@@ -71,6 +71,7 @@ class DisplaySession(
                 binderRef = null
             }
             awakeClient.stopKeepAwake(display.displayId)
+            custody.close()
             audioManager.close()
             networkManager?.close()
             onRelease(display)
@@ -93,13 +94,13 @@ class DisplaySession(
         ): DisplaySession {
             val display = pool?.acquire(config) ?: AgentDisplay(shell, config, displayManager)
             val awake = DisplayAwakeClient(shell)
-            val conflict = MainScreenConflictManager(shell)
+            val custody = DisplayCustody(shell)
             val audio = AgentAudioManager(shell)
 
             val session = DisplaySession(
                 display = display,
                 awakeClient = awake,
-                conflictManager = conflict,
+                custody = custody,
                 audioManager = audio,
                 networkManager = networkManager,
                 onRelease = { disp ->

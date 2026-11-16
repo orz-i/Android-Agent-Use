@@ -8,6 +8,7 @@ import android.os.Parcel
 import android.os.Process
 import android.view.Surface
 import com.agent.use.common.DisplayConfig
+import com.agent.use.common.IAgentCustodyListener
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.shell.AgentShellEngine
@@ -102,11 +103,20 @@ class ShellService(
     override fun visibleOnMainScreen(packageName: String, userId: Int): Boolean =
         engine.visibleOnMainScreen(packageName, userId)
 
-    override fun watchMainScreen(windowMs: Int): Int =
-        engine.watchMainScreen(windowMs)
+    override fun startCustody(displayId: Int, listener: IAgentCustodyListener?): Boolean =
+        engine.startCustody(displayId, listener)
 
-    override fun mainArrivals(sinceUptimeMs: Long): Bundle =
-        engine.mainArrivals(sinceUptimeMs) ?: Bundle()
+    override fun stopCustody(displayId: Int) =
+        engine.stopCustody(displayId)
+
+    override fun launchOrigin(taskId: Int): Bundle =
+        engine.launchOrigin(taskId)
+
+    override fun resolveJumpTarget(
+        taskId: Int,
+        interstitialPackage: String?,
+        initiatorPackage: String?,
+    ): String? = engine.resolveJumpTarget(taskId, interstitialPackage, initiatorPackage)
 
     // ==========================================
     // 5. 事件与输入注入

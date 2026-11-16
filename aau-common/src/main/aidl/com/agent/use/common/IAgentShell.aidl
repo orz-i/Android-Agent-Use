@@ -4,7 +4,7 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.view.Surface;
 import com.agent.use.common.DisplayConfig;
-import com.agent.use.common.network.INetworkCapture;
+import com.agent.use.common.IAgentCustodyListener;
 import com.agent.use.common.network.INetworkCapture;
 
 /**
@@ -173,18 +173,7 @@ interface IAgentShell {
      */
     boolean visibleOnMainScreen(String packageName, int userId) = 20;
 
-    /**
-     * 开启主屏任务监听窗口：捕获未来 windowMs 毫秒内主屏顶层任务变动。
-     * 用于发现后台启动跳到主屏的弹窗任务，并拉回虚拟屏。
-     *
-     * @return 当前主屏顶层 taskId
-     */
-    int watchMainScreen(int windowMs) = 21;
-
-    /**
-     * 获取 sinceUptimeMs 以来在主屏新出现的任务列表 (Bundle 封装)。
-     */
-    Bundle mainArrivals(long sinceUptimeMs) = 22;
+    // 事务码 21 (watchMainScreen) 与 22 (mainArrivals) 已作废移除，严禁复用。
 
 
     // ==========================================
@@ -368,4 +357,30 @@ interface IAgentShell {
      * 获取服务端原生网络捕获控制器 (eBPF Root 抓包引擎)。
      */
     INetworkCapture getNetworkCapture() = 50;
+
+
+    // ==========================================
+    // 12. 常驻虚拟屏托管与启动来源解析 (Task Custody & Launch Origin)
+    // ==========================================
+
+    /**
+     * 为指定虚拟屏开启常驻任务托管监听；存在任意托管屏时维持底层 ITaskStackListener 监听，
+     * 并通过 linkToDeath 在客户端断连时自动回收托管注册。
+     */
+    boolean startCustody(int displayId, IAgentCustodyListener listener) = 51;
+
+    /**
+     * 停止指定虚拟屏的托管；最后一个托管屏注销时自动停止底层监听。
+     */
+    void stopCustody(int displayId) = 52;
+
+    /**
+     * 查询指定任务的启动来源 (originUid / originPackage / originConfidence / managedDisplay)。
+     */
+    Bundle launchOrigin(int taskId) = 53;
+
+    /**
+     * 方案 1：从系统侧多源（TaskInfo / dumpsys / 近期系统日志）核验跳转确认弹窗拦截的真实目标应用包名，未知返回 null。
+     */
+    String resolveJumpTarget(int taskId, String interstitialPackage, String initiatorPackage) = 54;
 }
