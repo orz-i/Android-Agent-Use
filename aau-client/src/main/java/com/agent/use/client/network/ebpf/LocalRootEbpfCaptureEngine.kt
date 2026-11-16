@@ -10,8 +10,11 @@ import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
 import com.agent.use.common.network.parser.TlsStreamParser
+import com.agent.use.common.network.plugin.EbpfDiscoveryReport
+import com.agent.use.common.network.plugin.EbpfProbeProfile
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.File
@@ -25,6 +28,17 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Result of running `libaau_ebpf.so --discover-only` against a target package.
+ */
+data class EbpfDiscoveryResult(
+    val ok: Boolean,
+    val report: EbpfDiscoveryReport? = null,
+    val suggestedProfile: EbpfProbeProfile? = null,
+    val error: String? = null,
+    val rawOutput: String = ""
+)
 
 /**
  * Local root-powered eBPF TLS capture engine running directly from the client app when the device is rooted.
@@ -191,6 +205,106 @@ class LocalRootEbpfCaptureEngine(
                 val cmd = buildSuCommand(binaryPath, uid, libDir, extraArgs)
                 ProcessBuilder(suPath, "-c", cmd).start()
             }
+        }
+
+        @JvmOverloads
+        fun discoverAppProfile(
+            context: Context?,
+            targetPackage: String,
+            useHeuristicsOnly: Boolean = true,
+            timeoutMs: Long = 15_000L,
+            binaryFileOverride: File? = null,
+            uidOverride: Int? = null,
+            libDirOverride: String? = null,
+            processStarterOverride: ((binaryPath: String, uid: Int, libDir: String?, extraArgs: List<String>) -> Process)? = null
+        ): EbpfDiscoveryResult {
+            val targetUid = uidOverride ?: context?.let { resolveTargetUid(it, targetPackage) } ?: -1
+            if (targetUid <= 0) {
+                return EbpfDiscoveryResult(
+                    ok = false,
+                    error = "ebpf_target_uid_not_found:$targetPackage"
+                )
+            }
+            val binaryFile = binaryFileOverride ?: context?.let { resolveDefaultBinary(it) }
+            if (binaryFile == null || !binaryFile.exists()) {
+                return EbpfDiscoveryResult(
+                    ok = false,
+                    error = "ebpf_binary_not_found:$BINARY_NAME"
+                )
+            }
+            val libDir = libDirOverride ?: context?.let { resolveNativeLibraryDir(it, targetPackage) }
+            val abiArgs = if (useHeuristicsOnly) {
+                NetworkCapturePluginRegistry.resolveDiscoveryAbiCliArgs(targetPackage)
+            } else {
+                NetworkCapturePluginRegistry.resolveCliArgs(targetPackage)
+            }
+            val extraArgs = listOf("--discover-only") + abiArgs
+            val process = try {
+                processStarterOverride?.invoke(binaryFile.absolutePath, targetUid, libDir, extraArgs)
+                    ?: startHelperProcess(binaryFile.absolutePath, targetUid, libDir, extraArgs)
+            } catch (t: Throwable) {
+                return EbpfDiscoveryResult(
+                    ok = false,
+                    error = "ebpf_discover_spawn_failed:${t.message}"
+                )
+            }
+
+            val stdoutBuf = ByteArrayOutputStream()
+            val stderrBuf = ByteArrayOutputStream()
+            val outThread = Thread {
+                runCatching { process.inputStream.copyTo(stdoutBuf) }
+            }.apply { isDaemon = true; start() }
+            val errThread = Thread {
+                runCatching { process.errorStream.copyTo(stderrBuf) }
+            }.apply { isDaemon = true; start() }
+
+            val finished = try {
+                process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                false
+            }
+            if (!finished) {
+                runCatching { process.destroyForcibly() }
+                runCatching { outThread.join(500) }
+                runCatching { errThread.join(500) }
+                return EbpfDiscoveryResult(
+                    ok = false,
+                    error = "ebpf_discover_timeout",
+                    rawOutput = stderrBuf.toString(StandardCharsets.UTF_8.name())
+                )
+            }
+            runCatching { outThread.join(1000) }
+            runCatching { errThread.join(1000) }
+
+            val exitCode = runCatching { process.exitValue() }.getOrDefault(-1)
+            val stdoutText = stdoutBuf.toString(StandardCharsets.UTF_8.name())
+            val stderrText = stderrBuf.toString(StandardCharsets.UTF_8.name())
+            if (exitCode != 0) {
+                val errSummary = stderrText.lineSequence().firstOrNull { it.isNotBlank() }?.trim()
+                    ?: "ebpf_discover_exit_$exitCode"
+                return EbpfDiscoveryResult(
+                    ok = false,
+                    error = errSummary,
+                    rawOutput = listOf(stdoutText, stderrText).filter { it.isNotBlank() }.joinToString("\n")
+                )
+            }
+
+            val report = EbpfDiscoveryReport.fromJson(stdoutText)
+                ?: return EbpfDiscoveryResult(
+                    ok = false,
+                    error = "ebpf_discover_invalid_json",
+                    rawOutput = stdoutText
+                )
+            val existingSigs = NetworkCapturePluginRegistry.resolveEbpfProfile(targetPackage)
+                .cronetAbiRule?.jniSignatures?.takeIf { it.isNotEmpty() }
+                ?: listOf("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J")
+            val suggested = report.toSuggestedProfile(jniSignatures = existingSigs)
+            return EbpfDiscoveryResult(
+                ok = true,
+                report = report,
+                suggestedProfile = suggested,
+                rawOutput = stdoutText
+            )
         }
     }
 

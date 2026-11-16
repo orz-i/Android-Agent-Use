@@ -592,6 +592,71 @@ class VpnTunForwarderAndLocalEbpfTest {
         assertTrue(suCmd.contains("'--cronet-abi' '0x20,0x10,0'"))
     }
 
+    @Test
+    fun testDiscoverAppProfileInvokesDiscoverOnlyAndBuildsSuggestedProfile() {
+        val tmpBin = File.createTempFile("aau_ebpf_discover_test", ".so").apply {
+            writeText("stub")
+            deleteOnExit()
+        }
+        val capturedArgs = mutableListOf<String>()
+        val sampleJson = """
+            {
+              "uid": 10333,
+              "arch": "arm64",
+              "abi": {
+                "rawHeadersOffset": "0x20",
+                "ioBufferDataOffset": "0x10",
+                "stringLayoutMode": 0,
+                "vtableSlots": [3, 4, 5]
+              },
+              "scannedLibrariesCount": 2,
+              "libraries": [
+                {
+                  "path": "/data/app/com.xingin.xhs/lib/arm64/libcronet.122.0.0.1.so",
+                  "name": "libcronet.122.0.0.1.so",
+                  "inAppDir": true,
+                  "sslSource": "stripped_heuristic",
+                  "sslWriteOffset": "0x501000",
+                  "sslReadOffset": "0x502000",
+                  "sslSniOffset": "0x503000",
+                  "cronetSource": "elf_heuristic",
+                  "cronetCreateOffset": "0x230000",
+                  "cronetResponseStartedOffset": "0x210000",
+                  "cronetReadCompletedOffset": "0x211000",
+                  "cronetSucceededOffset": "0x212000"
+                }
+              ],
+              "unmatchedAppLibs": []
+            }
+        """.trimIndent()
+
+        val result = LocalRootEbpfCaptureEngine.discoverAppProfile(
+            context = null,
+            targetPackage = "com.xingin.xhs",
+            useHeuristicsOnly = true,
+            binaryFileOverride = tmpBin,
+            uidOverride = 10333,
+            libDirOverride = "/data/app/com.xingin.xhs/lib/arm64",
+            processStarterOverride = { _, _, _, extraArgs ->
+                capturedArgs.addAll(extraArgs)
+                FakeProcess(
+                    stdoutBytes = sampleJson.toByteArray(StandardCharsets.UTF_8),
+                    stderrText = "",
+                    exitCode = 0
+                )
+            }
+        )
+
+        assertTrue(result.ok)
+        assertTrue(capturedArgs.contains("--discover-only"))
+        assertTrue(capturedArgs.contains("--cronet-abi"))
+        assertFalse(capturedArgs.contains("--ssl-offsets"))
+        assertFalse(capturedArgs.contains("--cronet-offsets"))
+        assertNotNull(result.suggestedProfile)
+        assertEquals("libcronet.122.0.0.1.so", result.suggestedProfile!!.cronetOffsetRules.first().libSubstring)
+        assertEquals(0x501000L, result.suggestedProfile!!.sslOffsetRules.first().writeOffset)
+    }
+
     private class FakeProcess(
         stdoutBytes: ByteArray,
         stderrText: String,

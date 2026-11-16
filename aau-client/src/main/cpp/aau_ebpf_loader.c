@@ -1202,6 +1202,77 @@ static int attach_uprobe_pmu_or_tracefs(
     return 0;
 }
 
+typedef struct {
+    int has_ssl;
+    const char *ssl_source;
+    uint64_t off_write;
+    uint64_t off_read;
+    uint64_t off_sni;
+    int has_cronet;
+    const char *cronet_source;
+    uint64_t off_cr_req;
+    uint64_t off_cr_hdr;
+    uint64_t off_cr_body;
+    uint64_t off_cr_fin;
+} library_probe_result;
+
+static void inspect_library_offsets(const char *path, int check_cronet, library_probe_result *out) {
+    memset(out, 0, sizeof(*out));
+    out->ssl_source = "none";
+    out->cronet_source = "none";
+
+    for (int r = 0; r < g_ssl_rule_count; r++) {
+        if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
+            g_ssl_rules[r].write_off != 0 && g_ssl_rules[r].read_off != 0) {
+            out->off_write = g_ssl_rules[r].write_off;
+            out->off_read = g_ssl_rules[r].read_off;
+            out->off_sni = g_ssl_rules[r].sni_off;
+            out->has_ssl = 1;
+            out->ssl_source = "rule";
+            break;
+        }
+    }
+    if (!out->has_ssl) {
+        if (resolve_elf_symbol_offset(path, "SSL_write", &out->off_write) == 0 &&
+            resolve_elf_symbol_offset(path, "SSL_read", &out->off_read) == 0) {
+            out->has_ssl = 1;
+            out->ssl_source = "dynsym";
+            resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &out->off_sni);
+        }
+#if defined(__LP64__) && defined(__aarch64__)
+        else if (resolve_stripped_boringssl_offsets(path, &out->off_write, &out->off_read, &out->off_sni) == 0) {
+            out->has_ssl = 1;
+            out->ssl_source = "stripped_heuristic";
+        }
+#endif
+    }
+
+#if defined(__LP64__) && defined(__aarch64__)
+    if (check_cronet) {
+        for (int r = 0; r < g_cronet_rule_count; r++) {
+            if (strstr(path, g_cronet_rules[r].lib_substr) != NULL &&
+                g_cronet_rules[r].create_off != 0 && g_cronet_rules[r].hdr_off != 0 &&
+                g_cronet_rules[r].body_off != 0 && g_cronet_rules[r].fin_off != 0) {
+                out->off_cr_req = g_cronet_rules[r].create_off;
+                out->off_cr_hdr = g_cronet_rules[r].hdr_off;
+                out->off_cr_body = g_cronet_rules[r].body_off;
+                out->off_cr_fin = g_cronet_rules[r].fin_off;
+                out->has_cronet = 1;
+                out->cronet_source = "rule";
+                break;
+            }
+        }
+        if (!out->has_cronet &&
+            resolve_cronet_offsets(path, &out->off_cr_req, &out->off_cr_hdr, &out->off_cr_body, &out->off_cr_fin) == 0) {
+            out->has_cronet = 1;
+            out->cronet_source = "elf_heuristic";
+        }
+    }
+#else
+    (void)check_cronet;
+#endif
+}
+
 static int try_attach_library(const char *path, bpf_bundle *bundle, int num_cpus) {
     if (!path || !path[0] || !file_exists_nonempty(path)) return -1;
     struct stat st;
@@ -1218,63 +1289,33 @@ static int try_attach_library(const char *path, bpf_bundle *bundle, int num_cpus
         return -1;
     }
 
-    uint64_t off_write = 0, off_read = 0, off_sni = 0;
-    int has_ssl = 0;
-    for (int r = 0; r < g_ssl_rule_count; r++) {
-        if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
-            g_ssl_rules[r].write_off != 0 && g_ssl_rules[r].read_off != 0) {
-            off_write = g_ssl_rules[r].write_off;
-            off_read = g_ssl_rules[r].read_off;
-            off_sni = g_ssl_rules[r].sni_off;
-            has_ssl = 1;
-            break;
-        }
-    }
-    if (!has_ssl) {
-        if (resolve_elf_symbol_offset(path, "SSL_write", &off_write) == 0 &&
-            resolve_elf_symbol_offset(path, "SSL_read", &off_read) == 0) {
-            has_ssl = 1;
-            resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &off_sni);
-        }
 #if defined(__LP64__) && defined(__aarch64__)
-        else if (resolve_stripped_boringssl_offsets(path, &off_write, &off_read, &off_sni) == 0) {
-            has_ssl = 1;
-        }
-#endif
-    }
-
-#if defined(__LP64__) && defined(__aarch64__)
-    uint64_t off_cr_req = 0, off_cr_hdr = 0, off_cr_body = 0, off_cr_fin = 0;
     int cronet_progs_ready = (
         bundle->prog_cronet_create_fd >= 0 &&
         bundle->prog_cronet_resp_started_fd >= 0 &&
         bundle->prog_cronet_read_completed_fd >= 0 &&
         bundle->prog_cronet_succeeded_fd >= 0
     );
-    int has_cronet = 0;
-    if (cronet_progs_ready) {
-        for (int r = 0; r < g_cronet_rule_count; r++) {
-            if (strstr(path, g_cronet_rules[r].lib_substr) != NULL &&
-                g_cronet_rules[r].create_off != 0 && g_cronet_rules[r].hdr_off != 0 &&
-                g_cronet_rules[r].body_off != 0 && g_cronet_rules[r].fin_off != 0) {
-                off_cr_req = g_cronet_rules[r].create_off;
-                off_cr_hdr = g_cronet_rules[r].hdr_off;
-                off_cr_body = g_cronet_rules[r].body_off;
-                off_cr_fin = g_cronet_rules[r].fin_off;
-                has_cronet = 1;
-                break;
-            }
-        }
-        if (!has_cronet &&
-            resolve_cronet_offsets(path, &off_cr_req, &off_cr_hdr, &off_cr_body, &off_cr_fin) == 0) {
-            has_cronet = 1;
-        }
-    }
 #else
-    int has_cronet = 0;
+    int cronet_progs_ready = 0;
 #endif
 
-    if (!has_ssl && !has_cronet) {
+    library_probe_result probe;
+    inspect_library_offsets(path, cronet_progs_ready, &probe);
+
+    int has_ssl = probe.has_ssl;
+    uint64_t off_write = probe.off_write;
+    uint64_t off_read = probe.off_read;
+    uint64_t off_sni = probe.off_sni;
+#if defined(__LP64__) && defined(__aarch64__)
+    int has_cronet = probe.has_cronet;
+    uint64_t off_cr_req = probe.off_cr_req;
+    uint64_t off_cr_hdr = probe.off_cr_hdr;
+    uint64_t off_cr_body = probe.off_cr_body;
+    uint64_t off_cr_fin = probe.off_cr_fin;
+#endif
+
+    if (!has_ssl && !probe.has_cronet) {
         return -1;
     }
 
@@ -1579,12 +1620,284 @@ static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch,
     __atomic_store_n(&meta->data_tail, data_tail, __ATOMIC_RELEASE);
 }
 
+static int is_system_lib_path(const char *path) {
+    if (!path) return 0;
+    return strncmp(path, "/system/", 8) == 0 ||
+           strncmp(path, "/vendor/", 8) == 0 ||
+           strncmp(path, "/apex/", 6) == 0 ||
+           strncmp(path, "/system_ext/", 12) == 0 ||
+           strncmp(path, "/product/", 9) == 0;
+}
+
+static const char *base_name_of(const char *path) {
+    if (!path) return "";
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static void print_json_escaped(FILE *out, const char *s) {
+    fputc('"', out);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            unsigned char c = *p;
+            if (c == '\\') fputs("\\\\", out);
+            else if (c == '"') fputs("\\\"", out);
+            else if (c == '\n') fputs("\\n", out);
+            else if (c == '\r') fputs("\\r", out);
+            else if (c == '\t') fputs("\\t", out);
+            else if (c < 0x20) fprintf(out, "\\u%04x", c);
+            else fputc(c, out);
+        }
+    }
+    fputc('"', out);
+}
+
+#define MAX_DISCOVER_SEEN 4096
+#define MAX_DISCOVER_MATCHES 64
+#define MAX_DISCOVER_UNMATCHED 64
+
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+} discover_seen_id;
+
+typedef struct {
+    char path[512];
+    dev_t dev;
+    ino_t ino;
+    int in_app_dir;
+    library_probe_result probe;
+} discover_item;
+
+typedef struct {
+    discover_seen_id *seen;
+    int seen_count;
+    discover_item *matches;
+    int match_count;
+    char unmatched[MAX_DISCOVER_UNMATCHED][128];
+    int unmatched_count;
+    int scanned_count;
+} discover_state;
+
+static void discover_add_unmatched_name(discover_state *ds, const char *name) {
+    if (!ds || !name || !name[0]) return;
+    for (int i = 0; i < ds->unmatched_count; i++) {
+        if (strcmp(ds->unmatched[i], name) == 0) return;
+    }
+    if (ds->unmatched_count >= MAX_DISCOVER_UNMATCHED) return;
+    snprintf(ds->unmatched[ds->unmatched_count++], sizeof(ds->unmatched[0]), "%s", name);
+}
+
+static void discover_record_library(
+    discover_state *ds,
+    const char *path,
+    int in_app_dir
+) {
+    if (!ds || !path || !path[0] || !file_exists_nonempty(path)) return;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) return;
+
+    for (int i = 0; i < ds->match_count; i++) {
+        if ((ds->matches[i].dev == st.st_dev && ds->matches[i].ino == st.st_ino) ||
+            strcmp(ds->matches[i].path, path) == 0) {
+            if (in_app_dir && !ds->matches[i].in_app_dir) {
+                ds->matches[i].in_app_dir = 1;
+            }
+            return;
+        }
+    }
+    for (int i = 0; i < ds->seen_count; i++) {
+        if (ds->seen[i].dev == st.st_dev && ds->seen[i].ino == st.st_ino) {
+            return;
+        }
+    }
+    if (ds->seen_count >= MAX_DISCOVER_SEEN) return;
+    ds->seen[ds->seen_count].dev = st.st_dev;
+    ds->seen[ds->seen_count].ino = st.st_ino;
+    ds->seen_count++;
+
+    ds->scanned_count++;
+    library_probe_result probe;
+    memset(&probe, 0, sizeof(probe));
+    inspect_library_offsets(path, 1, &probe);
+
+    if (probe.has_ssl || probe.has_cronet) {
+        if (ds->match_count < MAX_DISCOVER_MATCHES) {
+            discover_item *it = &ds->matches[ds->match_count++];
+            memset(it, 0, sizeof(*it));
+            snprintf(it->path, sizeof(it->path), "%s", path);
+            it->dev = st.st_dev;
+            it->ino = st.st_ino;
+            it->in_app_dir = in_app_dir;
+            it->probe = probe;
+        }
+    } else if (in_app_dir) {
+        discover_add_unmatched_name(ds, base_name_of(path));
+    }
+}
+
+static int run_discover_only(uint32_t target_uid, const char *explicit_lib) {
+    discover_state ds;
+    memset(&ds, 0, sizeof(ds));
+    ds.seen = (discover_seen_id *)calloc(MAX_DISCOVER_SEEN, sizeof(discover_seen_id));
+    ds.matches = (discover_item *)calloc(MAX_DISCOVER_MATCHES, sizeof(discover_item));
+    if (!ds.seen || !ds.matches) {
+        free(ds.seen);
+        free(ds.matches);
+        return 10;
+    }
+
+    if (explicit_lib && explicit_lib[0]) {
+        discover_record_library(&ds, explicit_lib, !is_system_lib_path(explicit_lib));
+    }
+
+    for (int d = 0; d < g_lib_dir_count; d++) {
+        DIR *dir = opendir(g_lib_dirs[d]);
+        if (!dir) continue;
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 3 || strcmp(de->d_name + nlen - 3, ".so") != 0) continue;
+            char full_path[1024];
+            snprintf(full_path, sizeof(full_path), "%s/%s", g_lib_dirs[d], de->d_name);
+            discover_record_library(&ds, full_path, 1);
+        }
+        closedir(dir);
+    }
+
+    if (target_uid > 0) {
+        DIR *proc = opendir("/proc");
+        if (proc) {
+            struct dirent *de;
+            while ((de = readdir(proc)) != NULL) {
+                if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+                char status_path[128];
+                snprintf(status_path, sizeof(status_path), "/proc/%s/status", de->d_name);
+                FILE *sf = fopen(status_path, "r");
+                if (!sf) continue;
+                char line[512];
+                uint32_t puid = 0;
+                int found_uid = 0;
+                while (fgets(line, sizeof(line), sf)) {
+                    if (strncmp(line, "Uid:", 4) == 0) {
+                        if (sscanf(line + 4, "%u", &puid) == 1) found_uid = 1;
+                        break;
+                    }
+                }
+                fclose(sf);
+                if (!found_uid || puid != target_uid) continue;
+
+                char maps_path[128];
+                snprintf(maps_path, sizeof(maps_path), "/proc/%s/maps", de->d_name);
+                FILE *mf = fopen(maps_path, "r");
+                if (!mf) continue;
+                while (fgets(line, sizeof(line), mf)) {
+                    char *slash = strchr(line, '/');
+                    if (!slash) continue;
+                    size_t slen = strlen(slash);
+                    while (slen > 0 && (slash[slen - 1] == '\n' || slash[slen - 1] == '\r' || slash[slen - 1] == ' ')) {
+                        slash[--slen] = '\0';
+                    }
+                    if (slen < 3 || strcmp(slash + slen - 3, ".so") != 0) continue;
+                    if (strstr(slash, ".apk!/") != NULL && !is_system_lib_path(slash)) {
+                        char apk_tag[128];
+                        snprintf(apk_tag, sizeof(apk_tag), "%s (apk-mapped)", base_name_of(slash));
+                        discover_add_unmatched_name(&ds, apk_tag);
+                        continue;
+                    }
+                    discover_record_library(&ds, slash, !is_system_lib_path(slash));
+                }
+                fclose(mf);
+            }
+            closedir(proc);
+        }
+    }
+
+#if defined(__LP64__)
+    const char *defaults[] = {
+        "/apex/com.android.conscrypt/lib64/libssl.so",
+        "/system/lib64/libssl.so",
+        NULL
+    };
+#else
+    const char *defaults[] = {
+        "/apex/com.android.conscrypt/lib/libssl.so",
+        "/system/lib/libssl.so",
+        NULL
+    };
+#endif
+    for (int i = 0; defaults[i]; i++) {
+        discover_record_library(&ds, defaults[i], 0);
+    }
+
+#if defined(__aarch64__)
+    const char *arch = "arm64";
+#elif defined(__arm__)
+    const char *arch = "arm";
+#elif defined(__x86_64__)
+    const char *arch = "x86_64";
+#else
+    const char *arch = "x86";
+#endif
+
+    printf("{\n");
+    printf("  \"uid\": %u,\n", target_uid);
+    printf("  \"arch\": \"%s\",\n", arch);
+    printf("  \"abi\": {\n");
+    printf("    \"rawHeadersOffset\": \"0x%x\",\n", g_cronet_abi.raw_headers_offset);
+    printf("    \"ioBufferDataOffset\": \"0x%x\",\n", g_cronet_abi.iobuf_data_offset);
+    printf("    \"stringLayoutMode\": %u,\n", g_cronet_abi.string_layout_mode);
+    printf("    \"vtableSlots\": [%d, %d, %d]\n", g_cronet_slot_hdr, g_cronet_slot_body, g_cronet_slot_fin);
+    printf("  },\n");
+    printf("  \"scannedLibrariesCount\": %d,\n", ds.scanned_count);
+    printf("  \"libraries\": [\n");
+    int first_lib = 1;
+    for (int i = 0; i < ds.match_count; i++) {
+        discover_item *it = &ds.matches[i];
+        if (!it->probe.has_ssl && !it->probe.has_cronet) continue;
+        if (!first_lib) printf(",\n");
+        first_lib = 0;
+        printf("    {\n");
+        printf("      \"path\": "); print_json_escaped(stdout, it->path); printf(",\n");
+        printf("      \"name\": "); print_json_escaped(stdout, base_name_of(it->path)); printf(",\n");
+        printf("      \"inAppDir\": %s,\n", it->in_app_dir ? "true" : "false");
+        printf("      \"sslSource\": "); print_json_escaped(stdout, it->probe.ssl_source); printf(",\n");
+        printf("      \"sslWriteOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_write);
+        printf("      \"sslReadOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_read);
+        printf("      \"sslSniOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_sni);
+        printf("      \"cronetSource\": "); print_json_escaped(stdout, it->probe.cronet_source); printf(",\n");
+        printf("      \"cronetCreateOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_cr_req);
+        printf("      \"cronetResponseStartedOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_cr_hdr);
+        printf("      \"cronetReadCompletedOffset\": \"0x%llx\",\n", (unsigned long long)it->probe.off_cr_body);
+        printf("      \"cronetSucceededOffset\": \"0x%llx\"\n", (unsigned long long)it->probe.off_cr_fin);
+        printf("    }");
+    }
+    printf("\n  ],\n");
+    printf("  \"unmatchedAppLibs\": [\n");
+    int limit_unmatched = ds.unmatched_count < 32 ? ds.unmatched_count : 32;
+    for (int i = 0; i < limit_unmatched; i++) {
+        if (i > 0) printf(",\n");
+        printf("    ");
+        print_json_escaped(stdout, ds.unmatched[i]);
+    }
+    printf("\n  ]\n");
+    printf("}\n");
+    fflush(stdout);
+    free(ds.seen);
+    free(ds.matches);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     uint32_t target_uid = 0;
     const char *explicit_lib = NULL;
+    int discover_only = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--uid") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--discover-only") == 0) {
+            discover_only = 1;
+        } else if (strcmp(argv[i], "--uid") == 0 && i + 1 < argc) {
             target_uid = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
             explicit_lib = argv[++i];
@@ -1667,6 +1980,14 @@ int main(int argc, char **argv) {
                 g_cronet_abi.string_layout_mode = mode;
             }
         }
+    }
+
+    if (discover_only) {
+        if (target_uid == 0 && g_lib_dir_count == 0 && (!explicit_lib || !explicit_lib[0])) {
+            fprintf(stderr, "ERR:usage:--uid, --lib-dir, or --lib required with --discover-only\n");
+            return 2;
+        }
+        return run_discover_only(target_uid, explicit_lib);
     }
 
     if (target_uid == 0) {
