@@ -42,6 +42,14 @@ class DisplayWindowInspector(
     }
 
     /**
+     * 提取指定屏幕当前界面的结构签名（SimHash + 静态锚点 + 包名/Activity 元数据）
+     */
+    fun screenSignature(displayId: Int, activityName: String? = null): ScreenSignature {
+        val service = serviceProvider() ?: return ScreenSignature.EMPTY
+        return screenSignature(service.windowsOn(displayId), activityName)
+    }
+
+    /**
      * 抓取并构建指定屏幕的完整语义节点树
      */
     fun inspect(displayId: Int): List<A11yNode> {
@@ -329,5 +337,37 @@ class DisplayWindowInspector(
             for (w in contentWindows(windows)) w.root?.let { visit(it, 0) }
             return hash
         }
+
+        /**
+         * 从无障碍窗口列表提取页面结构签名（自动跳过输入法、浮层及非聚焦的系统栏）。
+         */
+        fun screenSignature(
+            windows: List<AccessibilityWindowInfo>,
+            activityName: String? = null,
+            maxDepth: Int = DEFAULT_MAX_DEPTH
+        ): ScreenSignature = ScreenSignatureExtractor.extractFromWindows(windows, activityName, maxDepth)
+
+        /**
+         * 从不可变 [A11yNode] 节点树列表提取页面结构签名。
+         */
+        fun screenSignatureFromNodes(
+            roots: List<A11yNode>,
+            packageName: String? = null,
+            activityName: String? = null,
+            screenWidth: Int = 0,
+            screenHeight: Int = 0
+        ): ScreenSignature = ScreenSignatureExtractor.extractFromA11yNodes(
+            roots = roots,
+            packageName = packageName,
+            activityName = activityName,
+            screenWidth = screenWidth,
+            screenHeight = screenHeight
+        )
+
+        /**
+         * 提取可读的 Activity 短名（如 `com.tencent.mm/.ui.LauncherUI` -> `LauncherUI`）。
+         */
+        fun shortActivityName(packageName: String?, activityName: String?): String? =
+            com.agent.use.a11y.shortActivityName(packageName, activityName)
     }
 }

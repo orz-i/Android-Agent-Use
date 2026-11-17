@@ -122,6 +122,12 @@ class AgentA11yBridge(
      */
     fun windowHash(displayId: Int): Long = windowInspector.windowHash(displayId)
 
+    /**
+     * 提取指定屏幕当前界面的结构签名，用于跨页面与单 Activity 多标签页识别
+     */
+    fun screenSignature(displayId: Int, activityName: String? = null): ScreenSignature =
+        windowInspector.screenSignature(displayId, activityName)
+
     companion object {
         @JvmStatic
         val default = AgentA11yBridge()

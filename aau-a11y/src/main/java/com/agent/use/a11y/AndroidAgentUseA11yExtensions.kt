@@ -37,3 +37,9 @@ suspend fun AndroidAgentUse.AgentUseSession.swipeUp(): Boolean =
  */
 suspend fun AndroidAgentUse.AgentUseSession.swipeDown(): Boolean =
     AgentA11yBridge.getInstance().swipeDown(displayId, width, height)
+
+/**
+ * 提取当前虚拟屏界面的结构签名
+ */
+fun AndroidAgentUse.AgentUseSession.screenSignature(activityName: String? = null): ScreenSignature =
+    AgentA11yBridge.getInstance().screenSignature(displayId, activityName)
