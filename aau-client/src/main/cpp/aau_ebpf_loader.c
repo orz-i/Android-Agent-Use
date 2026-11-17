@@ -404,6 +404,32 @@ static int aarch64_window_has(const uint32_t *words, size_t start, size_t end, u
     return 0;
 }
 
+/*
+ * 专门给 OpenSSL 用的入口回溯。
+ *
+ * 不能复用 aarch64_find_func_start：那套先找 PACIASP、再找「前一条 RET」的边界，
+ * 是给 BoringSSL 写的。OpenSSL 的 SSL_write 紧跟 SSL_write_ex，前面是一条 B 跳转
+ * 而不是 RET，用 RET 边界会把 SSL_write 错认成 SSL_write_ex（实测差 0x154 字节）。
+ *
+ * 这里直接向上扫序言，遇到 RET 才停，说明已经跨进上一个函数。
+ */
+static size_t openssl_scan_func_entry(const uint32_t *words, size_t idx, size_t max_back) {
+    size_t limit = (idx > max_back) ? (idx - max_back) : 0;
+    for (size_t j = idx; j > limit; j--) {
+        uint32_t w = words[j];
+        /* STP X29, X30, [SP, #-N]! */
+        if ((w & 0xffc00000U) == 0xa9800000U &&
+            ((w >> 5) & 31U) == 31U && (w & 31U) == 29U && ((w >> 10) & 31U) == 30U) {
+            return j;
+        }
+        /* SUB SP, SP, #imm */
+        if ((w & 0xff8003ffU) == 0xd10003ffU) return j;
+        if (w == 0xd503233fU) return j;   /* PACIASP */
+        if (w == 0xd65f03c0U) break;      /* RET：跨函数了 */
+    }
+    return SIZE_MAX;
+}
+
 static int resolve_stripped_boringssl_offsets(
     const char *path,
     uint64_t *out_write,
@@ -506,6 +532,209 @@ static int resolve_stripped_boringssl_offsets(
                         }
                     }
                     rc = 0;
+                }
+            }
+        }
+    }
+
+    munmap((void *)base, map_size);
+    return rc;
+}
+
+/* ---------- OpenSSL 1.1.x（静态链入、已 strip）偏移解析 ----------
+ *
+ * 很多 App 不用系统 TLS，也不用 cronet，而是把 OpenSSL 整个静态链进自己的 transport so
+ * （BOSS 直聘的 libzp-sdk-transport.so 就是这一类：3.4MB，OpenSSL 1.1.1h）。
+ * 这类 so 的 .dynsym 里没有任何 SSL_* 符号，BoringSSL 的行号启发式也匹配不上。
+ *
+ * 这里走 ERR_STRING_DATA 反查，链路如下：
+ *   1. .rodata 里定位 "SSL_read\0" / "SSL_write\0" 字符串
+ *   2. PT_DYNAMIC → DT_RELA，找 R_AARCH64_RELATIVE 且 r_addend == 字符串地址的条目
+ *      r_offset 就是 ERR_STRING_DATA.string 字段的地址，往前 8 字节即 error code
+ *   3. code 拆出 lib/func/reason（ERR_PACK 布局：lib<<24 | func<<12 | reason）
+ *   4. .text 里扫 "mov w0, #20 (ERR_LIB_SSL)" + "mov w1, #func" 定位 SSLerr 调用点
+ *   5. 从调用点向上回溯函数入口
+ *
+ * func 编号随 OpenSSL 版本变化（1.1.1h 里 SSL_read=223、SSL_write=208），
+ * 所以第 2、3 步是运行时算的，不能写死。
+ */
+
+typedef struct {
+    uint64_t offset;
+    uint64_t size;
+    uint64_t entsize;
+} elf64_rela_range;
+
+static int elf64_find_rela_range(
+    const uint8_t *base,
+    size_t map_size,
+    const Elf64_Ehdr *eh,
+    const Elf64_Phdr *phdrs,
+    elf64_rela_range *out
+) {
+    for (int p = 0; p < eh->e_phnum; p++) {
+        if (phdrs[p].p_type != PT_DYNAMIC) continue;
+        if (phdrs[p].p_offset + phdrs[p].p_filesz > map_size) return -1;
+        if (phdrs[p].p_filesz < sizeof(Elf64_Dyn)) return -1;
+
+        const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + phdrs[p].p_offset);
+        size_t count = (size_t)(phdrs[p].p_filesz / sizeof(Elf64_Dyn));
+        uint64_t rela_va = 0, rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
+        for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+            if (dyn[i].d_tag == DT_RELA) {
+                rela_va = (uint64_t)dyn[i].d_un.d_ptr;
+            } else if (dyn[i].d_tag == DT_RELASZ) {
+                rela_sz = (uint64_t)dyn[i].d_un.d_val;
+            } else if (dyn[i].d_tag == DT_RELAENT && dyn[i].d_un.d_val >= sizeof(Elf64_Rela)) {
+                rela_ent = (uint64_t)dyn[i].d_un.d_val;
+            }
+        }
+        if (rela_va == 0 || rela_sz < sizeof(Elf64_Rela)) return -1;
+
+        uint64_t rela_off = 0;
+        if (elf64_vaddr_to_offset(eh, phdrs, rela_va, 0, &rela_off) != 0) return -1;
+        if (rela_off + rela_sz > map_size) return -1;
+
+        out->offset = rela_off;
+        out->size = rela_sz;
+        out->entsize = rela_ent;
+        return 0;
+    }
+    return -1;
+}
+
+static int openssl_string_to_va(
+    const uint8_t *base,
+    size_t map_size,
+    const Elf64_Ehdr *eh,
+    const Elf64_Phdr *phdrs,
+    const char *name,
+    uint64_t *out_va
+) {
+    size_t len = strlen(name) + 1;  /* 连结尾 NUL 一起匹配，避免 SSL_read 命中 SSL_read_ex */
+    (void)map_size;
+    const uint8_t *hit = (const uint8_t *)memmem(base, map_size, name, len);
+    if (!hit) return -1;
+    return elf64_offset_to_vaddr(eh, phdrs, (uint64_t)(hit - base), out_va);
+}
+
+static int openssl_err_func_code(
+    const uint8_t *base,
+    size_t map_size,
+    const Elf64_Ehdr *eh,
+    const Elf64_Phdr *phdrs,
+    const elf64_rela_range *rela,
+    uint64_t str_va,
+    uint32_t *out_func
+) {
+    size_t count = (size_t)(rela->size / rela->entsize);
+    for (size_t i = 0; i < count; i++) {
+        const Elf64_Rela *r = (const Elf64_Rela *)(base + rela->offset + i * rela->entsize);
+        if ((uint32_t)ELF64_R_TYPE(r->r_info) != R_AARCH64_RELATIVE) continue;
+        if ((uint64_t)r->r_addend != str_va) continue;
+
+        if (r->r_offset < 8) continue;
+        uint64_t code_off = 0;
+        if (elf64_vaddr_to_offset(eh, phdrs, (uint64_t)r->r_offset - 8, 0, &code_off) != 0) continue;
+        if (code_off + sizeof(uint64_t) > map_size) continue;
+
+        uint64_t code = 0;
+        memcpy(&code, base + code_off, sizeof(code));
+        uint32_t lib = (uint32_t)((code >> 24) & 0xffU);
+        uint32_t func = (uint32_t)((code >> 12) & 0xfffU);
+        if (lib != 20 /* ERR_LIB_SSL */ || func == 0) continue;
+
+        *out_func = func;
+        return 0;
+    }
+    return -1;
+}
+
+static size_t openssl_find_err_call_site(
+    const uint32_t *words,
+    size_t word_count,
+    uint32_t func_code
+) {
+    for (size_t i = 0; i < word_count; i++) {
+        if (words[i] != 0x52800280U) continue;  /* mov w0, #20 */
+        for (size_t j = 1; j <= 8 && i + j < word_count; j++) {
+            uint32_t ins = words[i + j];
+            if ((ins & 0xffe0001fU) == 0x52800001U) {  /* mov w1, #imm */
+                uint32_t imm = (ins >> 5) & 0xffffU;
+                if (imm == func_code) return i + j;
+                if (imm > 0xfffU) break;  /* 跑出函数码范围，不是同一次调用 */
+            }
+        }
+    }
+    return SIZE_MAX;
+}
+
+static int resolve_stripped_openssl_offsets(
+    const char *path,
+    uint64_t *out_write,
+    uint64_t *out_read,
+    uint64_t *out_sni
+) {
+    if (!path) return -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
+        close(fd);
+        return -1;
+    }
+    /* 静态链入 OpenSSL 的 so 不可能很小；先按体积筛掉大量无关库，省掉 mmap 和全段扫 */
+    if (st.st_size < (off_t)(256 * 1024)) {
+        close(fd);
+        return -1;
+    }
+    size_t map_size = (size_t)st.st_size;
+    const uint8_t *base = (const uint8_t *)mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return -1;
+
+    int rc = -1;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0 &&
+        eh->e_ident[EI_CLASS] == ELFCLASS64 &&
+        eh->e_phoff + (size_t)eh->e_phnum * sizeof(Elf64_Phdr) <= map_size) {
+
+        const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(base + eh->e_phoff);
+
+        /* 先确认是 OpenSSL 1.1.x，别在无关 so 上白扫 */
+        if (memmem(base, map_size, "OpenSSL 1.1.", 12) != NULL) {
+            elf64_rela_range rela;
+            if (elf64_find_rela_range(base, map_size, eh, phdrs, &rela) == 0) {
+                uint64_t write_str = 0, read_str = 0;
+                uint32_t write_func = 0, read_func = 0;
+                if (openssl_string_to_va(base, map_size, eh, phdrs, "SSL_write", &write_str) == 0 &&
+                    openssl_string_to_va(base, map_size, eh, phdrs, "SSL_read", &read_str) == 0 &&
+                    openssl_err_func_code(base, map_size, eh, phdrs, &rela, write_str, &write_func) == 0 &&
+                    openssl_err_func_code(base, map_size, eh, phdrs, &rela, read_str, &read_func) == 0) {
+
+                    uint64_t text_off = 0, text_va = 0, text_sz = 0;
+                    if (elf64_find_exec_range(base, map_size, eh, phdrs, &text_off, &text_va, &text_sz) == 0 &&
+                        (text_off & 3ULL) == 0 && text_sz >= 256) {
+                        const uint32_t *words = (const uint32_t *)(base + text_off);
+                        size_t word_count = (size_t)(text_sz / 4ULL);
+
+                        size_t write_site = openssl_find_err_call_site(words, word_count, write_func);
+                        size_t read_site = openssl_find_err_call_site(words, word_count, read_func);
+
+                        if (write_site != SIZE_MAX && read_site != SIZE_MAX) {
+                            size_t write_start = openssl_scan_func_entry(words, write_site, 128);
+                            size_t read_start = openssl_scan_func_entry(words, read_site, 128);
+                            if (write_start != SIZE_MAX && read_start != SIZE_MAX &&
+                                write_start != read_start) {
+                                *out_write = text_off + (uint64_t)write_start * 4ULL;
+                                *out_read = text_off + (uint64_t)read_start * 4ULL;
+                                /* SSL_set_tlsext_host_name 常被内联，没有稳定入口；host 交给 ClientHello 解析 */
+                                if (out_sni) *out_sni = 0;
+                                rc = 0;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1244,7 +1473,20 @@ static void inspect_library_offsets(const char *path, int check_cronet, library_
             out->has_ssl = 1;
             out->ssl_source = "stripped_heuristic";
         }
+        else if (resolve_stripped_openssl_offsets(path, &out->off_write, &out->off_read, &out->off_sni) == 0) {
+            out->has_ssl = 1;
+            out->ssl_source = "openssl_heuristic";
+        }
 #endif
+    }
+
+    if (out->has_ssl) {
+        fprintf(stderr,
+                "INFO:ssl-offsets %s source=%s write=0x%llx read=0x%llx sni=0x%llx\n",
+                path, out->ssl_source,
+                (unsigned long long)out->off_write,
+                (unsigned long long)out->off_read,
+                (unsigned long long)out->off_sni);
     }
 
 #if defined(__LP64__) && defined(__aarch64__)
