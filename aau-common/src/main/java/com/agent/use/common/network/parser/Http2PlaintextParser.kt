@@ -186,6 +186,54 @@ class Http2PlaintextParser(
         connectionId: String,
         isOutbound: Boolean
     ) {
+        when (type) {
+            // GOAWAY 表示服务端不会再为更高的 stream id 产出响应。把已经收到响应头的
+            // 半截响应放出去，别让它们随连接一起消失——eBPF 抓到的连接十有八九是被切断的。
+            FRAME_TYPE_GOAWAY -> {
+                handleGoaway(payload)
+                return
+            }
+
+            // SETTINGS / PING 固定在 stream 0，与任何请求无关
+            FRAME_TYPE_SETTINGS, FRAME_TYPE_PING -> return
+
+            // PRIORITY 描述依赖树，WINDOW_UPDATE 描述流量控制窗口。两者都可能落在
+            // "从未承载过请求"的 stream id 上；若在此建 StreamContext，长连接跑久了
+            // 会攒下一堆永不派发的空流上下文（每个还带一个 ByteArrayOutputStream）。
+            FRAME_TYPE_PRIORITY, FRAME_TYPE_WINDOW_UPDATE -> return
+
+            FRAME_TYPE_RST_STREAM -> {
+                streams.remove(streamId)?.let { reset ->
+                    if (reset.responseHeadersReceived && !reset.responseDispatched) {
+                        dispatchResponseIfNeeded(reset)
+                    } else if (!reset.requestDispatched && reset.requestHeaders.isNotEmpty()) {
+                        dispatchRequestIfNeeded(reset)
+                    }
+                }
+                return
+            }
+
+            FRAME_TYPE_PUSH_PROMISE -> {
+                handlePushPromise(flags, streamId, payload, connectionId)
+                return
+            }
+
+            // CONTINUATION 只有紧随其 HEADERS 时才有意义。孤立的要丢弃，
+            // 否则会为一个不存在的头块凭空造出 stream。
+            FRAME_TYPE_CONTINUATION -> {
+                val matches = if (isOutbound) {
+                    outboundContinuationStreamId == streamId
+                } else {
+                    inboundContinuationStreamId == streamId
+                }
+                if (!matches) return
+            }
+
+            FRAME_TYPE_HEADERS, FRAME_TYPE_DATA -> Unit
+
+            else -> return // 0xA 以上的扩展帧不对应 HTTP 语义，不该驱动流状态机
+        }
+
         if (streamId == 0) return
 
         val stream = streams.computeIfAbsent(streamId) {
@@ -265,13 +313,112 @@ class Http2PlaintextParser(
                 }
             }
 
-            FRAME_TYPE_RST_STREAM -> {
-                if (stream.responseHeadersReceived && !stream.responseDispatched) {
-                    dispatchResponseIfNeeded(stream)
-                }
-                streams.remove(streamId)
+            // RST_STREAM / GOAWAY / PUSH_PROMISE 已在入口处处理
+        }
+    }
+
+    /**
+     * GOAWAY 的 lastStreamId 之上的 stream 永远不会再有响应了。
+     * 把这些流收掉并放出已拿到的部分数据，避免响应凭空消失。
+     */
+    private fun handleGoaway(payload: ByteArray) {
+        if (payload.size < 8) return
+        val lastStreamId = ((payload[0].toInt() and 0x7F) shl 24) or
+            ((payload[1].toInt() and 0xFF) shl 16) or
+            ((payload[2].toInt() and 0xFF) shl 8) or
+            (payload[3].toInt() and 0xFF)
+
+        val abandoned = streams.values.filter { it.streamId > lastStreamId }
+        for (stream in abandoned) {
+            streams.remove(stream.streamId)
+            if (stream.responseHeadersReceived && !stream.responseDispatched) {
+                dispatchResponseIfNeeded(stream)
+            } else if (!stream.requestDispatched && stream.requestHeaders.isNotEmpty()) {
+                dispatchRequestIfNeeded(stream)
             }
         }
+    }
+
+    /**
+     * 服务端推送。promised stream 上的响应没有对应的客户端请求，
+     * 这里用 PUSH_PROMISE 携带的伪头补出一个合成请求，
+     * 否则后续 HEADERS 只能落到 `https://<host>/` 这种没有路径的 URL 上。
+     */
+    private fun handlePushPromise(flags: Int, streamId: Int, payload: ByteArray, connectionId: String) {
+        if (streamId == 0 || payload.isEmpty()) return
+
+        var start = 0
+        var end = payload.size
+        if ((flags and FLAG_PADDED) != 0) {
+            val padLength = payload[0].toInt() and 0xFF
+            start = 1
+            end -= padLength
+        }
+        if (end - start < 4) return
+
+        val promisedId = ((payload[start].toInt() and 0x7F) shl 24) or
+            ((payload[start + 1].toInt() and 0xFF) shl 16) or
+            ((payload[start + 2].toInt() and 0xFF) shl 8) or
+            (payload[start + 3].toInt() and 0xFF)
+        start += 4
+        if (start >= end || promisedId == 0) return
+
+        val headers = inboundHpack.decode(payload.copyOfRange(start, end))
+        if (headers.isEmpty()) return
+
+        var scheme = "https"
+        var authority: String? = null
+        var path = "/"
+        for (header in headers) {
+            when (header.name.lowercase()) {
+                ":scheme" -> scheme = header.value
+                ":authority" -> if (isUsableHost(header.value)) authority = header.value.trim()
+                ":path" -> path = header.value
+            }
+        }
+        val resolvedAuthority = authority ?: extractHostFromHeaders(headers) ?: lastSeenAuthority
+            ?: connectionHostHint ?: "unknown-host"
+        if (isUsableHost(resolvedAuthority)) {
+            lastSeenAuthority = resolvedAuthority
+        }
+
+        val normalizedPath = if (path.startsWith("/")) path else "/$path"
+        val pushed = streams.computeIfAbsent(promisedId) {
+            StreamContext(
+                streamId = promisedId,
+                requestId = "${connectionId}_h2_s$promisedId",
+                url = "$scheme://$resolvedAuthority$normalizedPath"
+            )
+        }
+        pushed.url = "$scheme://$resolvedAuthority$normalizedPath"
+        pushed.method = "GET"
+        pushed.requestHeaders = headers
+        dispatchRequestIfNeeded(pushed)
+    }
+
+    /**
+     * 连接终止时排空所有还在等待 END_STREAM 的流。
+     *
+     * 不排空的话，凡是没等到 END_STREAM 的响应都会静默丢失——而被 uprobe 截获的连接
+     * 大多是被 App 主动关闭或进程退出的，本来就拿不到 END_STREAM。
+     */
+    @Synchronized
+    fun finish() {
+        val pending = streams.values.toList()
+        streams.clear()
+        for (stream in pending) {
+            if (stream.responseHeadersReceived && !stream.responseDispatched) {
+                dispatchResponseIfNeeded(stream)
+            } else if (!stream.requestDispatched && stream.requestHeaders.isNotEmpty()) {
+                dispatchRequestIfNeeded(stream)
+            }
+        }
+        outboundBuffer.reset()
+        inboundBuffer.reset()
+        outboundContinuationStreamId = -1
+        inboundContinuationStreamId = -1
+        outboundContinuationBuffer.reset()
+        inboundContinuationBuffer.reset()
     }
 
     private fun applyDecodedHeaders(
