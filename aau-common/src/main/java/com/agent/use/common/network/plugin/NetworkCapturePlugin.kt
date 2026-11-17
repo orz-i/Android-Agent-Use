@@ -463,6 +463,7 @@ object NetworkCapturePluginRegistry {
         add(GenericCronetCapturePlugin)
         add(XiaohongshuCapturePlugin)
         add(DouyinCapturePlugin)
+        add(BossZhipinCapturePlugin)
     }
 
     private val jsonProfileOverrides = ConcurrentHashMap<String, EbpfProbeProfile>()
