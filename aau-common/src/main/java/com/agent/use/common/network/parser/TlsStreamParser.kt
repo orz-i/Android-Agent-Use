@@ -30,6 +30,8 @@ class TlsStreamParser @JvmOverloads constructor(
     companion object {
         private const val TAG = "TlsStreamParser"
         private const val MAX_CACHED_BODIES = 500
+        private const val MAX_PENDING_DECODED_BODIES = 32
+        private const val DECODED_BODY_TTL_MS = 3000L
         val HTTP2_PREFACE_PREFIX = "PRI ".toByteArray(StandardCharsets.ISO_8859_1)
 
         /**
@@ -142,6 +144,83 @@ class TlsStreamParser @JvmOverloads constructor(
             }
         }
     )
+
+    private class DecodedBody(val producedAt: Long, val bytes: ByteArray)
+
+    // Plaintext decoded inside the target process by the JNI bridge, waiting for its
+    // matching HTTP response. Entries expire so a stray decode cannot attach to a
+    // response that arrives much later.
+    private val pendingDecodedBodies = ArrayDeque<DecodedBody>()
+    private val decodedBodyLock = Any()
+
+    /**
+     * Receives plaintext produced by an in-process native decoder (JNI bridge probe).
+     *
+     * Apps like BOSS encrypt response bodies *above* TLS, so the SSL layer only ever
+     * yields ciphertext. This channel carries the post-decryption bytes observed at
+     * the native decoder's return value — no injection, no key material required.
+     */
+    fun onDecodedJniBody(methodId: Int, body: ByteArray) {
+        if (body.isEmpty()) return
+        val normalized = normalizeDecodedBody(body)
+        val now = System.currentTimeMillis()
+        synchronized(decodedBodyLock) {
+            while (pendingDecodedBodies.isNotEmpty() &&
+                now - pendingDecodedBodies.first().producedAt > DECODED_BODY_TTL_MS
+            ) {
+                pendingDecodedBodies.removeFirst()
+            }
+            pendingDecodedBodies.addLast(DecodedBody(now, normalized))
+            while (pendingDecodedBodies.size > MAX_PENDING_DECODED_BODIES) {
+                pendingDecodedBodies.removeFirst()
+            }
+        }
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "decoded jni body method=$methodId bytes=${normalized.size}")
+        }
+    }
+
+    /**
+     * Normalizes the two encodings the BOSS decoder emits.
+     *
+     * Its UTF-16 output is byte-identical JSON otherwise, so transcoding here keeps
+     * every downstream consumer (shape checks, middlewares, the UI) encoding-blind.
+     */
+    private fun normalizeDecodedBody(body: ByteArray): ByteArray {
+        if (body.size < 4 || body.size % 2 != 0) return body
+        val first = body[0]
+        if (first != '{'.code.toByte() && first != '['.code.toByte()) return body
+        // UTF-16LE keeps the second byte of each ASCII char at zero.
+        if (body[1] != 0.toByte() || body[3] != 0.toByte()) return body
+        return runCatching {
+            String(body, Charsets.UTF_16LE).toByteArray(Charsets.UTF_8)
+        }.getOrDefault(body)
+    }
+
+    /**
+     * Pops the oldest staged plaintext that satisfies [accept].
+     *
+     * The shape filter matters: the loader already refuses to emit payloads it cannot
+     * positively identify, but a mis-resolved `jbyteArray` can still slip through as
+     * printable garbage. Letting such a frame replace a good ciphertext body would make
+     * the response *less* useful than leaving it untouched, so non-matching entries are
+     * left in the queue (they may pair with a later response within the TTL) instead of
+     * being discarded.
+     */
+    private fun takeDecodedBody(accept: (ByteArray) -> Boolean = { true }): ByteArray? {
+        val now = System.currentTimeMillis()
+        synchronized(decodedBodyLock) {
+            var scanned = 0
+            while (scanned < pendingDecodedBodies.size) {
+                val entry = pendingDecodedBodies.removeFirst()
+                if (now - entry.producedAt > DECODED_BODY_TTL_MS) continue
+                if (accept(entry.bytes)) return entry.bytes
+                pendingDecodedBodies.addLast(entry)
+                scanned++
+            }
+        }
+        return null
+    }
 
     fun setConnectionHostHint(connectionId: String, hostHint: String) {
         val clean = extractHost(hostHint) ?: return
@@ -356,7 +435,9 @@ class TlsStreamParser @JvmOverloads constructor(
     fun finishConnection(connectionId: String) {
         http1Parsers[connectionId]?.finishOnEof()
         http1Parsers.remove(connectionId)
-        http2Parsers.remove(connectionId)
+        // 连接被切断时把还没等到 END_STREAM 的 HTTP/2 流排空，
+        // 否则半截响应会随着 parser 一起被丢掉。
+        http2Parsers.remove(connectionId)?.finish()
         cronetStreams.remove(connectionId)?.let { finalizeCronetStream(connectionId, it) }
         connectionProtocols.remove(connectionId)
         connectionHostHints.remove(connectionId)
@@ -459,7 +540,7 @@ class TlsStreamParser @JvmOverloads constructor(
     }
 
     private fun dispatchResponse(response: HttpResponseEvent) {
-        var effective = response
+        var effective = applyDecodedBodyOverride(response)
         val currentHost = extractHost(response.url)
         if (currentHost != null) {
             lastKnownHost = currentHost
@@ -511,6 +592,95 @@ class TlsStreamParser @JvmOverloads constructor(
         } catch (e: RemoteException) {
             Log.w(TAG, "RemoteException dispatching onResponseReceived: ${e.message}")
         }
+    }
+
+    /**
+     * Swaps an opaque response body for the plaintext captured by the JNI bridge.
+     *
+     * Guarded so it only ever fires on payloads that *look* encrypted: the response
+     * advertises JSON yet the staged bytes are not JSON. Genuinely plaintext
+     * responses, images, and binary blobs are left untouched.
+     */
+    private fun applyDecodedBodyOverride(event: HttpResponseEvent): HttpResponseEvent {
+        val requestId = event.requestId
+        val staged = getResponseBody(requestId)
+        if (staged == null || staged.isEmpty()) return event
+        if (isLikelyJsonPayload(staged)) return event
+        if (!advertisesJson(event)) return event
+
+        val decoded = takeDecodedBody(::looksRecognizable) ?: return event
+        if (decoded.isEmpty()) return event
+
+        val maxBytes = config.maxBodySizeBytes.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        val out = ByteArrayOutputStream()
+        val toWrite = minOf(decoded.size, maxBytes)
+        if (toWrite > 0) out.write(decoded, 0, toWrite)
+        synchronized(responseBodies) { responseBodies[requestId] = out }
+
+        val hint = "jni:${staged.size}->${decoded.size}"
+        Log.d(TAG, "decoded body override $requestId $hint")
+        return event.copy(
+            contentLength = out.size().toLong(),
+            headers = event.headers + HttpHeader("x-aau-decode-hint", hint)
+        )
+    }
+
+    private fun advertisesJson(event: HttpResponseEvent): Boolean {
+        val contentType = event.headers.firstOrNull {
+            it.name.equals("content-type", ignoreCase = true)
+        }?.value ?: return false
+        return contentType.contains("json", ignoreCase = true)
+    }
+
+    private fun isLikelyJsonPayload(bytes: ByteArray): Boolean {
+        var i = 0
+        if (bytes.size >= 3 &&
+            bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()
+        ) {
+            i = 3
+        }
+        while (i < bytes.size) {
+            val b = bytes[i]
+            if (b == ' '.code.toByte() || b == '\n'.code.toByte() ||
+                b == '\r'.code.toByte() || b == '\t'.code.toByte()
+            ) {
+                i++
+            } else {
+                break
+            }
+        }
+        if (i >= bytes.size) return false
+        return bytes[i] == '{'.code.toByte() || bytes[i] == '['.code.toByte()
+    }
+
+    /**
+     * Cheap acceptance test for a payload the JNI bridge claims is plaintext.
+     *
+     * A real decoder hands back either JSON or a container whose header is ASCII
+     * (`BZPBlock` and friends). A mis-resolved `jbyteArray` reads back as arbitrary
+     * process memory, which essentially never starts with four printable bytes —
+     * so this rejects the garbage without needing to know any app-specific format.
+     */
+    private fun looksRecognizable(bytes: ByteArray): Boolean {
+        if (isLikelyJsonPayload(bytes)) {
+            // A decoder that splits a large string across several arrays hands us a
+            // valid-looking prefix that never closes. Injecting that would silently
+            // corrupt the body, which is worse than leaving the ciphertext in place.
+            var end = bytes.size - 1
+            while (end >= 0) {
+                val b = bytes[end].toInt() and 0xFF
+                if (b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D || b == 0x00) end-- else break
+            }
+            if (end < 0) return false
+            val tail = bytes[end].toInt() and 0xFF
+            return tail == '}'.code || tail == ']'.code
+        }
+        if (bytes.size < 4) return false
+        for (i in 0 until 4) {
+            val b = bytes[i].toInt() and 0xFF
+            if (b < 0x20 || b > 0x7E) return false
+        }
+        return true
     }
 
     private fun stageResponseBody(requestId: String, chunk: ByteArray) {

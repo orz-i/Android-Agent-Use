@@ -409,6 +409,23 @@ object BossZhipinCapturePlugin : NetworkCapturePlugin {
                     sniOffset = 0L,
                 )
             ),
+            jniHookRules = listOf(
+                JniHookRule(
+                    libSubstring = YZWG_LIB,
+                    methodNames = listOf(
+                        "nativeDecodeContent",
+                        "nativeDecodeRequestBody",
+                    ),
+                    captureReturn = true,
+                    expectJson = true,
+                    // nativeDecodeContent 返回的不一定是裸 JSON：实测同一入口既可能给
+                    // 明文 JSON，也可能给 BZPBlock 容器（由 BossZhipinTrafficMiddleware
+                    // 再剥一层 LZ4）。把容器魔数也声明为合法形态，否则这类返回会被
+                    // loader 当成误读而丢弃。
+                    magic = BzpBlockCodec.MAGIC,
+                    maxBytes = 4 * 1024 * 1024,
+                )
+            ),
             // 这是精确命中，命中后不必再跑通用探测
             replaceBuiltinOffsets = false,
         )
@@ -418,6 +435,12 @@ object BossZhipinCapturePlugin : NetworkCapturePlugin {
         listOf(BossZhipinTrafficMiddleware)
 
     private const val TRANSPORT_LIB = "libzp-sdk-transport.so"
+
+    /**
+     * 应用层加解密库。方法通过 RegisterNatives 动态注册，so 里只有 JNI_OnLoad，
+     * 因此只能在运行时从 libart 拦截注册表拿到真实地址。
+     */
+    private const val YZWG_LIB = "libyzwg.so"
 
     /**
      * 偏移对应的样本指纹，BOSS 升级后 so 变了就得重跑脚本：

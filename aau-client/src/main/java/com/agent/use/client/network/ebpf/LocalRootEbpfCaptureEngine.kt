@@ -80,7 +80,10 @@ class LocalRootEbpfCaptureEngine(
         internal const val DIRECTION_CRONET_RESP_HDR = 5
         internal const val DIRECTION_CRONET_BODY = 6
         internal const val DIRECTION_CRONET_FINISH = 7
+        internal const val DIRECTION_JNI_RESULT = 9
         private const val MAX_FRAME_PAYLOAD = 64 * 1024
+        // Decoded bodies are delivered whole, so they get a wider budget than TLS chunks.
+        private const val MAX_JNI_FRAME_PAYLOAD = 4 * 1024 * 1024
         private const val STARTUP_TIMEOUT_MS = 5000L
 
         private val KNOWN_SU_PATHS = arrayOf(
@@ -532,7 +535,12 @@ class LocalRootEbpfCaptureEngine(
             val length = hdrBuf.getInt(16)
             val sslPtr = hdrBuf.getLong(20)
 
-            if (length <= 0 || length > MAX_FRAME_PAYLOAD) {
+            val maxAllowed = if (direction == DIRECTION_JNI_RESULT) {
+                MAX_JNI_FRAME_PAYLOAD
+            } else {
+                MAX_FRAME_PAYLOAD
+            }
+            if (length <= 0 || length > maxAllowed) {
                 throw IllegalStateException("Invalid AAUE frame length: $length")
             }
 
@@ -559,6 +567,7 @@ class LocalRootEbpfCaptureEngine(
                 DIRECTION_CRONET_RESP_HDR -> streamParser.onCronetResponseStarted(connId, payload)
                 DIRECTION_CRONET_BODY -> streamParser.onCronetReadCompleted(connId, payload)
                 DIRECTION_CRONET_FINISH -> streamParser.onCronetFinish(connId)
+                DIRECTION_JNI_RESULT -> streamParser.onDecodedJniBody(sslPtr.toInt(), payload)
             }
         }
     }

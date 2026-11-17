@@ -31,10 +31,59 @@ data class EbpfCronetAbiRule(
     val jniSignatures: List<String> = emptyList()
 )
 
+/**
+ * Declares a JNI bridge rule: intercept `RegisterNatives` in libart, resolve the
+ * requested methods, and read their return value straight out of the ART heap.
+ *
+ * This is an observation-only channel — no injection, no code patching in the
+ * target process. It is the only way to see plaintext that an app encrypts above
+ * the TLS layer.
+ *
+ * @param libSubstring fragment of the owning library path, e.g. "libyzwg.so"
+ * @param methodNames dynamically registered native methods to watch
+ * @param captureReturn read the jobject returned by the method (assumed byte[]).
+ *                      Return capture is the only mode the loader implements today;
+ *                      the flag is reserved for argument-only rules.
+ * @param expectJson reject payloads that do not start with '{' or '['
+ * @param magic optional container magic (e.g. "BZPBlock") accepted in addition to JSON
+ * @param maxBytes upper bound for a single array, guards against bad offsets
+ */
+data class JniHookRule(
+    val libSubstring: String,
+    val methodNames: List<String>,
+    val captureReturn: Boolean = true,
+    val expectJson: Boolean = true,
+    val magic: String? = null,
+    val maxBytes: Int = 4 * 1024 * 1024
+) {
+    fun toCliArgs(): List<String> {
+        if (libSubstring.isBlank()) return emptyList()
+        val names = methodNames.filter { it.isNotBlank() }
+        if (names.isEmpty()) return emptyList()
+        val args = ArrayList<String>(6)
+        // Argument order is a contract with aau_ebpf_loader.c: `--jni-magic` and
+        // `--jni-no-json` bind to the **most recent** `--jni-hook`, so the hook pair
+        // must always be emitted first.
+        args.add("--jni-hook")
+        args.add("$libSubstring:${names.joinToString(",")}")
+        if (!expectJson) args.add("--jni-no-json")
+        magic?.takeIf { it.isNotBlank() }?.let {
+            args.add("--jni-magic")
+            args.add(it)
+        }
+        if (maxBytes in 1..(4 * 1024 * 1024)) {
+            args.add("--jni-max-bytes")
+            args.add(maxBytes.toString())
+        }
+        return args
+    }
+}
+
 data class EbpfProbeProfile(
     val sslOffsetRules: List<EbpfSslOffsetRule> = emptyList(),
     val cronetOffsetRules: List<EbpfCronetOffsetRule> = emptyList(),
     val cronetAbiRule: EbpfCronetAbiRule? = null,
+    val jniHookRules: List<JniHookRule> = emptyList(),
     val replaceBuiltinOffsets: Boolean = false
 ) {
     fun toCliArgs(): List<String> {
@@ -79,6 +128,9 @@ data class EbpfProbeProfile(
                     args.add(sig)
                 }
             }
+        }
+        for (rule in jniHookRules) {
+            args.addAll(rule.toCliArgs())
         }
         return args
     }
@@ -550,12 +602,14 @@ object NetworkCapturePluginRegistry {
         val prioritized = (specificProfiles.asReversed() + matchedProfiles.filterNot { specificProfiles.contains(it) })
         val sslRules = ArrayList<EbpfSslOffsetRule>()
         val cronetRules = ArrayList<EbpfCronetOffsetRule>()
+        val jniRules = ArrayList<JniHookRule>()
         val jniSigs = LinkedHashSet<String>()
         var chosenAbi: EbpfCronetAbiRule? = null
 
         for (p in prioritized) {
             sslRules.addAll(p.sslOffsetRules)
             cronetRules.addAll(p.cronetOffsetRules)
+            jniRules.addAll(p.jniHookRules)
             p.cronetAbiRule?.let { abi ->
                 if (chosenAbi == null) {
                     chosenAbi = abi
@@ -568,7 +622,8 @@ object NetworkCapturePluginRegistry {
         return EbpfProbeProfile(
             sslOffsetRules = sslRules.distinct(),
             cronetOffsetRules = cronetRules.distinct(),
-            cronetAbiRule = finalAbi
+            cronetAbiRule = finalAbi,
+            jniHookRules = jniRules.distinct()
         )
     }
 
