@@ -222,4 +222,61 @@ class LaunchOriginResolverTest {
         assertEquals("android", origin48921.packageName)
         assertEquals(LaunchOrigin.CONFIDENCE_HIGH, origin48921.confidence)
     }
+
+    @Test
+    fun resolveBypassesSelfOriginAndLauncherRootViaActivityTaskManagerLogcat() {
+        val wechatTaskWithSelfTopAndLauncherRoot = """
+            Display #0 (activities from top to bottom):
+              * Task{bdeb737 #49336 type=standard A=10433:com.tencent.mm}
+                * Hist  #1: ActivityRecord{82496689 u0 com.tencent.mm/.plugin.base.stub.WXBizEntryActivity t49336}
+                  launchedFromUid=10433 launchedFromPackage=com.tencent.mm userId=0
+                * Hist  #0: ActivityRecord{198306257 u0 com.tencent.mm/.ui.LauncherUI t49336}
+                  launchedFromUid=10233 launchedFromPackage=com.android.launcher userId=0
+        """.trimIndent()
+
+        // 传入 targetPackage=com.tencent.mm 时，识别到自启动与历史桌面遮蔽并追查近期系统日志
+        val resolvedFromStartLog = LaunchOriginResolver.resolve(
+            taskId = 49336,
+            packageName = "com.tencent.mm",
+            nowEpochMs = 1_794_881_604_850L,
+        ) { cmd ->
+            when {
+                cmd.contains("activities") -> 0 to wechatTaskWithSelfTopAndLauncherRoot
+                cmd.contains("starter") -> 0 to "mLastStarter:\n  task=Task{other #999}"
+                cmd.firstOrNull() == "logcat" -> 0 to """
+                             1794881604.210  9197  9666 I ActivityTaskManager: START u0 {dat=weixin://dl/... flg=0x10000000 cmp=com.tencent.mm/.plugin.base.stub.WXBizEntryActivity} with LAUNCH_SINGLE_TOP from uid 10433 (com.tencent.mm) result code=0
+                             1794881604.215  9197  9296 I ActivityTaskManager: START u0 {act=android.intent.action.MAIN flg=0x10000000 pkg=com.tencent.mm cmp=com.tencent.mm/.ui.LauncherUI} with LAUNCH_SINGLE_TOP from uid 10434 (com.qidian.QDReader) (realCallingUid=1000) result code=3
+                """.trimIndent()
+                else -> -1 to ""
+            }
+        }
+        assertEquals(10434, resolvedFromStartLog.uid)
+        assertEquals("com.qidian.QDReader", resolvedFromStartLog.packageName)
+        assertEquals(LaunchOrigin.CONFIDENCE_HIGH, resolvedFromStartLog.confidence)
+
+        // 当 WXBizEntryActivity 已销毁只剩 LauncherUI（launchedFromPackage=com.android.launcher）时，也能从 BAL 日志反查真实发起方
+        val launcherOnlyRootDump = """
+            Display #0 (activities from top to bottom):
+              * Task{bdeb737 #49336 type=standard A=10433:com.tencent.mm}
+                * Hist  #0: ActivityRecord{198306257 u0 com.tencent.mm/.ui.LauncherUI t49336}
+                  launchedFromUid=10233 launchedFromPackage=com.android.launcher userId=0
+        """.trimIndent()
+        val resolvedFromBalLog = LaunchOriginResolver.resolve(
+            taskId = 49336,
+            packageName = "com.tencent.mm",
+            nowEpochMs = 1_794_881_604_850L,
+        ) { cmd ->
+            when {
+                cmd.contains("activities") -> 0 to launcherOnlyRootDump
+                cmd.contains("starter") -> 0 to ""
+                cmd.firstOrNull() == "logcat" -> 0 to """
+                             1794881604.213  9197  9296 E ActivityTaskManager: With Android 15 BAL hardening this activity start may be blocked ![callingPackage: com.qidian.QDReader; callingPackageTargetSdk: 30; callingUid: 10434; callingPid: -1; intent: Intent { pkg=com.tencent.mm cmp=com.tencent.mm/.ui.LauncherUI }]
+                """.trimIndent()
+                else -> -1 to ""
+            }
+        }
+        assertEquals(10434, resolvedFromBalLog.uid)
+        assertEquals("com.qidian.QDReader", resolvedFromBalLog.packageName)
+        assertEquals(LaunchOrigin.CONFIDENCE_HIGH, resolvedFromBalLog.confidence)
+    }
 }

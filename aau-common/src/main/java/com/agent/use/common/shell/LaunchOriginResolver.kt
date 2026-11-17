@@ -21,6 +21,17 @@ object LaunchOriginResolver {
     private val CALLING_UID = Regex("""\b(?:mCallingUid|callingUid)=(-?\d+)\b""")
     private val CALLING_PKG = Regex("""\b(?:callingPackage|mCallingPackage)=([^\s,}]+)""")
     private val TASK_ID_INLINE = Regex("""\btaskId=(-?\d+)\b|\b(?:Task|TaskRecord)\{[^#]*#(\d+)\b|ActivityRecord\{[^}]*\bt(\d+)\b""")
+    private val LOGCAT_EPOCH_LINE = Regex("""^\s*(\d+)\.(\d{3})\s+\d+\s+\d+\s+[A-Z]\s+([^:\s(]+)\s*(?:\([^)]*\))?:\s*(.*)$""")
+    private val ATM_START_LINE = Regex("""\bSTART\s+u\d+\s+\{([^}]*)\}.*?\bfrom\s+uid\s+(-?\d+)\s+\(([^),\s:]+)""")
+    private val BAL_CALLER_UID_LINE = Regex("""\bcallingPackage:\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+);\s*callingPackageTargetSdk:\s*-?\d+;\s*callingUid:\s*(-?\d+)""")
+    private val BAL_CALLER_TASK_LINE = Regex("""\bcallingPackage:\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+).*?\bmTargetRootTask:Task\{[^#]*#(\d+)\b""")
+    private val ABORTED_RESULT_CODE = Regex("""\bresult\s+code=-\d+\b""")
+    private val INTENT_CMP_PKG = Regex("""\bcmp=([a-zA-Z0-9_.]+)/""")
+    private val INTENT_PKG = Regex("""\bpkg=([a-zA-Z0-9_.]+)""")
+
+    private const val SYSTEM_UID = 1_000
+    private const val ROOT_UID = 0
+    private const val RECENT_LOG_WINDOW_MS = 5_000L
 
     private data class RecordLines(
         val origin: RecordOrigin?,
@@ -39,16 +50,24 @@ object LaunchOriginResolver {
      */
     @JvmStatic
     fun parse(dump: String, taskId: Int): LaunchOrigin =
-        parse(activitiesDump = dump, starterDump = null, taskId = taskId)
+        parse(activitiesDump = dump, starterDump = null, taskId = taskId, targetPackage = null)
 
     /**
      * 结合 `dumpsys activity activities` 与可选 `dumpsys activity starter` 输出解析 [taskId] 的启动来源。
      */
     @JvmStatic
-    fun parse(activitiesDump: String, starterDump: String?, taskId: Int): LaunchOrigin {
+    fun parse(activitiesDump: String, starterDump: String?, taskId: Int): LaunchOrigin =
+        parse(activitiesDump = activitiesDump, starterDump = starterDump, taskId = taskId, targetPackage = null)
+
+    /**
+     * 结合 `dumpsys activity activities` 与可选 `dumpsys activity starter` 解析 [taskId] 的启动来源，
+     * 传入 [targetPackage] 时识别自启动遮蔽以便后续结合日志定位真实发起方。
+     */
+    @JvmStatic
+    fun parse(activitiesDump: String, starterDump: String?, taskId: Int, targetPackage: String?): LaunchOrigin {
         if (taskId < 0) return LaunchOrigin.unknown()
         if (activitiesDump.isNotBlank()) {
-            val fromActivities = parseActivitiesDump(activitiesDump, taskId)
+            val fromActivities = parseActivitiesDump(activitiesDump, taskId, targetPackage)
             if (fromActivities.isKnown) return fromActivities
         }
         if (!starterDump.isNullOrBlank()) {
@@ -58,7 +77,7 @@ object LaunchOriginResolver {
         return LaunchOrigin.unknown()
     }
 
-    private fun parseActivitiesDump(dump: String, taskId: Int): LaunchOrigin {
+    private fun parseActivitiesDump(dump: String, taskId: Int, targetPackage: String? = null): LaunchOrigin {
         val taskLines = extractTaskLines(dump, taskId)
         if (taskLines.isEmpty()) return LaunchOrigin.unknown()
 
@@ -75,8 +94,18 @@ object LaunchOriginResolver {
             return LaunchOrigin.unknown()
         }
 
-        // dumpsys activity activities 中 Hist 按从顶到底 (#N .. #0) 排列；index 0 为顶层，last 为根 ActivityRecord
+        // dumpsys activity activities 中 Hist 按从顶到底 (#N .. #0) 排列；优先选择非自启动、非系统、非桌面的外部发起方
         val top = records.first().origin
+        if (top != null && !isSelfOrSystemOrigin(top, targetPackage) && !isLauncherLikePackage(top.packageName)) {
+            return LaunchOrigin(top.uid, top.packageName, LaunchOrigin.CONFIDENCE_HIGH)
+        }
+        for (i in 1 until records.size) {
+            val recOrigin = records[i].origin ?: continue
+            if (!isSelfOrSystemOrigin(recOrigin, targetPackage) && !isLauncherLikePackage(recOrigin.packageName)) {
+                return LaunchOrigin(recOrigin.uid, recOrigin.packageName, LaunchOrigin.CONFIDENCE_MEDIUM)
+            }
+        }
+        // 若栈顶是目标自身自启动（如 WXBizEntryActivity）且栈底为历史桌面 Launcher，保留栈顶自启动交由 starter/logcat 追查
         if (top != null) {
             return LaunchOrigin(top.uid, top.packageName, LaunchOrigin.CONFIDENCE_HIGH)
         }
@@ -285,26 +314,205 @@ object LaunchOriginResolver {
     }
 
     /**
-     * 通过 Shell 执行全量 `dumpsys` 命令获取并解析 [taskId] 的启动来源。
+     * 解析 `logcat -b system -v epoch` 中的 `ActivityTaskManager` 启动与 PendingIntent 审计日志，
+     * 在 `activities` / `starter` 被目标自启动或历史根记录遮蔽时找出最近 [maxAgeMs] 内的真实外部发起方。
+     */
+    @JvmStatic
+    fun parseSystemLogcat(
+        logcatDump: String,
+        taskId: Int,
+        targetPackage: String?,
+        nowEpochMs: Long = -1L,
+        maxAgeMs: Long = RECENT_LOG_WINDOW_MS,
+    ): LaunchOrigin {
+        if (logcatDump.isBlank()) return LaunchOrigin.unknown()
+        val cleanTarget = targetPackage?.trim()?.takeIf { it.isNotEmpty() }
+        if (cleanTarget == null && taskId < 0) return LaunchOrigin.unknown()
+
+        val lines = logcatDump.lineSequence().toList()
+        var refEpochMs = nowEpochMs
+        if (refEpochMs <= 0L) {
+            for (i in lines.indices.reversed()) {
+                val epochMatch = LOGCAT_EPOCH_LINE.find(lines[i]) ?: continue
+                val sec = epochMatch.groupValues[1].toLongOrNull() ?: continue
+                val ms = epochMatch.groupValues[2].toLongOrNull() ?: continue
+                val ts = sec * 1_000L + ms
+                if (ts > refEpochMs) refEpochMs = ts
+                break
+            }
+        }
+
+        for (i in lines.indices.reversed()) {
+            val rawLine = lines[i]
+            val parsed = LOGCAT_EPOCH_LINE.find(rawLine)
+            if (parsed != null && refEpochMs > 0L) {
+                val sec = parsed.groupValues[1].toLongOrNull() ?: continue
+                val ms = parsed.groupValues[2].toLongOrNull() ?: continue
+                val ageMs = refEpochMs - (sec * 1_000L + ms)
+                if (ageMs < -1_500L || ageMs > maxAgeMs) continue
+            }
+            val tag = parsed?.groupValues?.get(3).orEmpty()
+            val body = parsed?.groupValues?.get(4) ?: rawLine
+            if (tag.isNotEmpty() && !tag.startsWith("ActivityTaskManager")) continue
+            if (ABORTED_RESULT_CODE.containsMatchIn(body)) continue
+
+            ATM_START_LINE.find(body)?.let { m ->
+                val intentSpec = m.groupValues[1]
+                val callerUid = m.groupValues[2].toIntOrNull() ?: LaunchOrigin.UNKNOWN_UID
+                val callerPkg = normalizePackage(m.groupValues[3])
+                if (matchesTargetLine(body, intentSpec, taskId, cleanTarget) &&
+                    isExternalNonSystemCaller(callerUid, callerPkg, cleanTarget)
+                ) {
+                    return LaunchOrigin(
+                        uid = callerUid,
+                        packageName = callerPkg,
+                        confidence = if (callerUid >= 0) LaunchOrigin.CONFIDENCE_HIGH else LaunchOrigin.CONFIDENCE_MEDIUM,
+                    )
+                }
+            }
+
+            BAL_CALLER_UID_LINE.find(body)?.let { m ->
+                val callerPkg = normalizePackage(m.groupValues[1])
+                val callerUid = m.groupValues[2].toIntOrNull() ?: LaunchOrigin.UNKNOWN_UID
+                if (matchesTargetLine(body, body, taskId, cleanTarget) &&
+                    isExternalNonSystemCaller(callerUid, callerPkg, cleanTarget)
+                ) {
+                    return LaunchOrigin(
+                        uid = callerUid,
+                        packageName = callerPkg,
+                        confidence = if (callerUid >= 0) LaunchOrigin.CONFIDENCE_HIGH else LaunchOrigin.CONFIDENCE_MEDIUM,
+                    )
+                }
+            }
+
+            BAL_CALLER_TASK_LINE.find(body)?.let { m ->
+                val callerPkg = normalizePackage(m.groupValues[1])
+                val targetTaskId = m.groupValues[2].toIntOrNull() ?: -1
+                val matchesTask = taskId >= 0 && targetTaskId == taskId
+                if ((matchesTask || matchesTargetLine(body, body, taskId, cleanTarget)) &&
+                    isExternalNonSystemCaller(LaunchOrigin.UNKNOWN_UID, callerPkg, cleanTarget)
+                ) {
+                    return LaunchOrigin(
+                        uid = LaunchOrigin.UNKNOWN_UID,
+                        packageName = callerPkg,
+                        confidence = LaunchOrigin.CONFIDENCE_MEDIUM,
+                    )
+                }
+            }
+        }
+        return LaunchOrigin.unknown()
+    }
+
+    /**
+     * 通过 Shell 执行全量 `dumpsys` 与近期 `ActivityTaskManager` 日志解析 [taskId] 的启动来源。
      * 不传递 `-p`，避免 ColorOS/Android 触发 App 级转储造成秒级 Binder 阻塞。
      */
     fun resolve(
         taskId: Int,
-        @Suppress("UNUSED_PARAMETER") packageName: String? = null,
+        packageName: String? = null,
+        runShell: (Array<String>) -> Pair<Int, String>,
+    ): LaunchOrigin = resolve(
+        taskId = taskId,
+        packageName = packageName,
+        nowEpochMs = System.currentTimeMillis(),
+        runShell = runShell,
+    )
+
+    fun resolve(
+        taskId: Int,
+        packageName: String? = null,
+        nowEpochMs: Long,
         runShell: (Array<String>) -> Pair<Int, String>,
     ): LaunchOrigin {
         if (taskId < 0) return LaunchOrigin.unknown()
 
         val (actCode, actOut) = runShell(arrayOf("dumpsys", "activity", "activities"))
         val activitiesDump = if (actCode == 0) actOut else ""
-        val fromActivities = if (activitiesDump.isNotBlank()) parse(activitiesDump, taskId) else LaunchOrigin.unknown()
-        if (fromActivities.isKnown) return fromActivities
+        val fromActivities = if (activitiesDump.isNotBlank()) {
+            parse(activitiesDump, starterDump = null, taskId = taskId, targetPackage = packageName)
+        } else {
+            LaunchOrigin.unknown()
+        }
+        if (fromActivities.isKnown &&
+            !isSelfOrSystemOrigin(fromActivities, packageName) &&
+            !isLauncherLikePackage(fromActivities.packageName)
+        ) {
+            return fromActivities
+        }
 
         val (starterCode, starterOut) = runShell(arrayOf("dumpsys", "activity", "starter"))
-        if (starterCode == 0 && starterOut.isNotBlank()) {
-            return parseStarter(starterOut, taskId)
+        val fromStarter = if (starterCode == 0 && starterOut.isNotBlank()) {
+            parseStarter(starterOut, taskId)
+        } else {
+            LaunchOrigin.unknown()
         }
-        return LaunchOrigin.unknown()
+        if (fromStarter.isKnown &&
+            !isSelfOrSystemOrigin(fromStarter, packageName) &&
+            !isLauncherLikePackage(fromStarter.packageName)
+        ) {
+            return fromStarter
+        }
+
+        val (logCode, logOut) = runShell(
+            arrayOf(
+                "logcat", "-b", "system", "-v", "epoch", "-d", "-t", "3000",
+                "-s", "ActivityTaskManager:I", "*:S",
+            ),
+        )
+        val fromLogcat = if (logCode == 0 && logOut.isNotBlank()) {
+            parseSystemLogcat(logOut, taskId, packageName, nowEpochMs = nowEpochMs)
+        } else {
+            LaunchOrigin.unknown()
+        }
+        if (fromLogcat.isKnown) return fromLogcat
+
+        if (fromStarter.isKnown && !isSelfOrSystemOrigin(fromStarter, packageName)) {
+            return fromStarter
+        }
+        return if (fromActivities.isKnown) fromActivities else fromStarter
+    }
+
+    private fun isSelfOrSystemOrigin(origin: RecordOrigin, targetPackage: String?): Boolean {
+        val pkg = origin.packageName
+        if (!targetPackage.isNullOrBlank() && pkg.equals(targetPackage, ignoreCase = true)) return true
+        return pkg == "android" || origin.uid == SYSTEM_UID
+    }
+
+    private fun isSelfOrSystemOrigin(origin: LaunchOrigin, targetPackage: String?): Boolean {
+        val pkg = origin.packageName
+        if (!targetPackage.isNullOrBlank() && pkg.equals(targetPackage, ignoreCase = true)) return true
+        return pkg == "android" || origin.uid == SYSTEM_UID
+    }
+
+    private fun isLauncherLikePackage(pkg: String?): Boolean {
+        val lower = pkg?.lowercase() ?: return false
+        return "launcher" in lower || ".home" in lower
+    }
+
+    private fun isExternalNonSystemCaller(callerUid: Int, callerPkg: String?, targetPackage: String?): Boolean {
+        if (callerPkg.isNullOrBlank()) return false
+        if (!targetPackage.isNullOrBlank() && callerPkg.equals(targetPackage, ignoreCase = true)) return false
+        if (callerPkg == "android" || callerPkg == "system") return false
+        if (callerUid == SYSTEM_UID || callerUid == ROOT_UID) return false
+        return true
+    }
+
+    private fun matchesTargetLine(fullLine: String, intentSpec: String, taskId: Int, targetPackage: String?): Boolean {
+        if (taskId >= 0) {
+            if (fullLine.contains("#$taskId ") ||
+                fullLine.contains("#$taskId}") ||
+                fullLine.contains(" t$taskId ") ||
+                fullLine.contains(" t$taskId}")
+            ) {
+                return true
+            }
+        }
+        if (targetPackage.isNullOrBlank()) return false
+        val cmpPkg = INTENT_CMP_PKG.find(intentSpec)?.groupValues?.get(1)
+        if (cmpPkg.equals(targetPackage, ignoreCase = true)) return true
+        val explicitPkg = INTENT_PKG.find(intentSpec)?.groupValues?.get(1)
+        if (explicitPkg.equals(targetPackage, ignoreCase = true)) return true
+        return fullLine.contains(":$targetPackage")
     }
 
     private fun isValidOrigin(origin: RecordOrigin): Boolean =
