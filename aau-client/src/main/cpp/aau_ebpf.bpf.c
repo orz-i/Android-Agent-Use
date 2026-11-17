@@ -26,6 +26,11 @@ typedef signed long long __s64;
 #define DIRECTION_CRONET_RESP_HDR 5U
 #define DIRECTION_CRONET_BODY 6U
 #define DIRECTION_CRONET_FINISH 7U
+#define DIRECTION_JNI_REGISTER 8U
+#define DIRECTION_JNI_RETURN 9U
+#define DIRECTION_JNI_ARGUMENT 10U
+// Plaintext read straight out of a live argument buffer (see probe_array_region).
+#define DIRECTION_JNI_REGION 11U
 #define MAX_DATA_CHUNK 16383U
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
@@ -48,7 +53,9 @@ struct pt_regs {
 #define PT_REGS_PARM2(x) ((x)->regs[1])
 #define PT_REGS_PARM3(x) ((x)->regs[2])
 #define PT_REGS_PARM4(x) ((x)->regs[3])
+#define PT_REGS_PARM5(x) ((x)->regs[4])
 #define PT_REGS_RC(x)    ((x)->regs[0])
+#define PT_REGS_IP(x)    ((x)->pc)
 #elif defined(__TARGET_ARCH_x86_64)
 struct pt_regs {
     __u64 r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8;
@@ -58,7 +65,9 @@ struct pt_regs {
 #define PT_REGS_PARM2(x) ((x)->rsi)
 #define PT_REGS_PARM3(x) ((x)->rdx)
 #define PT_REGS_PARM4(x) ((x)->rcx)
+#define PT_REGS_PARM5(x) ((x)->r8)
 #define PT_REGS_RC(x)    ((x)->rax)
+#define PT_REGS_IP(x)    ((x)->rip)
 #elif defined(__TARGET_ARCH_arm)
 struct pt_regs {
     __u32 uregs[18];
@@ -67,7 +76,9 @@ struct pt_regs {
 #define PT_REGS_PARM2(x) ((__u64)(x)->uregs[1])
 #define PT_REGS_PARM3(x) ((__u64)(x)->uregs[2])
 #define PT_REGS_PARM4(x) ((__u64)(x)->uregs[3])
+#define PT_REGS_PARM5(x) ((__u64)(x)->uregs[4])
 #define PT_REGS_RC(x)    ((__u64)(x)->uregs[0])
+#define PT_REGS_IP(x)    ((__u64)(x)->uregs[15])
 #elif defined(__TARGET_ARCH_x86)
 struct pt_regs {
     __u32 bx, cx, dx, si, di, bp, ax, ds, es, fs, gs, orig_ax, ip, cs, flags, sp, ss;
@@ -81,7 +92,9 @@ static __inline __u64 bpf_read_x86_stack_arg(struct pt_regs *ctx, __u32 slot) {
 #define PT_REGS_PARM2(x) bpf_read_x86_stack_arg((x), 2)
 #define PT_REGS_PARM3(x) bpf_read_x86_stack_arg((x), 3)
 #define PT_REGS_PARM4(x) bpf_read_x86_stack_arg((x), 4)
+#define PT_REGS_PARM5(x) bpf_read_x86_stack_arg((x), 5)
 #define PT_REGS_RC(x)    ((__u64)(x)->ax)
+#define PT_REGS_IP(x)    ((__u64)(x)->ip)
 #else
 #error "Unsupported __TARGET_ARCH_* for aau_ebpf.bpf.c"
 #endif
@@ -163,6 +176,49 @@ struct bpf_map_def events = {
     .key_size = sizeof(__u32),
     .value_size = sizeof(__u32),
     .max_entries = 0,
+    .map_flags = 0,
+};
+
+struct jni_event_extra {
+    __u32 method_id;
+    __u32 aux;      // REGISTER: method count | REGION: start offset in the array
+    __u32 length;   // REGION: bytes in this chunk (0 for other directions)
+    __u32 pad;
+    __u64 key;      // REGION: array handle, used to reassemble chunked writes
+};
+
+struct jni_reg_args_val {
+    __u64 methods_ptr;
+    __s32 count;
+    __u32 pad;
+};
+
+SEC("maps")
+struct bpf_map_def jni_reg_args = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u64),
+    .value_size = sizeof(struct jni_reg_args_val),
+    .max_entries = 1024,
+    .map_flags = 0,
+};
+
+SEC("maps")
+struct bpf_map_def jni_addr_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u64),
+    .value_size = sizeof(__u32),
+    .max_entries = 128,
+    .map_flags = 0,
+};
+
+// tid -> method_id for the in-flight native call, so the return probe knows
+// which method it is closing. Entry probes can read the PC; return probes cannot.
+SEC("maps")
+struct bpf_map_def jni_call_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u64),
+    .value_size = sizeof(__u32),
+    .max_entries = 4096,
     .map_flags = 0,
 };
 
@@ -593,6 +649,182 @@ int probe_cronet_succeeded(struct pt_regs *ctx) {
 
     __u32 emit_size = (__u32)sizeof(struct tls_event_hdr) + 4U;
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+    return 0;
+}
+
+static __inline __attribute__((always_inline)) void emit_jni_event_full(
+    void *ctx,
+    __u32 uid,
+    __u32 direction,
+    __u64 ptr,
+    __u32 method_id,
+    __u32 aux,
+    __u32 length,
+    __u64 key
+) {
+    __u32 zero = 0;
+    struct tls_event *ev = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!ev) {
+        return;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    ev->hdr.pid = (__u32)(pid_tgid >> 32);
+    ev->hdr.uid = uid;
+    ev->hdr.ssl_ptr = ptr;
+    ev->hdr.direction = direction;
+    ev->hdr.length = (__u32)sizeof(struct jni_event_extra);
+    ev->hdr.ts_ns = (__u64)bpf_ktime_get_ns();
+
+    struct jni_event_extra *ex = (struct jni_event_extra *)ev->data;
+    ex->method_id = method_id;
+    ex->aux = aux;
+    ex->length = length;
+    ex->pad = 0;
+    ex->key = key;
+
+    __u32 emit_size = (__u32)(sizeof(struct tls_event_hdr) + sizeof(struct jni_event_extra));
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, emit_size);
+}
+
+static __inline __attribute__((always_inline)) void emit_jni_event(
+    void *ctx,
+    __u32 uid,
+    __u32 direction,
+    __u64 ptr,
+    __u32 method_id,
+    __u32 aux
+) {
+    emit_jni_event_full(ctx, uid, direction, ptr, method_id, aux, 0U, 0ULL);
+}
+
+// art::JNI<*>::RegisterNatives(JNIEnv* env [x0], jclass clazz [x1],
+//                              const JNINativeMethod* methods [x2], jint n [x3])
+SEC("uprobe/reg_natives")
+int probe_reg_natives_entry(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 methods = (__u64)PT_REGS_PARM3(ctx);
+    __s32 count = (__s32)PT_REGS_PARM4(ctx);
+    if (!methods || count <= 0 || count > 512) {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct jni_reg_args_val v;
+    v.methods_ptr = methods;
+    v.count = count;
+    v.pad = 0;
+    bpf_map_update_elem(&jni_reg_args, &pid_tgid, &v, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/reg_natives_exit")
+int probe_reg_natives_exit(struct pt_regs *ctx) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct jni_reg_args_val *saved = bpf_map_lookup_elem(&jni_reg_args, &pid_tgid);
+    if (!saved) {
+        return 0;
+    }
+
+    __u64 methods = saved->methods_ptr;
+    __s32 count = saved->count;
+    bpf_map_delete_elem(&jni_reg_args, &pid_tgid);
+
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    emit_jni_event(ctx, uid, DIRECTION_JNI_REGISTER, methods, 0U, (__u32)count);
+    return 0;
+}
+
+// Entry of a probed native method. The PC identifies which registered address
+// fired, so the method id is stashed under the calling thread until return.
+SEC("uprobe/jni_arg")
+int probe_jni_entry(struct pt_regs *ctx) {
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 ip = PT_REGS_IP(ctx);
+    __u32 *slot = bpf_map_lookup_elem(&jni_addr_map, &ip);
+    if (!slot) {
+        // Some kernels report the address just past the breakpoint.
+        __u64 alt = ip - 4;
+        slot = bpf_map_lookup_elem(&jni_addr_map, &alt);
+    }
+    if (!slot) {
+        return 0;
+    }
+
+    __u32 method_id = *slot;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&jni_call_map, &pid_tgid, &method_id, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/jni_ret")
+int probe_jni_return(struct pt_regs *ctx) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    if (!slot) {
+        return 0;
+    }
+    __u32 method_id = *slot;
+    bpf_map_delete_elem(&jni_call_map, &pid_tgid);
+
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __u64 ret = (__u64)PT_REGS_RC(ctx);
+    if (!ret) {
+        return 0;
+    }
+
+    emit_jni_event(ctx, uid, DIRECTION_JNI_RETURN, ret, method_id, 0U);
+    return 0;
+}
+
+// art::JNI<*>::SetByteArrayRegion(JNIEnv* env [x0], jbyteArray array [x1],
+//                                 jint start [w2], jint len [w3], const jbyte* buf [x4])
+//
+// Why this probe exists: the jobject handed back by a native decoder is an ART
+// handle, and ART has already torn its handle scope down by the time a uretprobe
+// fires on the caller's return address -- the slot reads back as 0xc0dead10
+// poison. The plaintext buffer passed *into* SetByteArrayRegion is alive for the
+// duration of that call, so observing the argument is the reliable way to get it.
+// Gate on jni_call_map so this only fires while a hooked decoder is on the stack.
+SEC("uprobe/array_region")
+int probe_array_region(struct pt_regs *ctx) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    if (!slot) {
+        return 0;
+    }
+
+    __u32 uid = match_target_uid();
+    if (uid == 0) {
+        return 0;
+    }
+
+    __s32 start = (__s32)PT_REGS_PARM3(ctx);
+    __s32 len = (__s32)PT_REGS_PARM4(ctx);
+    __u64 buf = (__u64)PT_REGS_PARM5(ctx);
+    __u64 array = (__u64)PT_REGS_PARM2(ctx);
+    if (!buf || !array || len <= 0 || start < 0) {
+        return 0;
+    }
+
+    emit_jni_event_full(ctx, uid, DIRECTION_JNI_REGION, buf, *slot,
+                        (__u32)start, (__u32)len, array);
     return 0;
 }
 

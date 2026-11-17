@@ -17,6 +17,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -997,6 +998,13 @@ typedef struct {
     int prog_cronet_resp_started_fd;
     int prog_cronet_read_completed_fd;
     int prog_cronet_succeeded_fd;
+    int prog_reg_natives_fd;
+    int prog_reg_natives_exit_fd;
+    int prog_jni_arg_fd;
+    int prog_jni_ret_fd;
+    int prog_array_region_fd;
+    int jni_reg_args_map_fd;
+    int jni_addr_map_fd;
 } bpf_bundle;
 
 static int try_bpf_prog_load(
@@ -1118,6 +1126,8 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
         if (strcmp(mname, "target_uid_map") == 0) out->target_uid_map_fd = fd;
         else if (strcmp(mname, "events") == 0) out->events_map_fd = fd;
         else if (strcmp(mname, "cronet_abi_map") == 0) out->cronet_abi_map_fd = fd;
+        else if (strcmp(mname, "jni_reg_args") == 0) out->jni_reg_args_map_fd = fd;
+        else if (strcmp(mname, "jni_addr_map") == 0) out->jni_addr_map_fd = fd;
         map_count++;
     }
 
@@ -1130,7 +1140,12 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
         "uprobe/cronet_create",
         "uprobe/cronet_resp_started",
         "uprobe/cronet_read_completed",
-        "uprobe/cronet_succeeded"
+        "uprobe/cronet_succeeded",
+        "uprobe/reg_natives",
+        "uretprobe/reg_natives_exit",
+        "uprobe/jni_arg",
+        "uretprobe/jni_ret",
+        "uprobe/array_region"
     };
     int *prog_fds[] = {
         &out->prog_write_fd,
@@ -1140,11 +1155,17 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
         &out->prog_cronet_create_fd,
         &out->prog_cronet_resp_started_fd,
         &out->prog_cronet_read_completed_fd,
-        &out->prog_cronet_succeeded_fd
+        &out->prog_cronet_succeeded_fd,
+        &out->prog_reg_natives_fd,
+        &out->prog_reg_natives_exit_fd,
+        &out->prog_jni_arg_fd,
+        &out->prog_jni_ret_fd,
+        &out->prog_array_region_fd
     };
-    const int prog_required[] = {1, 1, 1, 0, 0, 0, 0, 0};
+    const int prog_required[] = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int prog_count = (int)(sizeof(prog_secs) / sizeof(prog_secs[0]));
 
-    for (int p = 0; p < 8; p++) {
+    for (int p = 0; p < prog_count; p++) {
         int sec_idx = -1;
         for (int i = 0; i < eh->e_shnum; i++) {
             if (strcmp(shstrtab + shdrs[i].sh_name, prog_secs[p]) == 0) {
@@ -1766,6 +1787,57 @@ typedef struct {
     uint32_t payload_offset;
 } batch_event_meta;
 
+/* ================= JNI bridge: dynamic RegisterNatives interception ================= */
+
+#define MAX_JNI_RULES 8
+#define MAX_JNI_METHODS 8
+#define MAX_JNI_TARGETS 32
+#define JNI_ARRAY_BYTES_LIMIT (4U * 1024U * 1024U)
+
+typedef struct {
+    char lib_substr[128];
+    char methods[MAX_JNI_METHODS][80];
+    int method_count;
+    int expect_json;
+    int max_bytes;
+    char magic[16];
+    int magic_len;
+} jni_hook_rule;
+
+typedef struct {
+    char lib_path[512];
+    uint64_t addr;
+    uint64_t file_offset;
+    uint32_t method_id;
+    int expect_json;
+    int max_bytes;
+    char magic[16];
+    int magic_len;
+    int perf_fd_count;
+    int perf_fds[128];
+} jni_target;
+
+typedef struct {
+    uint64_t name;
+    uint64_t signature;
+    uint64_t fn_ptr;
+} jni_native_method;
+
+static jni_hook_rule g_jni_rules[MAX_JNI_RULES];
+static int g_jni_rule_count = 0;
+static jni_target g_jni_targets[MAX_JNI_TARGETS];
+static int g_jni_target_count = 0;
+static int g_jni_attached_count = 0;
+static int g_jni_hook_enabled = 0;
+static char g_jni_libart_path[256] = {0};
+static int g_jni_array_len_off = -1;
+static int g_jni_array_data_off = -1;
+static int g_jni_default_expect_json = 1;
+static int g_jni_default_max_bytes = (int)JNI_ARRAY_BYTES_LIMIT;
+
+static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra);
+static void attach_jni_register_probes(bpf_bundle *bundle, uint32_t target_uid, int num_cpus);
+
 static batch_event_meta g_batch_metas[MAX_BATCH_EVENTS];
 static uint8_t *g_batch_payload_pool = NULL;
 static size_t g_batch_payload_pool_cap = 4 * 1024 * 1024;
@@ -1840,6 +1912,10 @@ static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch,
                     bpf_tls_hdr bh;
                     memcpy(&bh, sample, sizeof(bh));
                     if (bh.length > 0 && sizeof(bh) + bh.length <= raw_size) {
+                        if (bh.direction >= 8U) {
+                            flush_event_batch();
+                            handle_jni_event(&bh, sample + sizeof(bh));
+                        } else {
                         if (g_batch_count >= MAX_BATCH_EVENTS ||
                             g_batch_payload_pool_len + bh.length > g_batch_payload_pool_cap) {
                             flush_event_batch();
@@ -1852,6 +1928,7 @@ static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch,
                             g_batch_payload_pool_len += bh.length;
                             g_batch_count++;
                         }
+                        }
                     }
                 }
             }
@@ -1860,6 +1937,796 @@ static void drain_perf_ring(perf_ring *ring, size_t page_size, uint8_t *scratch,
     }
 
     __atomic_store_n(&meta->data_tail, data_tail, __ATOMIC_RELEASE);
+}
+
+/* ================= JNI bridge implementation ================= */
+
+static bpf_bundle *g_jni_bundle = NULL;
+static int g_jni_num_cpus = 0;
+
+static int read_proc_mem(uint32_t pid, uint64_t addr, void *buf, size_t len) {
+    if (!pid || !addr || !buf || !len) return -1;
+
+    struct iovec local;
+    struct iovec remote;
+    local.iov_base = buf;
+    local.iov_len = len;
+    remote.iov_base = (void *)(uintptr_t)addr;
+    remote.iov_len = len;
+    if (process_vm_readv((pid_t)pid, &local, 1, &remote, 1, 0) == (ssize_t)len) {
+        return 0;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%u/mem", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t r = pread(fd, buf, len, (off_t)addr);
+    close(fd);
+    return (r == (ssize_t)len) ? 0 : -1;
+}
+
+// Resolve the load base of the first mapping whose path contains `substr`.
+static int find_lib_mapping(
+    uint32_t pid,
+    const char *substr,
+    char *path_out,
+    size_t path_cap,
+    uint64_t *base_out
+) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
+    FILE *f = fopen(maps_path, "r");
+    if (!f) return -1;
+
+    uint64_t best_base = 0;
+    char best_path[512];
+    best_path[0] = '\0';
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, substr)) continue;
+        unsigned long long start = 0, end = 0, foff = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s %llx", &start, &end, perms, &foff) != 4) continue;
+        if (perms[0] != 'r') continue;
+        char *slash = strchr(line, '/');
+        if (!slash) continue;
+        size_t slen = strlen(slash);
+        while (slen > 0 && (slash[slen - 1] == '\n' || slash[slen - 1] == '\r' || slash[slen - 1] == ' ')) {
+            slash[--slen] = '\0';
+        }
+        if (slen < 4) continue;
+        uint64_t base = (uint64_t)start - (uint64_t)foff;
+        if (best_base == 0 || base < best_base) {
+            best_base = base;
+            snprintf(best_path, sizeof(best_path), "%s", slash);
+        }
+    }
+    fclose(f);
+
+    if (best_base == 0) return -1;
+    if (path_out && path_cap) snprintf(path_out, path_cap, "%s", best_path);
+    if (base_out) *base_out = best_base;
+    return 0;
+}
+
+// Look up a symbol in .symtab (not .dynsym) and translate its vaddr to a file offset.
+// Used for libart.so, whose JNI entry points are not exported dynamically.
+static int resolve_symtab_symbol_offset(
+    const char *path,
+    const char *needle,
+    uint64_t *out_offset
+) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    Elf64_Ehdr eh;
+    if (fread(&eh, sizeof(eh), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf64_Shdr)) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fseek(f, (long)eh.e_shoff, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    Elf64_Shdr *shdrs = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
+    if (!shdrs) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(shdrs, sizeof(Elf64_Shdr), eh.e_shnum, f) != eh.e_shnum) {
+        free(shdrs);
+        fclose(f);
+        return -1;
+    }
+
+    Elf64_Shdr *symtab = NULL;
+    Elf64_Shdr *strtab = NULL;
+    for (int i = 0; i < eh.e_shnum; i++) {
+        if (shdrs[i].sh_type == SHT_SYMTAB && shdrs[i].sh_size > 0) {
+            symtab = &shdrs[i];
+            if (shdrs[i].sh_link < eh.e_shnum) strtab = &shdrs[shdrs[i].sh_link];
+            break;
+        }
+    }
+    if (!symtab || !strtab || strtab->sh_size < 2) {
+        free(shdrs);
+        fclose(f);
+        return -1;
+    }
+
+    size_t sym_count = symtab->sh_size / sizeof(Elf64_Sym);
+    Elf64_Sym *syms = (Elf64_Sym *)malloc(symtab->sh_size);
+    char *strs = (char *)malloc(strtab->sh_size);
+    if (!syms || !strs) {
+        free(syms);
+        free(strs);
+        free(shdrs);
+        fclose(f);
+        return -1;
+    }
+
+    int io_ok = (fseek(f, (long)symtab->sh_offset, SEEK_SET) == 0 &&
+                 fread(syms, 1, symtab->sh_size, f) == symtab->sh_size &&
+                 fseek(f, (long)strtab->sh_offset, SEEK_SET) == 0 &&
+                 fread(strs, 1, strtab->sh_size, f) == strtab->sh_size);
+
+    int rc = -1;
+    if (io_ok) {
+        for (size_t i = 0; i < sym_count; i++) {
+            if (syms[i].st_name == 0 || syms[i].st_name >= strtab->sh_size) continue;
+            if (syms[i].st_value == 0 || syms[i].st_shndx == SHN_UNDEF) continue;
+            const char *nm = strs + syms[i].st_name;
+            if (!strstr(nm, needle)) continue;
+            // Skip compiler-generated lambdas such as _ZZ...ENKUl...
+            if (strncmp(nm, "_ZZ", 3) == 0) continue;
+
+            for (int s = 0; s < eh.e_shnum; s++) {
+                if (shdrs[s].sh_addr == 0 || shdrs[s].sh_size == 0) continue;
+                if (shdrs[s].sh_type != SHT_PROGBITS) continue;
+                if (syms[i].st_value < shdrs[s].sh_addr) continue;
+                if (syms[i].st_value >= shdrs[s].sh_addr + shdrs[s].sh_size) continue;
+                *out_offset = syms[i].st_value - shdrs[s].sh_addr + shdrs[s].sh_offset;
+                rc = 0;
+                break;
+            }
+            if (rc == 0) break;
+        }
+    }
+
+    free(syms);
+    free(strs);
+    free(shdrs);
+    fclose(f);
+    return rc;
+}
+
+static int jni_addr_known(uint64_t addr) {
+    for (int i = 0; i < g_jni_target_count; i++) {
+        if (g_jni_targets[i].addr == addr) return 1;
+    }
+    return 0;
+}
+
+static int jni_attach_target(
+    const char *lib_path,
+    uint64_t addr,
+    uint64_t file_offset,
+    uint32_t method_id,
+    int expect_json,
+    int max_bytes,
+    const char *magic,
+    int magic_len
+) {
+    if (g_jni_target_count >= MAX_JNI_TARGETS || !g_jni_bundle) return -1;
+    if (g_jni_bundle->prog_jni_arg_fd < 0 || g_jni_bundle->prog_jni_ret_fd < 0 ||
+        g_jni_bundle->jni_addr_map_fd < 0) {
+        return -1;
+    }
+
+    uint64_t key = addr;
+    uint32_t value = method_id;
+    union bpf_attr ma;
+    memset(&ma, 0, sizeof(ma));
+    ma.map_fd = (uint32_t)g_jni_bundle->jni_addr_map_fd;
+    ma.key = (uint64_t)(uintptr_t)&key;
+    ma.value = (uint64_t)(uintptr_t)&value;
+    ma.flags = BPF_ANY;
+    if (sys_bpf(BPF_MAP_UPDATE_ELEM, &ma, sizeof(ma)) != 0) {
+        fprintf(stderr, "WARN:jni_addr_map_update:errno=%d\n", errno);
+        return -1;
+    }
+
+    jni_target *t = &g_jni_targets[g_jni_target_count];
+    memset(t, 0, sizeof(*t));
+    snprintf(t->lib_path, sizeof(t->lib_path), "%s", lib_path);
+    t->addr = addr;
+    t->file_offset = file_offset;
+    t->method_id = method_id;
+    t->expect_json = expect_json;
+    t->max_bytes = max_bytes;
+    t->magic_len = 0;
+    if (magic && magic_len > 0 && magic_len < (int)sizeof(t->magic)) {
+        memcpy(t->magic, magic, (size_t)magic_len);
+        t->magic[magic_len] = '\0';
+        t->magic_len = magic_len;
+    }
+
+    char suf_e[40];
+    char suf_r[40];
+    snprintf(suf_e, sizeof(suf_e), "jnie_%u", method_id);
+    snprintf(suf_r, sizeof(suf_r), "jnir_%u", method_id);
+    int fd_count = 0;
+    if (attach_uprobe_pmu_or_tracefs(lib_path, file_offset, 0, suf_e,
+                                     g_jni_bundle->prog_jni_arg_fd, g_jni_num_cpus,
+                                     t->perf_fds, &fd_count) != 0) {
+        fprintf(stderr, "WARN:jni_attach_entry_failed off=0x%llx\n", (unsigned long long)file_offset);
+        return -1;
+    }
+    if (attach_uprobe_pmu_or_tracefs(lib_path, file_offset, 1, suf_r,
+                                     g_jni_bundle->prog_jni_ret_fd, g_jni_num_cpus,
+                                     t->perf_fds, &fd_count) != 0) {
+        fprintf(stderr, "WARN:jni_attach_return_failed off=0x%llx\n", (unsigned long long)file_offset);
+        return -1;
+    }
+    t->perf_fd_count = fd_count;
+    g_jni_target_count++;
+    g_jni_attached_count++;
+    return 0;
+}
+
+static void jni_handle_register(uint32_t pid, uint64_t methods_ptr, uint32_t count) {
+    if (!g_jni_hook_enabled || g_jni_rule_count == 0 || !g_jni_bundle) return;
+    if (count == 0 || count > 512) return;
+
+    // Reaching here proves the libart probe fires, even when no rule matches.
+    fprintf(stderr, "INFO:jni_register_hit pid=%u count=%u\n", pid, count);
+    fflush(stderr);
+
+    size_t arr_bytes = sizeof(jni_native_method) * (size_t)count;
+    if (arr_bytes > 131072U) return;
+
+    jni_native_method *arr = (jni_native_method *)malloc(arr_bytes);
+    if (!arr) return;
+    if (read_proc_mem(pid, methods_ptr, arr, arr_bytes) != 0) {
+        fprintf(stderr, "WARN:jni_read_methods:pid=%u\n", pid);
+        free(arr);
+        return;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (arr[i].name == 0 || arr[i].fn_ptr == 0) continue;
+
+        char nm[96];
+        memset(nm, 0, sizeof(nm));
+        if (read_proc_mem(pid, arr[i].name, nm, sizeof(nm) - 1) != 0) continue;
+        nm[sizeof(nm) - 1] = '\0';
+        if (nm[0] < 0x20 || nm[0] > 0x7E) continue;
+
+        int rule_idx = -1;
+        for (int r = 0; r < g_jni_rule_count && rule_idx < 0; r++) {
+            for (int m = 0; m < g_jni_rules[r].method_count; m++) {
+                if (strcmp(nm, g_jni_rules[r].methods[m]) == 0) {
+                    rule_idx = r;
+                    break;
+                }
+            }
+        }
+        if (rule_idx < 0) continue;
+        if (jni_addr_known(arr[i].fn_ptr)) continue;
+        if (g_jni_target_count >= MAX_JNI_TARGETS) break;
+
+        char lib_path[512];
+        memset(lib_path, 0, sizeof(lib_path));
+        uint64_t base = 0;
+        if (find_lib_mapping(pid, g_jni_rules[rule_idx].lib_substr,
+                             lib_path, sizeof(lib_path), &base) != 0) {
+            fprintf(stderr, "WARN:jni_lib_not_mapped:%s\n", g_jni_rules[rule_idx].lib_substr);
+            continue;
+        }
+        if (arr[i].fn_ptr < base) continue;
+        uint64_t off = arr[i].fn_ptr - base;
+        if (off == 0 || off > 0x8000000ULL) continue;
+
+        uint32_t method_id = (uint32_t)g_jni_target_count;
+        if (jni_attach_target(lib_path, arr[i].fn_ptr, off, method_id,
+                              g_jni_rules[rule_idx].expect_json,
+                              g_jni_rules[rule_idx].max_bytes,
+                              g_jni_rules[rule_idx].magic,
+                              g_jni_rules[rule_idx].magic_len) == 0) {
+            fprintf(stderr, "INFO:jni_hook lib=%s off=0x%llx id=%u method=%s\n",
+                    lib_path, (unsigned long long)off, method_id, nm);
+            fflush(stderr);
+        }
+    }
+
+    free(arr);
+}
+
+// Last resort when the exact mirror::Array layout is unknown: scan the object head
+// for a JSON payload and accept it only when the length prefix agrees and the
+// payload closes with a matching bracket.
+static int scan_json_array_window(
+    uint32_t pid,
+    uint64_t base,
+    int max_bytes,
+    uint8_t *out,
+    size_t out_cap
+) {
+    uint8_t win[256];
+    if (read_proc_mem(pid, base, win, sizeof(win)) != 0) return -1;
+
+    uint32_t limit = (max_bytes > 0) ? (uint32_t)max_bytes : JNI_ARRAY_BYTES_LIMIT;
+
+    for (int i = 8; i + 4 < (int)sizeof(win); i++) {
+        if (win[i] != '{' && win[i] != '[') continue;
+        uint32_t len = 0;
+        memcpy(&len, win + i - 4, sizeof(len));
+        if (len < 2 || len > limit) continue;
+        if ((size_t)len > out_cap) continue;
+        if (read_proc_mem(pid, base + (uint64_t)i, out, len) != 0) continue;
+        uint8_t tail = out[len - 1];
+        if (tail != '}' && tail != ']') continue;
+        return (int)len;
+    }
+    return -1;
+}
+
+// ART hands out indirect JNI references: the jobject points at a slot holding the
+// real mirror::Object*, sometimes with low tag bits set. Probe both the raw value
+// and one level of dereference, and trust the payload shape to pick the winner.
+// The decoder also builds binary arrays on the same thread, and a leading '{' alone
+// is not proof of JSON (`{\x1d\x00\x00...` shows up in practice). Accept printable
+// ASCII JSON and its UTF-16LE twin, which the parser transcodes later.
+static int jni_json_head_ok(const uint8_t *b, uint32_t n) {
+    if (n == 0) return 0;
+    if (b[0] != '{' && b[0] != '[') return 0;
+    if (n < 4) return 1;
+    if (b[1] >= 0x20 && b[1] < 0x7F && b[2] >= 0x20 && b[2] < 0x7F) return 1;
+    if (b[1] == 0 && b[3] == 0 && b[2] >= 0x20) return 1;
+    return 0;
+}
+
+static int read_java_byte_array(
+    uint32_t pid,
+    uint64_t obj,
+    int max_bytes,
+    int expect_json,
+    const char *magic,
+    int magic_len,
+    uint8_t *out,
+    size_t out_cap
+) {
+    static const uint32_t layouts[][2] = {
+        {8, 12}, {8, 16}, {16, 20}, {16, 24}, {12, 16}, {4, 8}
+    };
+    const size_t layout_count = sizeof(layouts) / sizeof(layouts[0]);
+
+    uint64_t bases[2];
+    int base_count = 0;
+    bases[base_count++] = obj;
+
+    uint64_t deref = 0;
+    if (read_proc_mem(pid, obj, &deref, sizeof(deref)) == 0 && deref > 0x10000ULL) {
+        uint64_t clean = deref & ~0x3ULL;
+        if (clean != obj) {
+            bases[base_count++] = clean;
+        }
+    }
+
+    int fallback_valid = 0;
+    uint32_t fallback_len = 0;
+    uint64_t fallback_base = 0;
+    size_t fallback_k = 0;
+
+    for (int b = 0; b < base_count; b++) {
+        for (size_t k = 0; k < layout_count; k++) {
+            uint32_t len = 0;
+            if (read_proc_mem(pid, bases[b] + layouts[k][0], &len, sizeof(len)) != 0) continue;
+            if (len == 0 || len > JNI_ARRAY_BYTES_LIMIT) continue;
+            if ((size_t)len > out_cap) continue;
+            if (max_bytes > 0 && len > (uint32_t)max_bytes) continue;
+
+            uint8_t head[16];
+            memset(head, 0, sizeof(head));
+            uint32_t probe = (len < sizeof(head)) ? len : (uint32_t)sizeof(head);
+            if (read_proc_mem(pid, bases[b] + layouts[k][1], head, probe) != 0) continue;
+
+            int head_json = (head[0] == '{' || head[0] == '[') ? 1 : 0;
+            int head_magic = 0;
+            if (!head_json && magic_len > 0 && probe >= (uint32_t)magic_len &&
+                memcmp(head, magic, (size_t)magic_len) == 0) {
+                head_magic = 1;
+            }
+            int shape_ok = head_json || head_magic;
+            if (!shape_ok && !expect_json && head[0] >= 0x09 && head[0] < 0x7F) {
+                shape_ok = 1;
+            }
+
+            if (!shape_ok) {
+                if (!fallback_valid) {
+                    fallback_valid = 1;
+                    fallback_len = len;
+                    fallback_base = bases[b];
+                    fallback_k = k;
+                }
+                continue;
+            }
+
+            if (read_proc_mem(pid, bases[b] + layouts[k][1], out, len) != 0) continue;
+            // A leading byte is not proof enough: a JSON payload must also close,
+            // otherwise a mis-resolved object yields plausible-looking garbage.
+            if (head_json && expect_json) {
+                uint8_t tail = out[len - 1];
+                if (tail != '}' && tail != ']' && tail != 0x00) continue;
+            }
+            if (g_jni_array_len_off != (int)layouts[k][0] || g_jni_array_data_off != (int)layouts[k][1]) {
+                g_jni_array_len_off = (int)layouts[k][0];
+                g_jni_array_data_off = (int)layouts[k][1];
+                fprintf(stderr, "INFO:jni_array_layout len_off=%u data_off=%u deref=%d\n",
+                        layouts[k][0], layouts[k][1], b);
+                fflush(stderr);
+            }
+            return (int)len;
+        }
+    }
+
+    if (expect_json) {
+        for (int b = 0; b < base_count; b++) {
+            int n = scan_json_array_window(pid, bases[b], max_bytes, out, out_cap);
+            if (n > 0) {
+                fprintf(stderr, "INFO:jni_array_window deref=%d len=%d\n", b, n);
+                fflush(stderr);
+                return n;
+            }
+        }
+    }
+
+    // Fallback only makes sense when the caller did not ask for JSON: with
+    // expect_json the payload must be positively identified or dropped.
+    if (!expect_json && fallback_valid) {
+        if (read_proc_mem(pid, fallback_base + layouts[fallback_k][1], out, fallback_len) != 0) return -1;
+        if (g_jni_array_len_off != (int)layouts[fallback_k][0]) {
+            g_jni_array_len_off = (int)layouts[fallback_k][0];
+            g_jni_array_data_off = (int)layouts[fallback_k][1];
+            fprintf(stderr, "INFO:jni_array_layout len_off=%u data_off=%u (fallback)\n",
+                    layouts[fallback_k][0], layouts[fallback_k][1]);
+            fflush(stderr);
+        }
+        return (int)fallback_len;
+    }
+    return -1;
+}
+
+static void write_jni_result_frame(
+    uint32_t pid,
+    uint32_t uid,
+    uint32_t method_id,
+    const uint8_t *data,
+    uint32_t len
+) {
+    wire_tls_hdr wh;
+    memset(&wh, 0, sizeof(wh));
+    wh.magic = 0x45554141U;
+    wh.pid = pid;
+    wh.uid = uid;
+    wh.direction = 9U;
+    wh.length = len;
+    wh.ssl_ptr = (uint64_t)method_id;
+    fwrite(&wh, 1, sizeof(wh), stdout);
+    if (len > 0 && data) fwrite(data, 1, len, stdout);
+    fflush(stdout);
+}
+
+// Decoders fill the result array with several SetByteArrayRegion() calls, so a
+// single probe event can carry only a slice of the payload. Chunks are keyed by
+// the array handle and stitched back together here.
+#define MAX_REGION_ASSEMBLY 8
+#define REGION_ASSEMBLY_MAX_BYTES (1024U * 1024U)
+#define REGION_ASSEMBLY_TTL_MS 3000
+
+typedef struct {
+    int used;
+    uint32_t pid;
+    uint64_t key;
+    uint32_t total;
+    uint32_t filled;
+    int64_t ts_ms;
+    uint8_t *buf;
+} region_assembly;
+
+static region_assembly g_region_asm[MAX_REGION_ASSEMBLY];
+
+static int64_t region_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void region_asm_release(region_assembly *a) {
+    if (!a) return;
+    if (a->buf) free(a->buf);
+    memset(a, 0, sizeof(*a));
+}
+
+static region_assembly *region_asm_get(uint32_t pid, uint64_t key, uint32_t total) {
+    region_assembly *reuse = NULL;
+    int64_t now = region_now_ms();
+    for (int i = 0; i < MAX_REGION_ASSEMBLY; i++) {
+        region_assembly *a = &g_region_asm[i];
+        if (!a->used) {
+            if (!reuse) reuse = a;
+            continue;
+        }
+        if (now - a->ts_ms > REGION_ASSEMBLY_TTL_MS) {
+            region_asm_release(a);
+            if (!reuse) reuse = a;
+            continue;
+        }
+        if (a->pid == pid && a->key == key) {
+            a->ts_ms = now;
+            return a;
+        }
+    }
+    if (!reuse) reuse = &g_region_asm[0];
+    region_asm_release(reuse);
+
+    reuse->buf = (uint8_t *)malloc(total);
+    if (!reuse->buf) return NULL;
+    reuse->used = 1;
+    reuse->pid = pid;
+    reuse->key = key;
+    reuse->total = total;
+    reuse->filled = 0;
+    reuse->ts_ms = now;
+    return reuse;
+}
+
+static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra) {
+    if (bh->direction == 8U && bh->length >= 8U) {
+        uint32_t count = 0;
+        memcpy(&count, extra + 4, sizeof(count));
+        jni_handle_register(bh->pid, bh->ssl_ptr, count);
+        return;
+    }
+
+    if (bh->direction == 11U && bh->length >= 24U) {
+        // extra layout: method_id | start | chunk length | pad | array handle
+        uint32_t method_id = 0;
+        uint32_t start = 0;
+        uint32_t chunk = 0;
+        uint64_t key = 0;
+        memcpy(&method_id, extra, sizeof(method_id));
+        memcpy(&start, extra + 4, sizeof(start));
+        memcpy(&chunk, extra + 8, sizeof(chunk));
+        memcpy(&key, extra + 16, sizeof(key));
+        if (method_id >= (uint32_t)g_jni_target_count) return;
+
+        const jni_target *t = &g_jni_targets[method_id];
+        if (chunk == 0 || chunk > JNI_ARRAY_BYTES_LIMIT || key == 0) return;
+
+        // The array object is still alive *during* SetByteArrayRegion, so its length is
+        // readable here even though the handle is dead once the decoder returns.
+        uint32_t total = 0;
+        uint64_t obj = key & ~0x3ULL;
+        if (read_proc_mem(bh->pid, obj + 8, &total, sizeof(total)) != 0 ||
+            total == 0 || total > JNI_ARRAY_BYTES_LIMIT || total < start + chunk) {
+            total = start + chunk;
+        }
+
+        if (t->max_bytes > 0 && total > (uint32_t)t->max_bytes) return;
+
+        if (total > REGION_ASSEMBLY_MAX_BYTES) {
+            // Too big to stitch; only a single-call payload can still be trusted.
+            if (start != 0 || chunk != total) return;
+        }
+
+        region_assembly *a = region_asm_get(bh->pid, key, total);
+        if (!a) return;
+        if ((uint64_t)start + chunk > a->total) {
+            region_asm_release(a);
+            return;
+        }
+        if (read_proc_mem(bh->pid, bh->ssl_ptr, a->buf + start, chunk) != 0) {
+            region_asm_release(a);
+            return;
+        }
+        if (start + chunk > a->filled) a->filled = start + chunk;
+        if (a->filled < a->total) return;
+
+        // Only a payload that starts at offset 0 can be shape-checked here, and only
+        // such a payload is worth handing over: a mid-array slice is never valid JSON.
+        int shaped = 1;
+        if (t->expect_json) {
+            shaped = jni_json_head_ok(a->buf, a->total);
+            if (!shaped && t->magic_len > 0 && a->total >= (uint32_t)t->magic_len &&
+                memcmp(a->buf, t->magic, (size_t)t->magic_len) == 0) {
+                shaped = 1;
+            }
+        }
+
+        static int region_seen = 0;
+        if (region_seen < 10) {
+            fprintf(stderr, "INFO:jni_region pid=%u mid=%u total=%u start=%u chunk=%u head=%02x%02x%02x%02x\n",
+                    bh->pid, method_id, a->total, start, chunk,
+                    a->buf[0], a->total > 1 ? a->buf[1] : 0,
+                    a->total > 2 ? a->buf[2] : 0, a->total > 3 ? a->buf[3] : 0);
+            fflush(stderr);
+            region_seen++;
+        }
+
+        if (shaped) {
+            write_jni_result_frame(bh->pid, bh->uid, method_id, a->buf, a->total);
+        }
+        region_asm_release(a);
+        return;
+    }
+
+    if (bh->direction == 9U && bh->length >= 8U) {
+        uint32_t method_id = 0;
+        memcpy(&method_id, extra, sizeof(method_id));
+        if (method_id >= (uint32_t)g_jni_target_count) return;
+
+        static uint8_t *jni_buf = NULL;
+        if (!jni_buf) {
+            jni_buf = (uint8_t *)malloc(JNI_ARRAY_BYTES_LIMIT);
+            if (!jni_buf) return;
+        }
+
+        const jni_target *t = &g_jni_targets[method_id];
+        int n = read_java_byte_array(bh->pid, bh->ssl_ptr, t->max_bytes, t->expect_json,
+                                     t->magic, t->magic_len,
+                                     jni_buf, JNI_ARRAY_BYTES_LIMIT);
+        // Best-effort only: see probe_array_region() for why the returned handle is
+        // usually already poisoned. Kept because apps that return global refs still work.
+        static int ret_seen = 0;
+        if (ret_seen < 5) {
+            fprintf(stderr, "INFO:jni_return_read pid=%u mid=%u n=%d\n", bh->pid, method_id, n);
+            fflush(stderr);
+            ret_seen++;
+        }
+        if (n <= 0) return;
+        write_jni_result_frame(bh->pid, bh->uid, method_id, jni_buf, (uint32_t)n);
+    }
+}
+
+static uint32_t find_pid_by_uid(uint32_t uid) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+    uint32_t found = 0;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        char status_path[128];
+        snprintf(status_path, sizeof(status_path), "/proc/%s/status", de->d_name);
+        FILE *sf = fopen(status_path, "r");
+        if (!sf) continue;
+        char line[512];
+        uint32_t puid = 0;
+        int got = 0;
+        while (fgets(line, sizeof(line), sf)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                if (sscanf(line + 4, "%u", &puid) == 1) got = 1;
+                break;
+            }
+        }
+        fclose(sf);
+        if (!got || puid != uid) continue;
+        found = (uint32_t)strtoul(de->d_name, NULL, 10);
+        if (found) break;
+    }
+    closedir(proc);
+    return found;
+}
+
+static int g_jni_reg_fds[2][128];
+static int g_jni_reg_fd_count[2] = {0, 0};
+static int g_jni_region_fds[128];
+static int g_jni_region_fd_count = 0;
+
+static void attach_jni_register_probes(bpf_bundle *bundle, uint32_t target_uid, int num_cpus) {
+    if (!g_jni_hook_enabled || g_jni_rule_count == 0) return;
+    if (bundle->prog_reg_natives_fd < 0 || bundle->prog_reg_natives_exit_fd < 0) {
+        fprintf(stderr, "WARN:jni_register_prog_missing\n");
+        return;
+    }
+
+    uint32_t pid = find_pid_by_uid(target_uid);
+    char libart[256];
+    libart[0] = '\0';
+    if (pid) {
+        find_lib_mapping(pid, "libart.so", libart, sizeof(libart), NULL);
+    }
+    if (!libart[0]) {
+        const char *fallbacks[] = {
+            "/apex/com.android.art/lib64/libart.so",
+            "/system/lib64/libart.so"
+        };
+        for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
+            if (file_exists_nonempty(fallbacks[i])) {
+                snprintf(libart, sizeof(libart), "%s", fallbacks[i]);
+                break;
+            }
+        }
+    }
+    if (!libart[0]) {
+        fprintf(stderr, "WARN:jni_libart_not_found\n");
+        return;
+    }
+
+    uint64_t offsets[2] = {0, 0};
+    int off_count = 0;
+    if (resolve_symtab_symbol_offset(libart, "3JNIILb0EE15RegisterNativesE", &offsets[off_count]) == 0) {
+        off_count++;
+    }
+    if (resolve_symtab_symbol_offset(libart, "3JNIILb1EE15RegisterNativesE", &offsets[off_count]) == 0) {
+        off_count++;
+    }
+    if (off_count == 0) {
+        fprintf(stderr, "WARN:jni_register_natives_sym_not_found:%s\n", libart);
+        return;
+    }
+
+    snprintf(g_jni_libart_path, sizeof(g_jni_libart_path), "%s", libart);
+
+    int attached = 0;
+    for (int i = 0; i < off_count; i++) {
+        char suf_e[32];
+        char suf_x[32];
+        snprintf(suf_e, sizeof(suf_e), "jnireg_%de", i);
+        snprintf(suf_x, sizeof(suf_x), "jnireg_%dx", i);
+
+        if (attach_uprobe_pmu_or_tracefs(libart, offsets[i], 0, suf_e,
+                                         bundle->prog_reg_natives_fd, num_cpus,
+                                         g_jni_reg_fds[i], &g_jni_reg_fd_count[i]) != 0) {
+            fprintf(stderr, "WARN:jni_reg_enter_attach_failed:idx=%d off=0x%llx\n",
+                    i, (unsigned long long)offsets[i]);
+            continue;
+        }
+        if (attach_uprobe_pmu_or_tracefs(libart, offsets[i], 1, suf_x,
+                                         bundle->prog_reg_natives_exit_fd, num_cpus,
+                                         g_jni_reg_fds[i], &g_jni_reg_fd_count[i]) != 0) {
+            fprintf(stderr, "WARN:jni_reg_exit_attach_failed:idx=%d off=0x%llx\n",
+                    i, (unsigned long long)offsets[i]);
+            continue;
+        }
+        attached++;
+        fprintf(stderr, "INFO:jni_register_probe lib=%s off=0x%llx variant=%d\n",
+                libart, (unsigned long long)offsets[i], i);
+        fflush(stderr);
+    }
+
+    if (attached == 0) {
+        fprintf(stderr, "WARN:jni_register_probe_all_failed\n");
+    }
+
+    // Second observation point: the plaintext buffer handed to SetByteArrayRegion.
+    // See probe_array_region() for why the returned handle cannot be used instead.
+    if (bundle->prog_array_region_fd >= 0) {
+        uint64_t region_off = 0;
+        if (resolve_symtab_symbol_offset(libart, "3JNIILb0EE18SetByteArrayRegionE", &region_off) == 0) {
+            if (attach_uprobe_pmu_or_tracefs(libart, region_off, 0, "jni_region",
+                                             bundle->prog_array_region_fd, num_cpus,
+                                             g_jni_region_fds, &g_jni_region_fd_count) == 0) {
+                fprintf(stderr, "INFO:jni_region_probe lib=%s off=0x%llx\n",
+                        libart, (unsigned long long)region_off);
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "WARN:jni_region_attach_failed off=0x%llx\n",
+                        (unsigned long long)region_off);
+            }
+        } else {
+            fprintf(stderr, "WARN:jni_region_sym_not_found:%s\n", libart);
+        }
+    }
 }
 
 static int is_system_lib_path(const char *path) {
@@ -2221,6 +3088,55 @@ int main(int argc, char **argv) {
                 if (iob_o > 0 && iob_o <= 256U) g_cronet_abi.iobuf_data_offset = iob_o;
                 g_cronet_abi.string_layout_mode = mode;
             }
+        } else if (strcmp(argv[i], "--jni-hook") == 0 && i + 1 < argc) {
+            const char *spec = argv[++i];
+            if (g_jni_rule_count < MAX_JNI_RULES) {
+                char buf[1024];
+                snprintf(buf, sizeof(buf), "%s", spec);
+                char *colon = strchr(buf, ':');
+                if (colon) {
+                    *colon = '\0';
+                    jni_hook_rule *r = &g_jni_rules[g_jni_rule_count];
+                    memset(r, 0, sizeof(*r));
+                    snprintf(r->lib_substr, sizeof(r->lib_substr), "%s", buf);
+                    r->expect_json = g_jni_default_expect_json;
+                    r->max_bytes = g_jni_default_max_bytes;
+
+                    char *p = colon + 1;
+                    while (p && *p && r->method_count < MAX_JNI_METHODS) {
+                        char *comma = strchr(p, ',');
+                        if (comma) *comma = '\0';
+                        if (*p) {
+                            snprintf(r->methods[r->method_count],
+                                     sizeof(r->methods[0]), "%s", p);
+                            r->method_count++;
+                        }
+                        p = comma ? comma + 1 : NULL;
+                    }
+                    if (r->lib_substr[0] && r->method_count > 0) {
+                        g_jni_rule_count++;
+                        g_jni_hook_enabled = 1;
+                    }
+                }
+            }
+        } else if (strcmp(argv[i], "--jni-no-json") == 0) {
+            g_jni_default_expect_json = 0;
+        } else if (strcmp(argv[i], "--jni-max-bytes") == 0 && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 10);
+            if (v > 0 && v <= (long)JNI_ARRAY_BYTES_LIMIT) {
+                g_jni_default_max_bytes = (int)v;
+            }
+        } else if (strcmp(argv[i], "--jni-magic") == 0 && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (g_jni_rule_count > 0 && m[0]) {
+                jni_hook_rule *r = &g_jni_rules[g_jni_rule_count - 1];
+                size_t ml = strlen(m);
+                if (ml < sizeof(r->magic)) {
+                    memcpy(r->magic, m, ml);
+                    r->magic[ml] = '\0';
+                    r->magic_len = (int)ml;
+                }
+            }
         }
     }
 
@@ -2346,6 +3262,10 @@ int main(int argc, char **argv) {
     pfds[num_cpus].fd = STDIN_FILENO;
     pfds[num_cpus].events = POLLHUP | POLLERR;
 
+    g_jni_bundle = &bundle;
+    g_jni_num_cpus = (num_cpus > 128) ? 128 : num_cpus;
+    attach_jni_register_probes(&bundle, target_uid, g_jni_num_cpus);
+
     if (explicit_lib && explicit_lib[0]) {
         try_attach_library(explicit_lib, &bundle, num_cpus);
     }
@@ -2353,13 +3273,15 @@ int main(int argc, char **argv) {
     scan_and_attach_proc_maps(target_uid, &bundle, num_cpus);
     scan_and_attach_defaults(&bundle, num_cpus);
 
-    if (g_attached_lib_count == 0) {
+    if (g_attached_lib_count == 0 && !g_jni_hook_enabled) {
         fprintf(stderr, "ERR:libssl_not_found:%s\n", g_last_attach_err[0] ? g_last_attach_err : "none");
         return 3;
     }
 
     // Signal readiness to Java parent
-    fprintf(stderr, "READY:%s\n", g_attached_libs[0].path);
+    fprintf(stderr, "READY:%s\n",
+            g_attached_lib_count > 0 ? g_attached_libs[0].path
+                                     : (g_jni_hook_enabled ? "jni-bridge" : "none"));
     fflush(stderr);
 
     g_batch_payload_pool = (uint8_t *)malloc(g_batch_payload_pool_cap);
