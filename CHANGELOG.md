@@ -4,6 +4,101 @@
 
 ---
 
+## [0.4.0] - 2026-11-19
+
+### 🔓 安全图层抓取：FLAG_SECURE 页面也能出图 (Secure Layer Capture)
+
+- **新增第五通道 `SECURE_PRIVILEGED`**：Android 17 把「是否放行安全内容」从隐式屏蔽改成了
+  显式策略 —— `android.window.ScreenCapture.capture()` 接受 `SECURE_CONTENT_POLICY_CAPTURE /
+  REDACT / THROW_EXCEPTION`。系统默认 `REDACT`，也就是 `screencap` 拿到的那片黑；
+  显式要求 `CAPTURE` 就能拿到真实像素。
+  **不需要 Root**，UID 2000 守护进程直接可用，不改系统文件、不装 Magisk 模块、不 hook
+  SurfaceFlinger、不需要 LSPosed。
+- **不是新链路，是 `SHELL_PRIVILEGED` 的升级分支**：`capturePng` 内部把「抓到纯黑」与
+  「根本没抓到」拆成两种结果（`Attempt.Blank` / `Attempt.Failed`），只有前者才升级到
+  secure 通道。普通页面零额外开销；纯黑也不再去回退 `su`——`su` 跑的仍是同一份 `screencap`，
+  secure 语义在 SurfaceFlinger 层，提权不改变结果。
+- **新文件 `SecureCapture.kt`**，三个实现坑都写在类注释里：
+  - `compileSdk = 36` 而目标类是 API 37，**整套调用只能反射**，这反而保证了低版本安全退化；
+  - 裸 `app_process` 里 `ApplicationSharedMemory` 未初始化，`capture()` 会在
+    `WindowManagerGlobal.getWindowManagerService()` 抛 `IllegalStateException`。
+    解法是反射往 `sWindowManagerService` 私有静态字段塞一个真 WMS 代理；
+  - 回调靠 Looper 投递，调用线程若无 Looper 且阻塞等待，进程会被看门狗 SIGKILL
+    （只剩一句 `Killed`，没有堆栈）。改用专用 `HandlerThread` 承载调用，调用方在外部等 latch。
+- **修正纯黑帧判定阈值（`BLANK_PNG_BYTES` 12KB → 200KB）**：
+  带状态栏的 FLAG_SECURE 页面实测仍有 **35441 字节**，旧阈值让它直接跳过检测，
+  上层拿到的是一张「看似成功」的黑图 —— 这是最难排查的一类失败。
+  现在按 200KB 放行上限 + 降采样抽检（约 860 点，1~2ms），复杂页面（实测 148KB~3MB）不误伤。
+- **长截图自动粘住 secure 通道**：某一帧确认走 secure 后，后续帧直接沿用
+  （`ShellFrameSource.secureSticky`），避免每帧先跑一次注定要丢掉的 `screencap`。
+- **能力快照扩展 `secureCaptureAvailable`**：`ScreenCaptureCapability` 新增字段与 Bundle 键，
+  并补 `canCaptureAnyContent`（普通页面 + 安全页面都能抓）。
+- **诊断项 `secure_layer_capture`**：`AAUDiagnosticSuite` 里显式回答「这台机器能不能抓
+  FLAG_SECURE 页面」，不可用时提示改走无障碍节点树。
+- **自检入口 `CaptureSelfCheck`**：`app_process ... com.agent.use.server.CaptureSelfCheck
+  <outDir> [AUTO|SHELL|ROOT|SECURE|NOSECURE]`，绕开 Provider 握手单独验证截屏链路。
+- **真机实测（PLK110 / Android 17 / ColorOS，FLAG_SECURE 靶子页）**：
+
+| 路径 | 结果 | 字节 | 耗时 |
+|---|---|---|---|
+| `AUTO`（生产路径） | 自动升级，mode=secure | 150407 | 557ms |
+| `SECURE`（强制） | mode=secure | 146488 | 422ms |
+| `NOSECURE`（禁止升级） | 失败，reason=纯黑（FLAG_SECURE） | — | 503ms |
+| 普通桌面 `AUTO` | mode=shell，未触发升级 | 3113016 | 1909ms |
+
+- **未突破的边界**：DRM protected buffer（Widevine L1 等）在 DPU 安全通路里解密，
+  非 secure 输出拿不到明文；抓到仍是纯黑时按失败返回，不谎报成功。
+
+---
+
+## [0.3.0] - 2026-11-18
+
+### 📸 免授权截屏与滚动长截图 (Privileged Screen Capture)
+
+- **`screencap` 特权通道**：守护进程本身运行在 Shell (UID 2000)，`screencap -p -d <displayId>` 对它是免授权的，
+  因此抓主屏不再需要 `MediaProjection` 的「开始录制」弹窗，也不再要求用户开启无障碍；
+  个别 OEM 把 `screencap` 限死在 UID 0 时，按 `AUTO` 策略经 `su -c` 自动重试一次。
+- **多通道降级调度 `ScreenCaptureChannel`**：
+  `VIRTUAL_DISPLAY`（ImageReader 直读） → `SHELL_PRIVILEGED` → `ROOT_PRIVILEGED` → `ACCESSIBILITY`，
+  逐条尝试并记录 `CaptureAttempt`，调用方拿到的不只是图，还有「实际走了哪条通道」。
+- **滚动拼接长截图 `LongScreenshotRunner`**：
+  - **行特征 `RowSignature`**：每行横向等分 8 段取平均灰度，打包进一个 `Long`；
+    刻意降维，因为长截图需要的是**可度量的距离**，而不是高熵哈希（见下方「真机纠偏」）；
+  - **`OverlapFinder` 锚点投票**：从新帧挑高纹理行当锚点，各自在旧帧找最像的位置，
+    对 `delta = j - i` 投票，票数最高的几个再用整段加权距离复核；
+  - **两段式等待稳定**：`input swipe` 后有惯性滑行与 overscroll 回弹，
+    必须等到「画面已变且连续两帧相似」才取帧，否则会抓到反向位移；
+  - 顶部固定标题栏/底部固定栏可排除（`topInsetRatio` / `bottomInsetRatio`）；
+  - 终止原因显式化：`REACHED_END` / `NO_OVERLAP` / `MAX_HEIGHT` / `MAX_SCROLLS` / `NO_PROGRESS` / `CAPTURE_FAILED`；
+  - 倍增扩容画布，避免为一次两屏截图预分配 12000 行（约 51 MB）。
+- **真机纠偏（PLK110 / Android 17），三处算法与参数被推翻重写**：
+  - `screencap -d` 的 id 命名空间变了：只认 **PhysicalDisplayId**（64 位，如 `4630946903293830803`），
+    传逻辑 id `0` 直接报 `Display Id '0' is not valid`。引擎改为「主屏不传 `-d`、非主屏解析
+    `dumpsys SurfaceFlinger --display-id` 换算」，且解析不到时**明确失败**而不是退化抓主屏；
+  - 虚拟屏没有物理 id，`screencap` 抓不到——这条通道只服务物理屏，虚拟屏仍走 ImageReader；
+  - KMP 精确匹配在真机上归零（一次滚动仅约 97.8% 行逐像素相同），「粗扫 + 局部精修」同样失效
+    （真实位移不落在步长上时谷底只有一两行宽），最终改为锚点投票；
+  - 滚动默认值从 58% 屏高/280ms 收到 **30% 屏高/900ms**：`input swipe` 的 fling 惯性会把实际位移
+    推到手势距离的 1.5~1.8 倍，重叠不足时锚点投票必然失效；
+  - 首帧与后续帧可能不同源：可折叠大标题在第一次滚动时收起，内容原点整体上移一两百像素，
+    此时以稳定后的帧为新起点重启拼接（`LongScreenshotStitcher.reset()`）。
+- **端到端实测**：设置页 4 帧拼成 1272×6147，24 个条目完整、无重复、无跳过，耗时约 13.6s。
+- **Binder 交付不走事务缓冲区**：服务端把 PNG 写入私有目录后 **打开 fd 并立即 unlink**，
+  客户端从只读 fd 流式读取。既绕开 1 MB 的 `TransactionTooLargeException`，
+  也不会把用户屏幕内容留在设备上（`/data/local/tmp` 归 shell 所有，传路径给应用必然 EACCES）。
+- **新增 3 个 AIDL 事务**（55~57）：`capturePng` / `captureLongPng` / `captureCapability`，
+  并新增 `LongScreenshotOptions` Parcelable 契约与 `ScreenCaptureCapability` 能力快照。
+- **安全图层显式化**：`FLAG_SECURE` 页面 `screencap` 会返回纯黑而非失败，
+  引擎对「压缩后异常小」的 PNG 做一次抽样判定，把黑屏作为失败上报，而不是让上层拿到一张「看似成功」的黑图。
+- **无障碍兜底长截图**：`AgentAccessibilityService.captureLongScreenshot` 复用同一套拼接算法，
+  默认参数针对 `takeScreenshot` 的 1 秒系统冷却调整为 1.1 秒稳定等待，避免每帧双倍等待。
+- **单测覆盖**：`LongScreenshotCaptureTest` 以合成行特征锁定 13 个边界（正常滚动、带噪声匹配、
+  噪声超限拒绝、到底、整屏换掉、阈值拒绝、固定标题栏、底栏、纯色页面、高度不一致、参数裁剪、
+  相似度判定）。合成数据用 splitmix64 生成——线性映射与 LCG 都会让「无关位移」只产生固定小差值，
+  把测试变成测生成器的漏洞。
+
+---
+
 ## [0.2.0] - 2026-11-12
 
 ### 🚀 统一模块命名与包名重构 (AAU Modernization)

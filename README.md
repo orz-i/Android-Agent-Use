@@ -77,8 +77,8 @@ flowchart TD
     end
 
     subgraph CommonLayer["aau-common (协议与契约层)"]
-        AIDL["IAgentShell.aidl (49 个高内聚原子原语)"]
-        Models["DisplayConfig / DisplayGeometry / LaunchResult / AudioMode"]
+        AIDL["IAgentShell.aidl (57 个高内聚原子原语)"]
+        Models["DisplayConfig / DisplayGeometry / LaunchResult / AudioMode / LongScreenshotOptions"]
     end
 
     subgraph DaemonProcess["特权守护进程 (Shell UID 2000)"]
@@ -88,12 +88,14 @@ flowchart TD
         Audio["AudioMuteLedger (AppOps 持久化账本与自愈)"]
         Input["InputInjector (InputManagerGlobal / InputManager 反射)"]
         TaskManager["TaskManagerFacade (任务常驻托管 / 来源解析 / 任务调度)"]
+        Capture["ScreenCapture (screencap 免授权抓帧 / 长截图拼接)"]
 
         Server --> VD
         Server --> Rotation
         Server --> Audio
         Server --> Input
         Server --> TaskManager
+        Server --> Capture
     end
 
     Display -.->|Binder IPC| AIDL
@@ -202,6 +204,129 @@ val finishResult = display.finish(
     closePackages = emptyList()
 )
 ```
+
+### 5. 免授权截屏与长截图
+
+AAU 的守护进程运行在 Shell (UID 2000)，因此 `screencap` 对它天然免授权——
+**不需要 MediaProjection 的「开始录制」弹窗，也不需要用户开启无障碍**：
+
+```kotlin
+// 1. 先看这台设备有哪些通道可用（screencap 路径 / su 提权 / input -d 滚动）
+val capability = display.captureCapability()
+Log.i(TAG, capability.summary)   // uid=2000 screencap=/system/bin/screencap(ok) root=false ...
+
+// 2. 抓「当下这一刻」的一帧：主屏或任意 display 均可
+val png: ByteArray? = display.capturePrivilegedPng()          // 本虚拟屏
+val mainPng: ByteArray? = PrivilegedCapture.capturePng(shell, displayId = 0)
+
+// 3. 滚动拼接长截图（同步调用，务必放在工作线程）
+val long = display.captureLongScreenshot(
+    LongScreenshotOptions.withStickyHeader()   // 排除顶部固定标题栏
+)
+// long.bitmap 为成品位图，long.meta 里带 frames / scrolls / stop / mode
+```
+
+五条通道由 `ScreenCaptureChannel` 按序裁决，任意一条失败自动降级：
+
+| 通道 | 权限代价 | 能力上限 |
+|---|---|---|
+| `VIRTUAL_DISPLAY` | 无 | 仅自有虚拟屏，取 ImageReader 最后一帧 |
+| `SHELL_PRIVILEGED` | 无（守护进程已是 UID 2000） | **任意物理屏，含主屏**，长截图主力 |
+| `ROOT_PRIVILEGED` | 需已 Root | Shell 被 OEM 拦截时的兜底，仍抓不到 `FLAG_SECURE` |
+| `SECURE_PRIVILEGED` | 无（UID 2000 即可，**不需要 Root**） | **能抓 `FLAG_SECURE` 页面**，Android 17+ |
+| `ACCESSIBILITY` | 用户手动开无障碍 | 1 秒系统冷却，仅作最后兜底 |
+
+`SECURE_PRIVILEGED` 不是另一条独立链路，而是 `SHELL_PRIVILEGED` 的升级分支：
+`screencap` 抓到纯黑帧时才切过去，普通页面不产生任何额外开销。
+
+#### FLAG_SECURE 页面为什么能抓到
+
+前提是 Android 17 把「要不要放行安全内容」从**隐式屏蔽**改成了**显式策略**：
+
+```java
+ScreenCaptureParams params = new ScreenCaptureParams.Builder(displayId)
+        .setSecureContentPolicy(SECURE_CONTENT_POLICY_CAPTURE)   // 默认是 REDACT
+        .setProtectedContentPolicy(PROTECTED_CONTENT_POLICY_CAPTURE)
+        .build();
+ScreenCapture.capture(params, executor, receiver);   // 异步，结果里是 HardwareBuffer
+```
+
+系统默认走 `REDACT`，也就是 `screencap` 拿到的那片黑。真机上做过对照：
+`REDACT` 与 `screencap` 的 PNG **字节数完全相同**（35441），
+而 `CAPTURE` 是 148068 且能读出实时时间戳——证明是策略参数在起作用，不是碰巧抓到了别的层。
+
+三个必须处理的实现细节（`SecureCapture.kt` 里都有注释）：
+
+1. `compileSdk = 36` 而 `android.window.ScreenCapture` 是 API 37，**整套调用只能反射**，
+   这反而保证了低版本设备上安全退化；
+2. 裸 `app_process` 进程里 `ApplicationSharedMemory` 未初始化，`capture()` 会在
+   `WindowManagerGlobal.getWindowManagerService()` 抛 `IllegalStateException`。
+   解法是反射往 `sWindowManagerService` 私有静态字段塞一个真 WMS 代理；
+3. 回调靠 Looper 投递。调用线程若无 Looper 且阻塞等待，进程会被看门狗 SIGKILL
+   （只剩一句 `Killed`，没有任何堆栈）。`SecureCapture` 用专用 `HandlerThread` 承载调用。
+
+**边界**：Widevine L1 那类 DRM protected buffer 在 DPU 的安全通路里解密，
+非 secure 输出拿不到明文，本通道同样无效。抓到的仍是纯黑时按失败返回，不谎报成功。
+
+#### display id 有两套命名空间，别混用
+
+真机实测（PLK110 / Android 17）踩到的坑，写在这里省得再踩一次：
+
+| 命令 | `-d` 需要的 id | 举例 | 拿不到会怎样 |
+|---|---|---|---|
+| `screencap -d` | **PhysicalDisplayId**（64 位） | `4630946903293830803` | 传 `0` 报 `Display Id '0' is not valid` |
+| `input -d` | 逻辑 display id（小整数） | `0` | 静默无效 |
+
+物理 id 从 `dumpsys SurfaceFlinger --display-id` 解析（`Display <physical> (HWC display <n>)`），
+引擎内部做了缓存与换算。两条实用结论：
+
+- **主屏一律不传 `-d`**：`screencap` 默认就抓默认物理屏，这是跨版本最稳的路径；
+- **虚拟屏抓不到**：它没有物理端口，不出现在那份列表里。硬传逻辑 id 只会失败，所以引擎让
+  `capturePng` 在解析不到物理 id 时**明确失败**，绝不退化成「抓主屏返回给你」。虚拟屏仍然走
+  `VIRTUAL_DISPLAY`（ImageReader）。
+
+#### 长截图不是「录屏抽帧」，也不是 KMP
+
+真实流程是**滚动 → 等高稳定 → 锚点投票求位移 → 只拼增量行**。
+
+算法经过两次真机纠正，值得记下来：
+
+1. **KMP 精确匹配不可用**。实测一次滚动的两帧只有约 97.8% 的行逐像素相同，其余因抗锯齿、
+   亚像素位移、OLED 调光差一两个色阶；精确匹配要求 100% 连续相等，直接归零。
+2. **「粗扫 + 局部精修」也不可用**。真实位移不落在粗扫步长上时，相邻候选点的分数全是噪声级，
+   谷底只有一两行宽，粗扫看不见它。
+3. **锚点投票才对**。从新帧挑高纹理行当锚点，各自在旧帧里找最像的位置，对 `delta = j - i`
+   投票，票数最高的几个再用整段加权距离复核。单行即可定位，不依赖连续匹配。
+
+配套的三个工程细节：
+
+- **纯色行必须降权**：整屏黑底会让任意位移都拿到接近 0 的分数，不加权就会把「没滚动」当成「完全重叠」；
+- **滚动量要留足重叠**：`input swipe` 的 fling 惯性会把实际位移推到手势距离的 1.5~1.8 倍
+  （1275px 的手势滚了 2273px），默认值压到 30% 屏高 + 900ms 慢速手势；
+- **首帧可能要丢弃**：可折叠大标题在第一次滚动时收起，内容原点整体上移一两百像素，两帧不再是
+  纯垂直平移关系。此时以稳定后的帧为新起点重启拼接（`LongScreenshotStitcher.reset()`），
+  比硬拼出一张错位图正确。
+
+终止原因是分开的：滚到底（`REACHED_END`）、页面跳转（`NO_OVERLAP`）、撞高度上限（`MAX_HEIGHT`）、
+手势无效（`NO_PROGRESS`），原样带回客户端。
+
+真机实测（设置页）：4 帧拼成 1272×6147，从「飞行模式」到「帮助与反馈」共 24 个条目完整无重复、
+无跳过，耗时约 13.6s。样本见 [`docs/capture/longshot-settings-6147px.png`](docs/capture/longshot-settings-6147px.png)，
+同目录下还有滚动前后的单帧对照。
+
+设备侧自检（与引擎内部调用等价）：
+
+```bash
+adb exec-out screencap -p > main.png                       # 免授权抓主屏，等价于 capturePng(0)
+adb shell dumpsys SurfaceFlinger --display-id              # 看物理 display id（screencap -d 用这个）
+adb shell input 2>&1 | head -3                             # 看 usage 里是否有 -d，长截图滚动依赖它
+adb shell su -c id -u                                      # 输出 0 表示 Root 通道可用
+```
+
+两个**能力边界**需要提前知道：`FLAG_SECURE` 页面在 Android 17+ 已能经 `SECURE_PRIVILEGED`
+通道抓到（见上），剩余的硬边界是 DRM protected buffer——Widevine L1 那类内容在 DPU 安全通路里
+解密，任何非 secure 输出都拿不到明文，此时引擎按失败返回原因，而不是给上层一张看似成功的黑图；
+`input -d` 驱动的是真实手势，对主屏做长截图时用户会看到页面在滚动。
 
 ---
 
