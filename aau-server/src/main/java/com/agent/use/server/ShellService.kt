@@ -5,11 +5,15 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Bundle
 import android.os.Parcel
+import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.view.Surface
 import com.agent.use.common.DisplayConfig
 import com.agent.use.common.IAgentCustodyListener
 import com.agent.use.common.IAgentShell
+import com.agent.use.common.capture.CaptureDelivery
+import com.agent.use.common.capture.CaptureFd
+import com.agent.use.common.capture.LongScreenshotOptions
 import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.shell.AgentShellEngine
 import com.agent.use.server.network.ebpf.EbpfCaptureEngine
@@ -21,7 +25,7 @@ import java.io.File
 @SuppressLint("PrivateApi")
 class ShellService(
     private val allowedUid: Int,
-    stateDir: File = File("/data/local/tmp"),
+    private val stateDir: File = File("/data/local/tmp"),
 ) : IAgentShell.Stub() {
 
     private val engine = AgentShellEngine(
@@ -203,4 +207,34 @@ class ShellService(
 
     override fun getNetworkCapture(): INetworkCapture =
         EbpfCaptureEngine.getInstance(engine.context)
+
+    // ==========================================
+    // 12. 特权截屏与长截图 (Privileged Screen Capture)
+    // ==========================================
+
+    /**
+     * 免授权抓取一帧；图片走「私有文件 + 只读 fd + 立即 unlink」，不占用 Binder 事务缓冲区。
+     */
+    override fun capturePng(displayId: Int, timeoutMs: Int, privilege: Int): ParcelFileDescriptor? {
+        val bytes = engine.capturePng(displayId, timeoutMs, privilege) ?: return null
+        return CaptureFd.publish(stateDir, bytes)
+    }
+
+    /**
+     * 滚动拼接长截图。
+     *
+     * 注意：本调用在整个滚动周期内同步占用一个 Binder 线程（默认最多 12 屏，约 5~15 秒），
+     * 客户端必须在工作线程调用，不要在 UI 线程直接调。
+     */
+    override fun captureLongPng(displayId: Int, options: LongScreenshotOptions): Bundle {
+        val output = engine.captureLong(displayId, options)
+        return CaptureDelivery.longResult(
+            output = output,
+            stateDir = stateDir,
+            mode = engine.screenCapture.lastMode,
+            failure = engine.screenCapture.failure,
+        )
+    }
+
+    override fun captureCapability(): Bundle = engine.captureCapability(false)
 }

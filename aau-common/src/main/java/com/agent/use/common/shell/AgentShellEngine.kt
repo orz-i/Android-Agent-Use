@@ -35,6 +35,11 @@ import com.agent.use.common.AppAudioKey
 import com.agent.use.common.DisplayConfig
 import com.agent.use.common.IAgentCustodyListener
 import com.agent.use.common.LaunchOrigin
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.LongScreenshotOutput
+import com.agent.use.common.capture.LongScreenshotProgress
+import com.agent.use.common.capture.ScreenCaptureCapability
+import com.agent.use.common.capture.ShellScreencap
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.reflect.Method
@@ -586,8 +591,17 @@ open class AgentShellEngine(
 
     private fun inUseOnMainScreen(packageName: String, userId: Int? = null): Boolean {
         val visibleField = runCatching { TASK_INFO.getField("isVisible") }.getOrNull()
+        val idField = TASK_INFO.getField("taskId")
         return tasksOn(Display.DEFAULT_DISPLAY).withIndex().any { (index, task) ->
-            isCopy(task, packageName, userId) && (visibleField?.getBoolean(task) ?: (index == 0))
+            if (!isCopy(task, packageName, userId)) return@any false
+            val visible = visibleField?.getBoolean(task) ?: (index == 0)
+            if (visible) {
+                // 用户自己把它提回了主屏前台：之前"由 Agent 摆在主屏后台保活"的身份作废，
+                // 否则下一次任务会继续把它当成 Agent 自己的任务直接搬回虚拟屏
+                val id = idField.getInt(task)
+                if (id >= 0) synchronized(kept) { kept.remove(id) }
+            }
+            visible
         }
     }
 
@@ -1472,9 +1486,48 @@ open class AgentShellEngine(
         return commandResult(if (finished) process.exitValue() else -1, output)
     }
 
-    private fun exec(vararg cmd: String): Int = sh(*cmd).first
+    // ==========================================
+    // 11. 特权截屏与长截图 (Privileged Screen Capture)
+    // ==========================================
 
-    fun sh(vararg cmd: String): Pair<Int, String> {
+    /**
+     * 特权截屏引擎（Shell / Root），懒加载并缓存能力探测结果。
+     */
+    val screenCapture: ShellScreencap by lazy { ShellScreencap(Process.myUid(), "$tag-Capture") }
+
+    /**
+     * 抓取指定屏幕的一帧 PNG（免 MediaProjection 授权）。
+     *
+     * @param allowSecure 抓到纯黑帧时是否允许升级到 Android 17 的 secure 策略通道。
+     *   默认开启：FLAG_SECURE 页面只有那条通道能出内容，关闭后这类页面一律返回 null。
+     */
+    fun capturePng(
+        displayId: Int,
+        timeoutMs: Int,
+        privilege: Int,
+        allowSecure: Boolean = true,
+    ): ByteArray? =
+        screenCapture.capturePng(
+            displayId = displayId,
+            timeoutMs = if (timeoutMs > 0) timeoutMs.toLong() else DEFAULT_CAPTURE_TIMEOUT_MS,
+            privilege = privilege,
+            allowSecure = allowSecure,
+        )
+
+    /** 截屏能力快照（Bundle 契约，见 [ScreenCaptureCapability]）。 */
+    fun captureCapability(forceRefresh: Boolean): Bundle =
+        screenCapture.capability(forceRefresh).toBundle()
+
+    /**
+     * 滚动拼接长截图；返回位图级结果，编码与 fd 交付由调用方决定。
+     */
+    fun captureLong(
+        displayId: Int,
+        options: LongScreenshotOptions,
+        onProgress: ((LongScreenshotProgress) -> Unit)? = null,
+    ): LongScreenshotOutput = screenCapture.captureLong(displayId, options, onProgress)
+
+    private fun exec(vararg cmd: String): Int = sh(*cmd).first    fun sh(vararg cmd: String): Pair<Int, String> {
         val p = try {
             ProcessBuilder(*cmd).redirectErrorStream(true).start()
         } catch (t: Throwable) {
@@ -1506,6 +1559,7 @@ open class AgentShellEngine(
         private const val CMD_TIMEOUT_S = 10L
         private const val COMMAND_OUTPUT_MAX = 64 * 1024
         private const val READER_JOIN_MS = 1_000L
+        private const val DEFAULT_CAPTURE_TIMEOUT_MS = 5_000L
         private val MODE_RE = Regex("[a-z_]+")
         private const val PER_USER_RANGE = 100_000
 

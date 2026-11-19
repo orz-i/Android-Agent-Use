@@ -7,6 +7,9 @@ import android.view.KeyEvent
 import com.agent.use.common.DisplayConfig
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.LaunchResult
+import com.agent.use.common.capture.LongScreenshotCapture
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.ScreenCaptureCapability
 import java.io.Closeable
 
 /**
@@ -100,6 +103,26 @@ object AndroidAgentUse {
          * 捕获当前屏幕最新 PNG 格式字节流（直接供给多模态视觉大模型 VLM）
          */
         fun capturePng(): ByteArray? = display.latestPng()
+
+        /**
+         * 以 Shell / Root 特权通道抓取「当下这一刻」的画面（免 MediaProjection 授权）。
+         *
+         * 与 [captureBitmap] 的取舍：本方法多花 100~300ms 起一次 `screencap`，
+         * 但拿到的是与点击严格对齐的像素，不受 ImageReader 最后一帧滞后的影响。
+         */
+        fun capturePrivilegedBitmap(): Bitmap? = display.capturePrivilegedBitmap()
+
+        /**
+         * 滚动拼接长截图；同步调用，务必在工作线程执行。
+         */
+        fun captureLongScreenshot(
+            options: LongScreenshotOptions = LongScreenshotOptions(),
+        ): LongScreenshotCapture = display.captureLongScreenshot(options)
+
+        /**
+         * 查询本机可用截屏通道（Shell / Root / 是否支持 `input -d` 滚动）。
+         */
+        fun captureCapability(): ScreenCaptureCapability = display.captureCapability()
 
         // =========================================================================
         // 2. 物理坐标与按键操作套件 (Physical Action Suite)

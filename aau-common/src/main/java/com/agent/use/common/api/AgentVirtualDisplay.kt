@@ -17,6 +17,11 @@ import com.agent.use.common.DisplayGeometry
 import com.agent.use.common.FinishDisplayResult
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.LaunchResult
+import com.agent.use.common.capture.LongScreenshotCapture
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.PrivilegedCapture
+import com.agent.use.common.capture.ScreenCaptureCapability
+import com.agent.use.common.capture.ScreenCapturePrivilege
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -196,6 +201,37 @@ class AgentVirtualDisplay internal constructor(
     fun lastFrameTimestamp(): Long? = synchronized(frameLock) {
         frameTimestampNanos.takeIf { !isReleased && it > 0 }
     }
+
+    // ==========================================
+    // 特权截屏与长截图（免 MediaProjection 授权）
+    // ==========================================
+
+    /**
+     * 以 Shell / Root 身份直接抓取本虚拟屏的一帧 PNG。
+     *
+     * 与 [latestPng] 的差别在于数据来源：那个走 ImageReader 实时流，零成本但可能滞后一帧；
+     * 这个走 `screencap`，取的是**当下这一刻**的像素，适合需要与点击严格对齐的取证场景。
+     */
+    fun capturePrivilegedPng(
+        timeoutMs: Int = 5_000,
+        privilege: Int = ScreenCapturePrivilege.AUTO,
+    ): ByteArray? = PrivilegedCapture.capturePng(shell, displayId, timeoutMs, privilege)
+
+    /** 以特权通道抓帧并解码为位图；调用方负责 recycle。 */
+    fun capturePrivilegedBitmap(
+        timeoutMs: Int = 5_000,
+        privilege: Int = ScreenCapturePrivilege.AUTO,
+    ): Bitmap? = PrivilegedCapture.captureBitmap(shell, displayId, timeoutMs, privilege)
+
+    /**
+     * 对本虚拟屏做滚动拼接长截图；同步占用一个 Binder 线程，必须在工作线程调用。
+     */
+    fun captureLongScreenshot(
+        options: LongScreenshotOptions = LongScreenshotOptions(),
+    ): LongScreenshotCapture = PrivilegedCapture.captureLong(shell, displayId, options)
+
+    /** 查询本机可用的截屏通道。 */
+    fun captureCapability(): ScreenCaptureCapability = PrivilegedCapture.capability(shell)
 
 
     // ==========================================

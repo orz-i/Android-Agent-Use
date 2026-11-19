@@ -14,6 +14,11 @@ import com.agent.use.common.DisplayConfig
 import com.agent.use.common.DisplayGeometry
 import com.agent.use.common.IAgentShell
 import com.agent.use.common.api.DisplayFrameProcessor
+import com.agent.use.common.capture.LongScreenshotCapture
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.PrivilegedCapture
+import com.agent.use.common.capture.ScreenCaptureCapability
+import com.agent.use.common.capture.ScreenCapturePrivilege
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -187,6 +192,47 @@ class AgentDisplay(
     fun lastFrameTimestampNanos(): Long? = synchronized(frameLock) {
         frameTimestampNanos.takeIf { !isReleased && it > 0 }
     }
+
+    // ==========================================
+    // 特权截屏与长截图（免 MediaProjection 授权）
+    // ==========================================
+
+    /**
+     * 以 Shell / Root 身份直接抓取本虚拟屏的一帧 PNG。
+     *
+     * 与 [latestFramePng] 的区别：后者来自 ImageReader 的实时流，零成本但可能滞后一帧；
+     * 本条走 `screencap`，是**当下这一刻**的像素，适合需要与点击严格对齐的证据留存。
+     *
+     * @param timeoutMs 抓帧超时
+     * @param privilege [ScreenCapturePrivilege] 策略，默认先 Shell 后 Root
+     */
+    fun capturePrivilegedPng(
+        timeoutMs: Int = 5_000,
+        privilege: Int = ScreenCapturePrivilege.AUTO,
+    ): ByteArray? = PrivilegedCapture.capturePng(shell, displayId, timeoutMs, privilege)
+
+    /**
+     * 以特权通道抓取本虚拟屏一帧并解码为位图；调用方负责 recycle。
+     */
+    fun capturePrivilegedBitmap(
+        timeoutMs: Int = 5_000,
+        privilege: Int = ScreenCapturePrivilege.AUTO,
+    ): Bitmap? = PrivilegedCapture.captureBitmap(shell, displayId, timeoutMs, privilege)
+
+    /**
+     * 对本虚拟屏做滚动拼接长截图。
+     *
+     * 整个滚动周期同步占用一个 Binder 线程（默认最多 12 屏），**必须在工作线程调用**。
+     * 返回的 [LongScreenshotCapture.bitmap] 由调用方 recycle。
+     */
+    fun captureLongScreenshot(
+        options: LongScreenshotOptions = LongScreenshotOptions(),
+    ): LongScreenshotCapture = PrivilegedCapture.captureLong(shell, displayId, options)
+
+    /**
+     * 查询本机可用的截屏通道（Shell / Root / 是否支持 `input -d` 滚动）。
+     */
+    fun captureCapability(): ScreenCaptureCapability = PrivilegedCapture.capability(shell)
 
     override fun close() {
         release()

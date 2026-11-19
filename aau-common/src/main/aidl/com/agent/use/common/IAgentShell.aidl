@@ -2,9 +2,11 @@ package com.agent.use.common;
 
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
 import android.view.Surface;
 import com.agent.use.common.DisplayConfig;
 import com.agent.use.common.IAgentCustodyListener;
+import com.agent.use.common.capture.LongScreenshotOptions;
 import com.agent.use.common.network.INetworkCapture;
 
 /**
@@ -383,4 +385,41 @@ interface IAgentShell {
      * 方案 1：从系统侧多源（TaskInfo / dumpsys / 近期系统日志）核验跳转确认弹窗拦截的真实目标应用包名，未知返回 null。
      */
     String resolveJumpTarget(int taskId, String interstitialPackage, String initiatorPackage) = 54;
+
+
+    // ==========================================
+    // 13. 特权截屏与长截图 (Privileged Screen Capture)
+    // ==========================================
+
+    /**
+     * 以 Shell (UID 2000) 或 Root 身份抓取指定屏幕的一帧 PNG，**不需要 MediaProjection 授权弹窗，
+     * 也不需要用户开启无障碍**。
+     *
+     * 实现路径：`screencap -p -d <displayId>` 直出 PNG 到标准输出；[privilege] 为 AUTO 时
+     * 先走 Shell，失败再经 `su -c` 重试。图像不放进 Binder 事务，而是写进服务端私有目录后
+     * 打开 fd 并立即 unlink，调用方从返回的只读 fd 流式读取。
+     *
+     * @param displayId 目标屏幕编号，0 为主屏
+     * @param timeoutMs 抓帧超时（建议 3000~8000），<=0 时取默认值
+     * @param privilege 0=AUTO(Shell→Root), 1=仅 Shell, 2=仅 Root
+     * @return PNG 只读 fd；不可用时返回 null（用 [captureCapability] 查原因）
+     */
+    ParcelFileDescriptor capturePng(int displayId, int timeoutMs, int privilege) = 55;
+
+    /**
+     * 滚动拼接长截图。
+     *
+     * 服务端完成「抓帧 → `input -d` 滚动 → 等待画面稳定 → 按行指纹求重叠 → 拼接」全流程，
+     * 一次 Binder 调用返回整张长图，避免每帧过 IPC。
+     *
+     * @return Bundle，字段见 `LongScreenshotResult.toBundle()`：
+     *         png(ParcelFileDescriptor) / width / height / frames / scrolls / stop / elapsedMs / mode / note
+     */
+    Bundle captureLongPng(int displayId, in LongScreenshotOptions options) = 56;
+
+    /**
+     * 探测本机截屏能力（screencap 路径与可用性、su 提权、-d 与 input 滚动支持）。
+     * 结果字段见 `ScreenCaptureCapability.toBundle()`，探测本身会真实抓一帧，可能有 100~400ms 开销。
+     */
+    Bundle captureCapability() = 57;
 }
