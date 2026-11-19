@@ -14,6 +14,7 @@ import com.agent.use.common.AudioMode
 import com.agent.use.common.CommandResult
 import com.agent.use.common.DisplayConfig
 import com.agent.use.common.IAgentShell
+import com.agent.use.common.capture.ScreenCaptureCapability
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -328,6 +329,52 @@ class AAUDiagnosticSuite(
                 latencyMs = a11yCost,
                 isWarningOnly = true,
                 advice = if (!a11yRunning) "如需使用语义定位与节点树解析，可在系统设置中开启 AgentAccessibilityService" else null
+            )
+        )
+
+        // 7. 免授权截屏通道（screencap / su 提权 / input -d 滚动）
+        val captureStart = SystemClock.uptimeMillis()
+        val capability = targetShell?.let { runCatching { ScreenCaptureCapability.fromBundle(it.captureCapability()) }.getOrNull() }
+        val captureCost = SystemClock.uptimeMillis() - captureStart
+        val capturePass = capability?.screencapAvailable == true
+        items.add(
+            CheckItem(
+                key = "privileged_capture",
+                title = "免授权截屏通道（screencap / long screenshot）",
+                status = if (capturePass) DiagnosticStatus.PASS else DiagnosticStatus.PARTIAL,
+                detail = when {
+                    capability == null -> "未连接 Shell 守护进程，无法探测特权截屏通道（可退回无障碍截屏）"
+                    capturePass -> "通道可用：${capability.screencapPath}，" +
+                        "主屏抓帧免授权；长截图滚动=${if (capability.supportsDisplaySwipe) "支持" else "不支持"}；" +
+                        "Root 提权=${if (capability.rootAvailable) "可用" else "不可用"}"
+                    else -> "screencap 不可用（${capability.note ?: "未知原因"}），长截图只能退回无障碍通道"
+                },
+                latencyMs = captureCost,
+                isWarningOnly = true,
+                advice = if (!capturePass) "若需免授权抓主屏与快速长截图，请确认守护进程以 Shell (UID 2000) 身份运行" else null
+            )
+        )
+
+        // 8. 安全图层抓取（FLAG_SECURE 页面）
+        val secureCapture = capability?.secureCaptureAvailable == true
+        items.add(
+            CheckItem(
+                key = "secure_layer_capture",
+                title = "安全图层抓取（FLAG_SECURE 页面）",
+                status = if (secureCapture) DiagnosticStatus.PASS else DiagnosticStatus.PARTIAL,
+                detail = when {
+                    capability == null -> "未连接 Shell 守护进程，无法判断 secure 通道"
+                    secureCapture -> "可用：Android 17 的 ScreenCapture 策略通道已就绪，" +
+                        "声明 FLAG_SECURE 的窗口可被抓取（不需要 Root）"
+                    else -> "不可用：当前系统为 API ${android.os.Build.VERSION.SDK_INT}，" +
+                        "该能力需要 Android 17 (API 37) 及以上；这些页面只能退回无障碍语义树"
+                },
+                latencyMs = 0L,
+                isWarningOnly = true,
+                advice = if (!secureCapture) {
+                    "支付密码、锁屏密码等页面声明了 FLAG_SECURE，拿不到像素是预期行为；" +
+                        "如需读取其中文本，请走无障碍节点树"
+                } else null
             )
         )
 
