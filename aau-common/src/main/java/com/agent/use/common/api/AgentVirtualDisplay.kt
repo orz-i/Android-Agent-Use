@@ -358,12 +358,16 @@ class AgentVirtualDisplay internal constructor(
         closePackages: List<String> = emptyList(),
     ): FinishDisplayResult {
         if (isReleased) return FinishDisplayResult(emptyList(), emptyMap(), "Already released")
-        val resultBundle = shell.finishDisplay(
-            displayId,
-            keepPackages.toTypedArray(),
-            closePackages.toTypedArray()
-        )
-        closeLocalResources()
+        val resultBundle = try {
+            shell.finishDisplay(
+                displayId,
+                keepPackages.toTypedArray(),
+                closePackages.toTypedArray()
+            )
+        } finally {
+            // 收尾失败时屏和帧缓冲同样要断开，否则本地 reader 线程与全尺寸帧会一直挂着
+            closeLocalResources()
+        }
         return FinishDisplayResult.fromBundle(resultBundle)
     }
 

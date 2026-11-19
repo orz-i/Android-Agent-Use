@@ -111,7 +111,15 @@ open class AgentShellEngine(
         }.onFailure { Log.w(tag, "display keep-awake unavailable: ${it.message}") }.getOrNull()
     }
 
-    private val kept = HashMap<Int, String>()
+    /**
+     * 由我方 `finishDisplay` 摆到主屏后台保活的 task：taskId -> 认领记录。
+     *
+     * 带时间戳是因为"认领"会过期。把这个 App 藏到主屏后台之后，用户完全可以自己再点开它；
+     * 那一刻起它就回到用户手里了，下一次任务不能再把它当成 Agent 的遗物直接搬上虚拟屏。
+     */
+    private class KeptClaim(val key: String, val atMs: Long)
+
+    private val kept = HashMap<Int, KeptClaim>()
     private val ownPackages: Set<String> by lazy {
         if (allowedUid <= 0) emptySet()
         else runCatching { context.packageManager.getPackagesForUid(allowedUid)?.toSet() }.getOrNull().orEmpty()
@@ -700,12 +708,17 @@ open class AgentShellEngine(
     }
 
     fun finishDisplay(displayId: Int, keep: Array<String>?, close: Array<String>?): Bundle? {
-        val sorting = synchronized(launchLock) {
-            if (!ownDisplay(displayId)) return null
-            sortAndMove(displayId, keep, close)
+        synchronized(launchLock) { if (!ownDisplay(displayId)) return null }
+        return try {
+            val sorting = synchronized(launchLock) { sortAndMove(displayId, keep, close) }
+            val settled = settleBehind(sorting.moved.mapTo(LinkedHashSet()) { it.task.id })
+            synchronized(launchLock) { closeOut(displayId, sorting, settled) }
+        } finally {
+            // 异常路径同样必须归还虚拟屏。否则 settleBehind / sortAndMove 抛出后，
+            // 这块屏会作为空屏永久挂着（用户抢走微信、Agent 失去目标时常走这条路）。
+            // releaseDisplay 自身幂等：displays.remove 已经取不到 VD 时不做任何事。
+            releaseDisplay(displayId)
         }
-        val settled = settleBehind(sorting.moved.mapTo(LinkedHashSet()) { it.task.id })
-        return synchronized(launchLock) { closeOut(displayId, sorting, settled) }
     }
 
     private class Sorting(
@@ -794,8 +807,8 @@ open class AgentShellEngine(
         }
         val hidden = moved.count { it.task.id in sorting.hidden }
         if (hidden > 0) notes += "$hidden ${AppsAfterTask.NOTE_LEFT_HIDDEN}"
-        synchronized(kept) { moved.forEach { kept[it.task.id] = it.key } }
-        releaseDisplay(displayId)
+        synchronized(kept) { moved.forEach { kept[it.task.id] = KeptClaim(it.key, SystemClock.uptimeMillis()) } }
+        // 虚拟屏的归还在 finishDisplay 的 finally 里统一执行，正常和异常路径都必然经过一次。
         return Bundle().apply {
             putStringArray(AppsAfterTask.KEY_KEPT, moved.map { it.key }.toTypedArray())
             putStringArray(AppsAfterTask.KEY_CLOSED, closed.toTypedArray())
@@ -942,12 +955,30 @@ open class AgentShellEngine(
         val idField = TASK_INFO.getField("taskId")
         val displayField = TASK_INFO.getField("displayId")
         val visibleField = runCatching { TASK_INFO.getField("isVisible") }.getOrNull()
+        val lastActiveField = runCatching { TASK_INFO.getField("lastActiveTime") }.getOrNull()
         val all = allTasks()
         synchronized(kept) { kept.keys.retainAll(all.map { idField.getInt(it) }.toSet()) }
         return all.filter { t ->
-            idField.getInt(t) in ids && displayField.getInt(t) == Display.DEFAULT_DISPLAY &&
-                isCopy(t, packageName, userId) && visibleField?.getBoolean(t) != true
+            val id = idField.getInt(t)
+            id in ids && displayField.getInt(t) == Display.DEFAULT_DISPLAY &&
+                isCopy(t, packageName, userId) && visibleField?.getBoolean(t) != true &&
+                !takenOverByUser(id, runCatching { lastActiveField?.getLong(t) }.getOrNull())
         }
+    }
+
+    /**
+     * 这个 task 被我方藏进主屏后台之后，又被用户自己激活过 —— 认领已经失效。
+     *
+     * `lastActiveTime` 与 [SystemClock.uptimeMillis] 同为开机基准，可以直接比。
+     * 一旦发现被接管就把认领删掉，后续 `start` 会走正常的"主屏占用"判定，而不是偷偷把它搬上虚拟屏。
+     */
+    private fun takenOverByUser(taskId: Int, lastActiveAtMs: Long?): Boolean {
+        if (lastActiveAtMs == null) return false
+        val claimedAt = synchronized(kept) { kept[taskId]?.atMs } ?: return false
+        if (lastActiveAtMs <= claimedAt) return false
+        synchronized(kept) { kept.remove(taskId) }
+        Log.i(tag, "task $taskId was activated by the user after we parked it; dropping our kept claim")
+        return true
     }
 
     private fun resumeKept(displayId: Int, packageName: String, userId: Int): Boolean {
