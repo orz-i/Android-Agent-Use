@@ -6,6 +6,9 @@ import android.content.Intent
 import android.provider.Settings
 import android.view.Display
 import com.agent.use.a11y.model.A11yNode
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.LongScreenshotOutput
+import com.agent.use.common.capture.LongScreenshotProgress
 
 /**
  * Agent 无障碍扩展统一外观门面。
@@ -111,6 +114,28 @@ class AgentA11yBridge(
             )
         return service.captureScreenshot(displayId)
     }
+
+    /**
+     * 无障碍兜底长截图（滚动 + 拼接）。
+     *
+     * 每帧受 1 秒系统冷却限制，适合「没有 Root、也没有常驻 Shell 守护进程」的场景；
+     * 有特权通道时请优先用 `PrivilegedCapture.captureLong`。
+     */
+    suspend fun captureLongScreenshot(
+        displayId: Int = Display.DEFAULT_DISPLAY,
+        options: LongScreenshotOptions = LongScreenshotOptions.accessibility(),
+        onProgress: ((LongScreenshotProgress) -> Unit)? = null,
+    ): LongScreenshotOutput {
+        val service = AgentAccessibilityService.instance.value
+            ?: return LongScreenshotOutput.failed("无障碍服务未连接")
+        return service.captureLongScreenshot(displayId, options, onProgress)
+    }
+
+    /**
+     * 把无障碍通道暴露成 [com.agent.use.common.capture.ScreenCaptureBackend]，
+     * 以便和特权通道一起交给 `ScreenCaptureChannel` 统一调度。
+     */
+    fun captureBackend(): A11yCaptureBackend = A11yCaptureBackend()
 
     /**
      * 获取指定屏幕当前顶层应用包名

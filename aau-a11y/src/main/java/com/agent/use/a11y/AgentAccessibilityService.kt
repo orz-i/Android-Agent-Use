@@ -7,17 +7,26 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityWindowInfo
 import com.agent.use.a11y.model.DisplayEvent
+import com.agent.use.common.capture.LongScreenshotOptions
+import com.agent.use.common.capture.LongScreenshotOutput
+import com.agent.use.common.capture.LongScreenshotProgress
+import com.agent.use.common.capture.LongScreenshotRunner
+import com.agent.use.common.capture.ScreenFrameSource
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 
 /**
@@ -198,6 +207,64 @@ open class AgentAccessibilityService : AccessibilityService() {
         return screenshotOnce(displayId)
     }
 
+    /**
+     * 无障碍兜底长截图：滚动 + 拼接。
+     *
+     * 这是**没有 Root、也不便依赖 Shell 守护进程**时的最后一条通道：
+     * 只需用户手动开启无障碍服务，代价是每次抓帧有 1 秒系统冷却（`takeScreenshot` 的硬限制），
+     * 因此默认参数（[LongScreenshotOptions.accessibility]）把稳定等待设到 1.1 秒，
+     * 宁可慢一点，也不要「等 300ms 撞冷却再重试」的双倍开销。
+     *
+     * 拼接算法与特权通道共用 [LongScreenshotRunner]，两条通道产出的长图在结构上完全一致。
+     *
+     * @return 位图级结果；[LongScreenshotOutput.bitmap] 由调用方负责 recycle
+     */
+    suspend fun captureLongScreenshot(
+        displayId: Int = Display.DEFAULT_DISPLAY,
+        options: LongScreenshotOptions = LongScreenshotOptions.accessibility(),
+        onProgress: ((LongScreenshotProgress) -> Unit)? = null,
+    ): LongScreenshotOutput = withContext(Dispatchers.Default) {
+        val clamped = options.clamped()
+        val source = A11yFrameSource(displayId, clamped)
+        try {
+            LongScreenshotRunner.run(source, clamped, onProgress)
+        } finally {
+            source.close()
+        }
+    }
+
+    /**
+     * 把「挂起抓帧 + 挂起手势」适配成 [LongScreenshotRunner] 需要的阻塞原语。
+     */
+    private inner class A11yFrameSource(
+        private val displayId: Int,
+        private val options: LongScreenshotOptions,
+    ) : ScreenFrameSource {
+
+        override fun capture(): Bitmap? = runBlocking {
+            when (val outcome = captureScreenshot(displayId)) {
+                is ScreenshotOutcome.Ok -> outcome.bitmap
+                else -> null
+            }
+        }
+
+        override fun scroll(frameWidth: Int, frameHeight: Int): Boolean = runBlocking {
+            val centerX = frameWidth / 2f
+            gestureDispatcher.swipe(
+                displayId = displayId,
+                startX = centerX,
+                startY = frameHeight * options.scrollFromRatio,
+                endX = centerX,
+                endY = frameHeight * options.scrollToRatio,
+                durationMs = options.scrollDurationMs,
+            )
+        }
+
+        override fun sleep(ms: Long) {
+            if (ms > 0) SystemClock.sleep(ms)
+        }
+    }
+
     private suspend fun screenshotOnce(displayId: Int): ScreenshotOutcome = suspendCancellableCoroutine { cont ->
         val service = _instance.value
         if (service == null) {
@@ -234,7 +301,6 @@ open class AgentAccessibilityService : AccessibilityService() {
      * 发生在指定屏上的原始无障碍事件流（跨服务重连实例保留）。
      */
     fun eventsFor(displayId: Int): Flow<AccessibilityEvent> = DisplayEventStream.rawEventsFor(displayId)
-
     /**
      * 窗口变化的信号流（跨服务重连实例保留）。
      */
