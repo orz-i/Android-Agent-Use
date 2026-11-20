@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.Surface
 import com.agent.use.common.DisplayConfig
 import com.agent.use.common.DisplayGeometry
@@ -80,6 +81,7 @@ class AgentDisplay(
     private var lastProcessedAt = 0L
     private var pendingSchedule = false
     private var frameTimestampNanos = 0L
+    @Volatile private var newerFramePending = false
     @Volatile private var isReleased = false
 
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -102,7 +104,10 @@ class AgentDisplay(
             throw IllegalStateException("Failed to create remote virtual display, returned: $id")
         }
         displayId = id
-        reader.setOnImageAvailableListener({ scheduleNextFrame() }, handler)
+        reader.setOnImageAvailableListener({
+            newerFramePending = true
+            scheduleNextFrame()
+        }, handler)
         handler.post { scheduleNextFrame() }
     }
 
@@ -143,6 +148,7 @@ class AgentDisplay(
                 hasFrame = true
                 frameTimestampNanos = image.timestamp
                 frameGeometry = capturedGeometry
+                newerFramePending = false
 
                 // 提取预览图供 StateFlow 订阅
                 val previewWidth = capturedGeometry.previewWidth(PREVIEW_SHORT_SIDE)
@@ -191,6 +197,23 @@ class AgentDisplay(
     /** 获取最新一帧的硬件时间戳（纳秒，来自 SurfaceFlinger） */
     fun lastFrameTimestampNanos(): Long? = synchronized(frameLock) {
         frameTimestampNanos.takeIf { !isReleased && it > 0 }
+    }
+
+    /**
+     * Current virtual-display frame identity. A trusted display may advertise
+     * FLAG_SECURE even while showing an ordinary window; protected-window
+     * handling belongs to the screen layer, not to this display capability bit.
+     * Null during rotation or while a newer frame is pending.
+     */
+    data class VisibleFrameStamp(val timestampNanos: Long, val geometry: DisplayGeometry)
+
+    fun visibleFrameStamp(): VisibleFrameStamp? {
+        if (displayId == Display.DEFAULT_DISPLAY) return null
+        val target = displayManager.getDisplay(displayId) ?: return null
+        return synchronized(frameLock) {
+            if (isReleased || newerFramePending || frameTimestampNanos <= 0 || frameGeometry.rotation != target.rotation) null
+            else VisibleFrameStamp(frameTimestampNanos, frameGeometry)
+        }
     }
 
     // ==========================================

@@ -58,6 +58,7 @@ add_executable(aau_ebpf
 
 target_include_directories(aau_ebpf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_options(aau_ebpf PRIVATE -O2 -Wall -Wextra)
+target_link_options(aau_ebpf PRIVATE "-Wl,-z,max-page-size=16384")
 
 # Package executable inside jniLibs/<abi>/libaau_ebpf.so so Android extracts it with +x to nativeLibraryDir.
 set_target_properties(aau_ebpf PROPERTIES
