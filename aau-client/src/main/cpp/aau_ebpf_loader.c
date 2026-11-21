@@ -69,6 +69,8 @@ static ssl_offset_rule g_ssl_rules[MAX_OFFSET_RULES];
 static int g_ssl_rule_count = 0;
 static cronet_offset_rule g_cronet_rules[MAX_OFFSET_RULES];
 static int g_cronet_rule_count = 0;
+/* 实验性：用 ssl_lib.cc 错误 thunk 反查静态链入 BoringSSL 的读写偏移（默认关闭） */
+static int g_enable_boringssl_thunks = 0;
 static char g_custom_cronet_sigs[MAX_CRONET_SIGS][128];
 static int g_custom_cronet_sig_count = 0;
 static int g_cronet_slot_hdr = 3;
@@ -273,11 +275,16 @@ static int ascii_strcasestr_contains(const char *haystack, const char *needle) {
     return 0;
 }
 
-static int path_looks_like_ssl_or_cronet(const char *path) {
-    return ascii_strcasestr_contains(path, "cronet") ||
-           ascii_strcasestr_contains(path, "boringssl") ||
-           ascii_strcasestr_contains(path, "libssl") ||
-           ascii_strcasestr_contains(path, "ttnet");
+/*
+ * 以前这里是一份库名白名单（cronet/boringssl/libssl/ttnet）。
+ * 白名单本身就是漏抓的根因：Flutter 把 BoringSSL 静态链进 libflutter.so，
+ * WebView 链进 libmonochrome.so，名字全都不在名单里，于是连尝试的机会都没有。
+ *
+ * 现在改成「内容判定」：凡能读到 BoringSSL 源码路径字符串（ssl/ssl_lib.cc）的 .so
+ * 都参与解析，名字只作为 cronet 那条独立链路（URLRequest 启发式）的提示。
+ */
+static int path_may_carry_tls(const char *path) {
+    return path != NULL && path[0] != '\0';
 }
 
 static int elf64_vaddr_to_offset(
@@ -431,13 +438,190 @@ static size_t openssl_scan_func_entry(const uint32_t *words, size_t idx, size_t 
     return SIZE_MAX;
 }
 
+/* ---------- 静态链入 BoringSSL（Flutter / WebView）的偏移解析 ----------
+ *
+ * Flutter 把 BoringSSL 编进 libflutter.so 并全量 strip，五个 MOV W2 常量那套判定
+ * 会失效：新版本把 reason 码换成了「冷代码 thunk」——一段只负责返回
+ * (lib=16, func=<imm>, file=".../ssl/ssl_lib.cc") 的小函数，调用点只留 line。
+ *
+ * 这里反过来用这个特征：
+ *   1. 在 .rodata 找到 ssl/ssl_lib.cc 字符串的起始地址（整串带构建路径前缀）
+ *   2. 扫 .text 里 ADRP+ADD 指向该字符串、随后 MOV W0,#16 / MOV W1,#imm / RET 的 thunk
+ *   3. 收集所有 B 到这些 thunk 的调用点，回溯到函数入口 —— 这些函数就是 ssl_lib.cc 里的函数
+ *   4. ssl_lib.cc 中读写两函数紧邻，且写路径的 OPENSSL_PUT_ERROR 分支明显更多，
+ *      按「错误码种类数」排序后取相邻的一对：多的判为 SSL_write，少的判为 SSL_read
+ */
+
+#define BSL_MAX_THUNKS 32
+#define BSL_MAX_CANDS  64
+#define BSL_MAX_CODES  8
+
+typedef struct {
+    size_t start;              /* 函数入口的 word 下标 */
+    uint32_t codes[BSL_MAX_CODES];
+    int code_count;
+} bsl_candidate;
+
+static size_t aarch64_find_func_start_loose(const uint32_t *words, size_t idx, size_t max_back) {
+    size_t limit = (idx > max_back) ? (idx - max_back) : 0;
+    for (size_t j = idx + 1; j > limit; ) {
+        j--;
+        uint32_t w = words[j];
+        if (w == 0xd503233fU || w == 0xd503245fU) return j;      /* PACIASP / BTI C */
+        if ((w & 0xff8003ffU) == 0xd10003ffU) return j;          /* SUB SP, SP, #imm */
+        if ((w & 0xffc00000U) == 0xa9800000U &&                   /* STP x29, x30, [SP, #-N]! */
+            ((w >> 5) & 31U) == 31U && (w & 31U) == 29U && ((w >> 10) & 31U) == 30U) {
+            return j;
+        }
+    }
+    return SIZE_MAX;
+}
+
+/* 解析 ADRP+ADD 组合的目标地址；成功返回 0 */
+static int aarch64_adrp_add_target(const uint32_t *words, size_t i, uint64_t pc, uint64_t *out_target) {
+    uint32_t w = words[i];
+    if ((w & 0x9f000000U) != 0x90000000U) return -1;
+    uint32_t rd = w & 31U;
+    int64_t imm = (int64_t)((((w >> 5) & 0x7ffffU) << 2) | ((w >> 29) & 3U));
+    if (imm & (1 << 20)) imm -= (1 << 21);
+    uint64_t page = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
+
+    uint32_t w2 = words[i + 1];
+    if ((w2 & 0x7f800000U) != 0x11000000U) return -1;            /* ADD (immediate) */
+    if ((w2 & 31U) != rd || ((w2 >> 5) & 31U) != rd) return -1;
+    uint64_t imm12 = (w2 >> 10) & 0xfffU;
+    if ((w2 >> 22) & 1U) imm12 <<= 12;
+
+    *out_target = page + imm12;
+    return 0;
+}
+
+/* ssl/ssl_lib.cc 字符串的起始 vaddr（BoringSSL 的 __FILE__ 带构建路径前缀） */
+static int ssl_lib_string_va(
+    const uint8_t *base,
+    size_t map_size,
+    const Elf64_Ehdr *eh,
+    const Elf64_Phdr *phdrs,
+    uint64_t *out_va
+) {
+    const uint8_t *hit = (const uint8_t *)memmem(base, map_size, "ssl/ssl_lib.cc", 14);
+    if (!hit) return -1;
+    size_t pos = (size_t)(hit - base);
+    size_t start = pos;
+    size_t floor_limit = (pos > 256) ? (pos - 256) : 0;
+    while (start > floor_limit && base[start - 1] != '\0') start--;
+    return elf64_offset_to_vaddr(eh, phdrs, (uint64_t)start, out_va);
+}
+
+static int bsl_candidate_add(bsl_candidate *cands, int *count, size_t start, uint32_t code) {
+    for (int i = 0; i < *count; i++) {
+        if (cands[i].start != start) continue;
+        for (int k = 0; k < cands[i].code_count; k++) {
+            if (cands[i].codes[k] == code) return 0;
+        }
+        if (cands[i].code_count < BSL_MAX_CODES) {
+            cands[i].codes[cands[i].code_count++] = code;
+        }
+        return 0;
+    }
+    if (*count >= BSL_MAX_CANDS) return -1;
+    cands[*count].start = start;
+    cands[*count].codes[0] = code;
+    cands[*count].code_count = 1;
+    (*count)++;
+    return 0;
+}
+
+static int resolve_boringssl_thunk_offsets(
+    const uint8_t *base,
+    size_t map_size,
+    const Elf64_Ehdr *eh,
+    const Elf64_Phdr *phdrs,
+    uint64_t text_off,
+    uint64_t text_va,
+    uint64_t text_sz,
+    uint64_t *out_write,
+    uint64_t *out_read
+) {
+    uint64_t ssl_va = 0;
+    if (ssl_lib_string_va(base, map_size, eh, phdrs, &ssl_va) != 0) return -1;
+
+    const uint32_t *words = (const uint32_t *)(base + text_off);
+    size_t word_count = (size_t)(text_sz / 4ULL);
+    if (word_count < 8) return -1;
+
+    size_t thunk_idx[BSL_MAX_THUNKS];
+    uint32_t thunk_code[BSL_MAX_THUNKS];
+    int thunk_count = 0;
+
+    for (size_t i = 0; i + 4 < word_count && thunk_count < BSL_MAX_THUNKS; i++) {
+        uint64_t target = 0;
+        if (aarch64_adrp_add_target(words, i, text_va + (uint64_t)i * 4ULL, &target) != 0) continue;
+        if (target != ssl_va) continue;
+        if (words[i + 2] != 0x52800200U) continue;                            /* MOV W0, #16 (ERR_LIB_SSL) */
+        if ((words[i + 3] & 0xffe0001fU) != 0x52800001U) continue;            /* MOV W1, #imm */
+        if (words[i + 4] != 0xd65f03c0U) continue;                            /* RET */
+        thunk_idx[thunk_count] = i;
+        thunk_code[thunk_count] = (words[i + 3] >> 5) & 0xffffU;
+        thunk_count++;
+    }
+    if (thunk_count < 2) return -1;
+
+    bsl_candidate cands[BSL_MAX_CANDS];
+    int cand_count = 0;
+    memset(cands, 0, sizeof(cands));
+
+    for (size_t i = 0; i < word_count; i++) {
+        int64_t target = aarch64_bl_target_idx(words, i, word_count);
+        if (target < 0) continue;
+        int hit = -1;
+        for (int t = 0; t < thunk_count; t++) {
+            if (thunk_idx[t] == (size_t)target) { hit = t; break; }
+        }
+        if (hit < 0) continue;
+        size_t fstart = aarch64_find_func_start_loose(words, i, 4096);
+        if (fstart == SIZE_MAX || fstart >= i) continue;
+        bsl_candidate_add(cands, &cand_count, fstart, thunk_code[hit]);
+    }
+    if (cand_count < 2) return -1;
+
+    /* 按函数入口地址排序 */
+    for (int i = 1; i < cand_count; i++) {
+        bsl_candidate key = cands[i];
+        int j = i - 1;
+        while (j >= 0 && cands[j].start > key.start) {
+            cands[j + 1] = cands[j];
+            j--;
+        }
+        cands[j + 1] = key;
+    }
+
+    /* 在相邻候选中挑「错误码种类最多的一对」：多者为写，少者为读 */
+    int best = -1, best_score = -1;
+    for (int i = 0; i + 1 < cand_count; i++) {
+        if (cands[i + 1].start - cands[i].start > 0x2000) continue;   /* 两个函数在 ssl_lib.cc 里紧邻 */
+        int score = cands[i].code_count + cands[i + 1].code_count;
+        if (cands[i].code_count == 0 || cands[i + 1].code_count == 0) continue;
+        if (score > best_score) { best_score = score; best = i; }
+    }
+    if (best < 0) return -1;
+
+    int w = (cands[best].code_count >= cands[best + 1].code_count) ? best : (best + 1);
+    int r = (w == best) ? (best + 1) : best;
+    if (cands[w].code_count < 2) return -1;   /* 只有一条错误分支，判成写不可信 */
+
+    *out_write = text_off + (uint64_t)cands[w].start * 4ULL;
+    *out_read = text_off + (uint64_t)cands[r].start * 4ULL;
+    return 0;
+}
+
 static int resolve_stripped_boringssl_offsets(
     const char *path,
     uint64_t *out_write,
     uint64_t *out_read,
     uint64_t *out_sni
 ) {
-    if (!path || !path_looks_like_ssl_or_cronet(path)) return -1;
+    if (!path || !path_may_carry_tls(path)) return -1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -533,6 +717,25 @@ static int resolve_stripped_boringssl_offsets(
                         }
                     }
                     rc = 0;
+                }
+
+                /* 五常量判定失效时（Flutter/新版本 BoringSSL 把 reason 码改成了冷代码 thunk），
+                 * 退回 ssl_lib.cc 错误 thunk 反查。
+                 *
+                 * 该启发式尚未通过端到端明文验证（只能定位到 ssl_lib.cc 内的函数，读/写归属
+                 * 仍靠「错误分支多者为写」推断），因此默认关闭，仅在显式传
+                 * --boringssl-thunks 时启用，避免在不确定的库上挂错函数产生垃圾事件。 */
+                if (rc != 0 && has_ssl_lib_str && g_enable_boringssl_thunks) {
+                    uint64_t thunk_write = 0, thunk_read = 0;
+                    if (resolve_boringssl_thunk_offsets(
+                            base, map_size, eh, phdrs,
+                            text_off, text_va, text_sz,
+                            &thunk_write, &thunk_read) == 0) {
+                        *out_write = thunk_write;
+                        *out_read = thunk_read;
+                        if (out_sni) *out_sni = 0;
+                        rc = 0;
+                    }
                 }
             }
         }
@@ -3037,6 +3240,10 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        } else if (strcmp(argv[i], "--boringssl-thunks") == 0) {
+            /* 实验性：对没有 SSL_* 符号、又匹配不上五常量判定的 BoringSSL（如 libflutter.so），
+             * 用 ssl_lib.cc 错误 thunk 反查读写偏移。默认关闭，见 resolve_boringssl_thunk_offsets。 */
+            g_enable_boringssl_thunks = 1;
         } else if (strcmp(argv[i], "--cronet-offsets") == 0 && i + 1 < argc) {
             const char *spec = argv[++i];
             if (g_cronet_rule_count < MAX_OFFSET_RULES) {
