@@ -1847,33 +1847,42 @@ static void inspect_library_offsets(const char *path, int check_cronet, library_
     out->ssl_source = "none";
     out->cronet_source = "none";
 
-    for (int r = 0; r < g_ssl_rule_count; r++) {
-        if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
-            g_ssl_rules[r].read_off != 0) {
-            out->off_write = g_ssl_rules[r].write_off;
-            out->off_read = g_ssl_rules[r].read_off;
-            out->off_sni = g_ssl_rules[r].sni_off;
-            out->has_ssl = 1;
-            out->ssl_source = "rule";
-            break;
+    /* WebView：Chromium 以 APK 内嵌 .so 的形式映射，uprobe 需要 APK 内绝对偏移 */
+    if (strstr(path, ".apk") != NULL &&
+        resolve_webview_apk_offsets(path, &out->off_write, &out->off_read) == 0) {
+        out->off_sni = 0;
+        out->has_ssl = 1;
+        out->ssl_source = "webview_apk";
+    }
+    /*
+     * 符号表最可信，优先级最高。
+     *
+     * --ssl-offsets 的规则是按路径子串匹配的，一条 "libssl.so:..." 会同时命中
+     * /apex 和 /system 下的 libssl.so，而它们的函数偏移完全不同。规则先于符号表
+     * 命中就会把别的库挂到错误地址上，所以规则只作为「没有符号表」时的兜底。
+     */
+    else if (resolve_elf_symbol_offset(path, "SSL_write", &out->off_write) == 0 &&
+        resolve_elf_symbol_offset(path, "SSL_read", &out->off_read) == 0) {
+        out->has_ssl = 1;
+        out->ssl_source = "dynsym";
+        resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &out->off_sni);
+    }
+    else {
+        for (int r = 0; r < g_ssl_rule_count; r++) {
+            if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
+                g_ssl_rules[r].read_off != 0) {
+                out->off_write = g_ssl_rules[r].write_off;
+                out->off_read = g_ssl_rules[r].read_off;
+                out->off_sni = g_ssl_rules[r].sni_off;
+                out->has_ssl = 1;
+                out->ssl_source = "rule";
+                break;
+            }
         }
     }
-    if (!out->has_ssl) {
-        /* WebView：Chromium 以 APK 内嵌 .so 的形式映射，uprobe 需要 APK 内绝对偏移 */
-        if (strstr(path, ".apk") != NULL &&
-            resolve_webview_apk_offsets(path, &out->off_write, &out->off_read) == 0) {
-            out->off_sni = 0;
-            out->has_ssl = 1;
-            out->ssl_source = "webview_apk";
-        }
-        else if (resolve_elf_symbol_offset(path, "SSL_write", &out->off_write) == 0 &&
-            resolve_elf_symbol_offset(path, "SSL_read", &out->off_read) == 0) {
-            out->has_ssl = 1;
-            out->ssl_source = "dynsym";
-            resolve_elf_symbol_offset(path, "SSL_set_tlsext_host_name", &out->off_sni);
-        }
 #if defined(__LP64__) && defined(__aarch64__)
-        else if (resolve_stripped_boringssl_offsets(path, &out->off_write, &out->off_read, &out->off_sni) == 0) {
+    if (!out->has_ssl) {
+        if (resolve_stripped_boringssl_offsets(path, &out->off_write, &out->off_read, &out->off_sni) == 0) {
             out->has_ssl = 1;
             out->ssl_source = "stripped_heuristic";
         }
@@ -1881,8 +1890,8 @@ static void inspect_library_offsets(const char *path, int check_cronet, library_
             out->has_ssl = 1;
             out->ssl_source = "openssl_heuristic";
         }
-#endif
     }
+#endif
 
     if (out->has_ssl) {
         fprintf(stderr,
@@ -2078,6 +2087,33 @@ static int scan_and_attach_lib_dirs(bpf_bundle *bundle, int num_cpus) {
     return attached;
 }
 
+/*
+ * 已判定过、确实没有 TLS 入口的映射路径。
+ *
+ * maps 每 2 秒重扫一次以覆盖懒加载的库，若不记住失败结果，像 libsqlite.so 这种
+ * 既非 SSL 又常驻的库会被反复读文件、扫字符串。只缓存「文件存在但解析不出 SSL」，
+ * 文件不存在的路径不缓存——它可能稍后才被写出来。
+ */
+#define MAX_REJECTED_PATHS 256
+
+static char g_rejected_paths[MAX_REJECTED_PATHS][256];
+static int g_rejected_path_count = 0;
+
+static int path_was_rejected(const char *path) {
+    for (int i = 0; i < g_rejected_path_count; i++) {
+        if (strcmp(g_rejected_paths[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static void remember_rejected_path(const char *path) {
+    if (g_rejected_path_count >= MAX_REJECTED_PATHS) return;
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(g_rejected_paths[0])) return;
+    memcpy(g_rejected_paths[g_rejected_path_count], path, n + 1);
+    g_rejected_path_count++;
+}
+
 static int scan_and_attach_proc_maps(uint32_t target_uid, bpf_bundle *bundle, int num_cpus) {
     DIR *proc = opendir("/proc");
     if (!proc) return 0;
@@ -2112,15 +2148,98 @@ static int scan_and_attach_proc_maps(uint32_t target_uid, bpf_bundle *bundle, in
             while (slen > 0 && (slash[slen - 1] == '\n' || slash[slen - 1] == '\r' || slash[slen - 1] == ' ')) {
                 slash[--slen] = '\0';
             }
-            if (slen < 3 || strcmp(slash + slen - 3, ".so") != 0) continue;
-            if (try_attach_library(slash, bundle, num_cpus) == 1) {
+            int is_so = (slen > 3 && strcmp(slash + slen - 3, ".so") == 0);
+            /*
+             * WebView(Trichrome) 把 Chromium 编进 APK，代码页的 inode 是 base.apk
+             * 而不是某个 .so，只认 .so 会把它整个漏掉。用「可执行段」做筛子：
+             * 普通 APK 的 dex/资源都是只读映射，只有真正承载 native 代码的段才是 r-xp。
+             */
+            int is_exec_apk = 0;
+            if (!is_so && slen > 4 && strcmp(slash + slen - 4, ".apk") == 0) {
+                char *perms = strchr(line, ' ');
+                while (perms != NULL && *perms == ' ') perms++;
+                /* perms 形如 "r-xp"/"rw-s"，第 3 个字符才是可执行位 */
+                is_exec_apk = (perms != NULL && strlen(perms) >= 4 && perms[2] == 'x');
+            }
+            if (!is_so && !is_exec_apk) continue;
+
+            struct stat mst;
+            if (stat(slash, &mst) != 0 || !S_ISREG(mst.st_mode)) continue;
+            if (path_was_rejected(slash)) continue;
+
+            int rc = try_attach_library(slash, bundle, num_cpus);
+            if (rc == 1) {
                 attached++;
+            } else if (rc < 0) {
+                remember_rejected_path(slash);
             }
         }
         fclose(mf);
     }
     closedir(proc);
     return attached;
+}
+
+/*
+ * 预挂载系统当前 WebView provider 的 APK。
+ *
+ * Trichrome 把 Chromium 编进 APK，进程只有真的用到 WebView 时才会映射它。
+ * 如果只靠 /proc/<pid>/maps 发现，那么在「先点开始抓包、再打开 H5」的顺序下，
+ * 首屏那批请求会在 chromium 被映射之前就发完，等 2 秒后的重扫挂上时已经迟了。
+ * 这里直接问系统当前 provider，把探针预挂在文件上，等它一被映射就生效。
+ */
+static int preattach_webview_provider(bpf_bundle *bundle, int num_cpus) {
+    static int attempted = 0;
+    if (attempted) return 0;
+    attempted = 1;
+
+    char pkg[128] = {0};
+    char buf[512];
+    FILE *fp = popen("/system/bin/dumpsys webviewupdate 2>/dev/null", "r");
+    if (fp) {
+        while (fgets(buf, sizeof(buf), fp)) {
+            /*
+             * 形如：
+             *   Current WebView package (name, version): (com.google.android.webview, 157.0.8103.50)
+             * 包名在 "): (" 之后那对括号里，前面那对括号是字段说明，不能直接取第一个 '('。
+             */
+            char *tag = strstr(buf, "Current WebView package");
+            if (!tag) continue;
+            char *mark = strstr(tag, "): (");
+            if (!mark) continue;
+            char *name = mark + 4;
+            char *comma = strchr(name, ',');
+            if (!comma) continue;
+            size_t n = (size_t)(comma - name);
+            while (n > 0 && name[n - 1] == ' ') n--;
+            if (n == 0 || n >= sizeof(pkg)) continue;
+            memcpy(pkg, name, n);
+            pkg[n] = '\0';
+            break;
+        }
+        pclose(fp);
+    }
+    if (!pkg[0]) return 0;
+
+    char apk[512] = {0};
+    snprintf(buf, sizeof(buf), "/system/bin/pm path %s 2>/dev/null", pkg);
+    fp = popen(buf, "r");
+    if (!fp) return 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (strncmp(buf, "package:", 8) != 0) continue;
+        char *p = buf + 8;
+        size_t n = strlen(p);
+        while (n > 0 && (p[n - 1] == '\n' || p[n - 1] == '\r')) n--;
+        if (n == 0 || n >= sizeof(apk)) continue;
+        memcpy(apk, p, n);
+        apk[n] = '\0';
+        break;
+    }
+    pclose(fp);
+    if (!apk[0]) return 0;
+
+    fprintf(stderr, "INFO:webview-prewarm %s (%s)\n", apk, pkg);
+    return try_attach_library(apk, bundle, num_cpus) == 1 ? 1 : 0;
 }
 
 static int scan_and_attach_defaults(bpf_bundle *bundle, int num_cpus) {
@@ -3667,6 +3786,7 @@ int main(int argc, char **argv) {
     scan_and_attach_lib_dirs(&bundle, num_cpus);
     scan_and_attach_proc_maps(target_uid, &bundle, num_cpus);
     scan_and_attach_defaults(&bundle, num_cpus);
+    preattach_webview_provider(&bundle, num_cpus);
 
     if (g_attached_lib_count == 0 && !g_jni_hook_enabled) {
         fprintf(stderr, "ERR:libssl_not_found:%s\n", g_last_attach_err[0] ? g_last_attach_err : "none");
