@@ -1669,6 +1669,179 @@ typedef struct {
     uint64_t off_cr_fin;
 } library_probe_result;
 
+/* ---------------------------------------------------------------------------
+ * WebView / Trichrome 支持
+ *
+ * Android WebView 把 Chromium 编译成 APK 内的内嵌 .so（extractNativeLibs=false），
+ * loader 直接把 base.apk 映射进进程，所以对它下 uprobe 时，offset 必须是
+ * 「APK 内的绝对文件偏移」= zip 成员数据起点 + .so 内部文件偏移。
+ *
+ * 成员数据起点由 zip 中央目录 + local header 算出；.so 内偏移用带入口签名
+ * 校验的偏移表给出——签名不匹配说明 WebView 版本变了，此时宁可放弃也不要
+ * 把探针挂到无关函数上。
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    uint64_t write_off;      /* .so 内部文件偏移 */
+    uint64_t read_off;
+    uint32_t write_sig[4];   /* 函数入口 4 条指令，用于版本校验 */
+    uint32_t read_sig[4];
+} webview_ssl_profile;
+
+static const webview_ssl_profile g_webview_profiles[] = {
+    /* Chromium 157.0.8103.50 (WebView, arm64) */
+    {
+        0x3272a14ULL, 0x32784dcULL,
+        {0xd503233fU, 0xd10143ffU, 0xa9017bfdU, 0xf90013f7U},
+        {0xd503233fU, 0xa9be7bfdU, 0xa9014ff4U, 0x910003fdU},
+    },
+};
+
+static uint32_t rd_u16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+static uint32_t rd_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 在 APK 的 zip 目录里找成员，返回其数据区的绝对偏移与长度 */
+static int apk_find_member_data(
+    const char *apk_path,
+    const char *member,
+    uint64_t *out_data_off,
+    uint64_t *out_size
+) {
+    int fd = open(apk_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 22) { close(fd); return -1; }
+    uint64_t fsz = (uint64_t)st.st_size;
+
+    /* EOCD 在文件尾部，最多回看 64KB + 22 */
+    size_t tail = (size_t)(fsz > 66560ULL ? 66560ULL : fsz);
+    uint8_t *buf = (uint8_t *)malloc(tail);
+    if (!buf) { close(fd); return -1; }
+    if (pread(fd, buf, tail, (off_t)(fsz - tail)) != (ssize_t)tail) {
+        free(buf); close(fd); return -1;
+    }
+
+    ssize_t eocd = -1;
+    for (ssize_t i = (ssize_t)tail - 22; i >= 0; i--) {
+        if (buf[i] == 'P' && buf[i + 1] == 'K' && buf[i + 2] == 5 && buf[i + 3] == 6) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) { free(buf); close(fd); return -1; }
+
+    uint32_t cd_size = rd_u32(buf + eocd + 12);
+    uint32_t cd_off = rd_u32(buf + eocd + 16);
+    free(buf);
+
+    if (cd_size == 0 || cd_size == 0xFFFFFFFFU || cd_off == 0xFFFFFFFFU ||
+        (uint64_t)cd_off + cd_size > fsz) {
+        close(fd);
+        return -1; /* Zip64 大目录：当前 WebView APK 不会走到这里 */
+    }
+
+    uint8_t *cd = (uint8_t *)malloc(cd_size);
+    if (!cd) { close(fd); return -1; }
+    if (pread(fd, cd, cd_size, (off_t)cd_off) != (ssize_t)cd_size) {
+        free(cd); close(fd); return -1;
+    }
+
+    int rc = -1;
+    size_t name_len = strlen(member);
+    size_t p = 0;
+    while (p + 46 <= cd_size && rd_u32(cd + p) == 0x02014b50U) {
+        uint32_t nlen = rd_u16(cd + p + 28);
+        uint32_t elen = rd_u16(cd + p + 30);
+        uint32_t clen = rd_u16(cd + p + 32);
+        uint32_t lho = rd_u32(cd + p + 42);
+
+        if (nlen == name_len && p + 46 + nlen <= cd_size &&
+            memcmp(cd + p + 46, member, name_len) == 0) {
+            uint8_t lh[30];
+            if (pread(fd, lh, sizeof(lh), (off_t)lho) == (ssize_t)sizeof(lh) &&
+                rd_u32(lh) == 0x04034b50U) {
+                uint32_t lnlen = rd_u16(lh + 26);
+                uint32_t lelen = rd_u16(lh + 28);
+                uint32_t csize = rd_u32(lh + 18);
+                *out_data_off = (uint64_t)lho + 30ULL + lnlen + lelen;
+                *out_size = (uint64_t)csize;
+                rc = 0;
+            }
+            break;
+        }
+        p += 46 + nlen + elen + clen;
+    }
+
+    free(cd);
+    close(fd);
+    return rc;
+}
+
+/* 解析 APK 内嵌 chromium 的 SSL 读写偏移；输出为 APK 内绝对偏移 */
+static int resolve_webview_apk_offsets(
+    const char *apk_path,
+    uint64_t *out_write,
+    uint64_t *out_read
+) {
+    static const char *candidates[] = {
+        "lib/arm64-v8a/libwebviewchromium.so",
+        "lib/arm64/libwebviewchromium.so",
+        "lib/arm64-v8a/libmonochrome.so",
+        "lib/arm64/libmonochrome.so",
+    };
+
+    uint64_t data_off = 0, size = 0;
+    int found = 0;
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (apk_find_member_data(apk_path, candidates[i], &data_off, &size) == 0 && size > 0) {
+            found = 1;
+            fprintf(stderr, "INFO:webview-member %s off=0x%llx size=0x%llx\n",
+                    candidates[i], (unsigned long long)data_off, (unsigned long long)size);
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    int fd = open(apk_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    /* 只需要校验入口机器码，不必映射整个 156MB 的 .so */
+    uint8_t ident[8];
+    if (pread(fd, ident, sizeof(ident), (off_t)data_off) != (ssize_t)sizeof(ident) ||
+        memcmp(ident, ELFMAG, SELFMAG) != 0 || ident[EI_CLASS] != ELFCLASS64) {
+        close(fd);
+        return -1;
+    }
+
+    int rc = -1;
+    for (size_t i = 0; i < sizeof(g_webview_profiles) / sizeof(g_webview_profiles[0]); i++) {
+        const webview_ssl_profile *pf = &g_webview_profiles[i];
+        if (pf->write_off + 16 > size || pf->read_off + 16 > size) continue;
+
+        uint8_t wsig[16], rsig[16];
+        if (pread(fd, wsig, sizeof(wsig), (off_t)(data_off + pf->write_off)) != (ssize_t)sizeof(wsig)) continue;
+        if (pread(fd, rsig, sizeof(rsig), (off_t)(data_off + pf->read_off)) != (ssize_t)sizeof(rsig)) continue;
+        if (memcmp(wsig, pf->write_sig, sizeof(wsig)) != 0 ||
+            memcmp(rsig, pf->read_sig, sizeof(rsig)) != 0) {
+            continue;
+        }
+
+        *out_write = data_off + pf->write_off;
+        *out_read = data_off + pf->read_off;
+        rc = 0;
+        break;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "WARN:webview-profile-miss %s (entry signature mismatch)\n", apk_path);
+    }
+
+    close(fd);
+    return rc;
+}
+
 static void inspect_library_offsets(const char *path, int check_cronet, library_probe_result *out) {
     memset(out, 0, sizeof(*out));
     out->ssl_source = "none";
@@ -1676,7 +1849,7 @@ static void inspect_library_offsets(const char *path, int check_cronet, library_
 
     for (int r = 0; r < g_ssl_rule_count; r++) {
         if (strstr(path, g_ssl_rules[r].lib_substr) != NULL &&
-            g_ssl_rules[r].write_off != 0 && g_ssl_rules[r].read_off != 0) {
+            g_ssl_rules[r].read_off != 0) {
             out->off_write = g_ssl_rules[r].write_off;
             out->off_read = g_ssl_rules[r].read_off;
             out->off_sni = g_ssl_rules[r].sni_off;
@@ -1686,7 +1859,14 @@ static void inspect_library_offsets(const char *path, int check_cronet, library_
         }
     }
     if (!out->has_ssl) {
-        if (resolve_elf_symbol_offset(path, "SSL_write", &out->off_write) == 0 &&
+        /* WebView：Chromium 以 APK 内嵌 .so 的形式映射，uprobe 需要 APK 内绝对偏移 */
+        if (strstr(path, ".apk") != NULL &&
+            resolve_webview_apk_offsets(path, &out->off_write, &out->off_read) == 0) {
+            out->off_sni = 0;
+            out->has_ssl = 1;
+            out->ssl_source = "webview_apk";
+        }
+        else if (resolve_elf_symbol_offset(path, "SSL_write", &out->off_write) == 0 &&
             resolve_elf_symbol_offset(path, "SSL_read", &out->off_read) == 0) {
             out->has_ssl = 1;
             out->ssl_source = "dynsym";
@@ -1797,7 +1977,13 @@ static int try_attach_library(const char *path, bpf_bundle *bundle, int num_cpus
         snprintf(suf_rr, sizeof(suf_rr), "rr_%d", idx);
         snprintf(suf_sni, sizeof(suf_sni), "sni_%d", idx);
 
-        int rc1 = attach_uprobe_pmu_or_tracefs(path, off_write, 0, suf_w, bundle->prog_write_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt);
+        int rc1 = 0;
+        if (off_write != 0) {
+            rc1 = attach_uprobe_pmu_or_tracefs(path, off_write, 0, suf_w, bundle->prog_write_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt);
+            if (rc1 != 0) rc1 = -1;
+        } else {
+            fprintf(stderr, "INFO:ssl-read-only %s (no write offset)\n", path);
+        }
         int rc2 = (rc1 == 0) ? attach_uprobe_pmu_or_tracefs(path, off_read, 0, suf_rw, bundle->prog_read_enter_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt) : -1;
         int rc3 = (rc2 == 0) ? attach_uprobe_pmu_or_tracefs(path, off_read, 1, suf_rr, bundle->prog_read_exit_fd, num_cpus, g_attached_libs[idx].uprobe_fds, &fd_cnt) : -1;
 
@@ -3235,7 +3421,9 @@ int main(int argc, char **argv) {
                     r->write_off = (uint64_t)strtoull(p1 + 1, NULL, 0);
                     r->read_off = (uint64_t)strtoull(p2 + 1, NULL, 0);
                     r->sni_off = p3 ? (uint64_t)strtoull(p3 + 1, NULL, 0) : 0ULL;
-                    if (r->lib_substr[0] && r->write_off > 0 && r->read_off > 0) {
+                    /* read_off 必须有；write_off 允许为 0（只抓响应方向的只读模式，
+                     * 例如 WebView 内嵌 chromium 尚未定位到 SSL_write 时）。 */
+                    if (r->lib_substr[0] && r->read_off > 0) {
                         g_ssl_rule_count++;
                     }
                 }
