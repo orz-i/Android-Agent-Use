@@ -4,6 +4,33 @@
 
 ---
 
+## [Unreleased]
+
+### 🏷️ 屏幕文本实体抽取：把一串文字变成可点击的区间 (On-device NER)
+
+- **新入口 `AauEntityExtractor`**（`:aau-vision`，LiteRT 后端）：把调用方给的文本映射成实体区间，
+  覆盖 27 类 —— 人名、电话、书面/口语地址、行政区划、公司、机构、政府、学校、医院、餐厅、酒店、
+  商超、银行、银行卡号、快递单号、航班号、车次、地铁站、公交站、机场/火车站、加油站。
+  返回**字符偏移**（半开区间）与原文切片，可以直接回切做点击、高亮或后续动作。
+- **模型取自 `com.oplus.aiunit`**（`engine-nlp_ner_information_intent` 3.0.6）：1.3MB、字符级、
+  双向 LSTM。实测一句中文 **25ms**（PLK110 / Android 17，512 字符窗口，CPU 双线程）。
+- **不给置信度**：argmax 已经烘进图里，输出就是标签 id。KDoc 与 README 都写明这一点，
+  免得上层拿它去调阈值。
+- **长文本按 512 字符切窗**，切点优先落在后 1/4 的空白处，偏移始终相对调用方传入的原串。
+- **分词表由资产驱动**：空格必须走 `[SPACE]`（词表里没有字面空格；验证时把它当 `[UNK]`
+  会让「北京 朝阳区 望京SOHO」只认出「望京」），未登录字和代理对的一半都落到 `[UNK]`。
+- **两个后端限制写进代码，不写在文档里**：
+  - `MNNConvert` 拒绝这张图的 `REVERSE_V2`，MNN 构建下 `supported == false`，构造时抛出明确理由；
+  - LiteRT 新的 `CompiledModel` 拒绝 variable tensor（LSTM 权重就是这么存的，`model_load.cc`
+    报 `Variable tensors not yet supported`），所以走同一 AAR 里的 TFLite 兼容 `Interpreter`。
+- **模型资产不入库**：权重属于 OPPO，已加入 `.gitignore`；`aau-vision/tools/import_ner_assets.py`
+  从解包目录校验后安装（词表 id 连续、`[PAD]`=0、BIOES 标签、flatbuffer 头），
+  词表或标签变了在导入期就失败，而不是到设备上悄悄输出乱码。
+- **测试**：15 条 JVM 用例覆盖分词、切窗、BIOES 解码（孤立 I/E、类型切换、越界 id）；
+  4 条真机用例跑真模型（含跨窗口偏移），另 1 条耗时护栏；未安装资产时真机用例自动跳过。
+
+---
+
 ## [0.4.0] - 2026-11-19
 
 ### 🔓 安全图层抓取：FLAG_SECURE 页面也能出图 (Secure Layer Capture)
