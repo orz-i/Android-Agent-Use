@@ -63,6 +63,18 @@ class AauEntityExtractorDeviceTest {
     }
 
     @Test
+    fun repeatedCallsOnOneInterpreterAgree() {
+        // The graph keeps its weights in variable tensors; if the runtime carried state
+        // between invocations the second call would drift.
+        val text = "明天下午三点去北京朝阳区望京SOHO找张三"
+        AauEntityExtractor(assets).use { extractor ->
+            val first = extractor.extract(text)
+            assertTrue("expected spans, got $first", first.isNotEmpty())
+            repeat(3) { assertEquals(first, extractor.extract(text)) }
+        }
+    }
+
+    @Test
     fun oneWindowStaysWellUnderASecond() {
         val text = "明天下午三点去北京朝阳区望京SOHO找张三"
         AauEntityExtractor(assets).use { extractor ->
