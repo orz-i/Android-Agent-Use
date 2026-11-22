@@ -50,3 +50,8 @@ release-assets/
 *.tmp
 *.log
 scratch/
+
+# NER model assets are OPPO's (com.oplus.aiunit), not redistributable. Provision them
+# locally with aau-vision/tools/import_ner_assets.py; the icon model is ours and stays.
+aau-vision/src/litert/assets/aau_ner_v1.*
+
