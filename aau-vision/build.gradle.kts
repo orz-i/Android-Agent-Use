@@ -52,9 +52,5 @@ android {
 kotlin { jvmToolchain(17) }
 
 dependencies {
-    if (backend == "litert") implementation(project(":aau-vision-litert"))
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.test.runner)
-    androidTestImplementation(libs.androidx.test.ext.junit)
+    if (backend == "litert") implementation(project(":aau-litert"))
 }
