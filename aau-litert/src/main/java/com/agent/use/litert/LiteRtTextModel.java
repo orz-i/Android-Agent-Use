@@ -43,7 +43,12 @@ public final class LiteRtTextModel implements Closeable {
     private final ByteBuffer model;
 
     public LiteRtTextModel(AssetManager assets, String name) {
-        model = readModel(assets, name + ".tflite");
+        this(readModel(assets, name + ".tflite"));
+    }
+
+    /** For callers without this APK's AssetManager, such as an app_process daemon reading a deployed file. */
+    public LiteRtTextModel(ByteBuffer model) {
+        this.model = model;
         Interpreter.Options options = new Interpreter.Options();
         // A 512-step LSTM is latency-bound; more threads only add hand-off cost.
         options.setNumThreads(2);

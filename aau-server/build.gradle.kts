@@ -34,6 +34,13 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
     }
+
+    lint {
+        // lifecycle 的 NonNullableMutableLiveDataDetector 与 Kotlin 2.1 分析 API 不兼容
+        // （KaCallableMemberCall 期望接口），分析本模块源码时抛 IncompatibleClassChangeError。
+        // 守护进程没有 LiveData，关掉这条检查。
+        disable += "NullSafeMutableLiveData"
+    }
 }
 
 kotlin {
@@ -42,6 +49,8 @@ kotlin {
 
 dependencies {
     implementation(project(":aau-common"))
+    // 裸进程里的端上实体识别：类进 dex，libLiteRt.so 由 packageServerDex 一并导出。
+    implementation(project(":aau-ner"))
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)
 }
@@ -89,6 +98,20 @@ val packageServerDexTask = tasks.register("packageServerDex") {
                     println("Successfully created standalone server jar: ${outputJar.absolutePath} (${outputJar.length()} bytes)")
                 } else {
                     println("Warning: classes.dex not found in ${apkFile.name}")
+                }
+
+                // app_process 没有 nativeLibraryDir，LiteRT 要按绝对路径 System.load（见 NativeLibraries）。
+                // 单独导出，部署时放到 /data/local/tmp/aau/lib/ 或 jar 同级的 lib/。
+                val soEntry = zip.getEntry("lib/arm64-v8a/libLiteRt.so")
+                if (soEntry != null) {
+                    val soFile = File(buildDir, "outputs/native/arm64-v8a/libLiteRt.so")
+                    soFile.parentFile.mkdirs()
+                    zip.getInputStream(soEntry).use { input ->
+                        soFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    println("Extracted libLiteRt.so: ${soFile.absolutePath} (${soFile.length()} bytes)")
+                } else {
+                    println("Warning: lib/arm64-v8a/libLiteRt.so not found in ${apkFile.name}")
                 }
             }
         }

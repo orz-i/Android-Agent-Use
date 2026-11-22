@@ -42,6 +42,10 @@ object AgentServerMain {
         val token = args[2]
         val mode = if (args.size >= 4) args[3] else "provider"
 
+        // 裸进程没有 nativeLibraryDir：随包走的 LiteRT 要先按绝对路径载入，
+        // 之后 NER 这类能力才可用；找不到库只记日志，不影响守护进程本身。
+        NativeLibraries.loadLiteRt()
+
         // 初始化主线程 Looper
         Looper.prepareMainLooper()
 

@@ -2,6 +2,7 @@ package com.agent.use.ner
 
 import android.content.res.AssetManager
 import java.io.Closeable
+import java.io.File
 import kotlin.math.min
 
 internal const val MODEL = "aau_ner_v1"
@@ -66,6 +67,16 @@ class AauEntityExtractor internal constructor(
 
         /** False when the ABI has no LiteRT runtime, which is the only backend for this graph. */
         val supported: Boolean get() = CpuTextModel.isSupported()
+
+        /**
+         * 从磁盘装载，给没有本 APK assets 的进程用（`app_process` 守护进程）。
+         * 三个文件分别是模型、词表、标签表；路径和资产名无关，部署脚本放哪就从哪读。
+         */
+        fun fromFiles(model: File, vocabulary: File, labels: File): AauEntityExtractor = AauEntityExtractor(
+            Vocabulary.ofFile(vocabulary),
+            Labels.ofFile(labels),
+            CpuTextModel.fromFile(model),
+        )
 
         private fun createModel(assets: AssetManager): TokenTagger {
             require(CpuTextModel.isSupported()) {
@@ -145,6 +156,8 @@ internal class Vocabulary private constructor(lines: List<String>) {
         fun fromAssets(assets: AssetManager, name: String): Vocabulary =
             Vocabulary(assets.open(name).bufferedReader().use { it.readLines() })
 
+        fun ofFile(file: File): Vocabulary = Vocabulary(file.bufferedReader().use { it.readLines() })
+
         internal fun of(vararg lines: String) = Vocabulary(lines.toList())
     }
 }
@@ -187,6 +200,8 @@ internal class Labels private constructor(lines: List<String>) {
 
         fun fromAssets(assets: AssetManager, name: String): Labels =
             Labels(assets.open(name).bufferedReader().use { it.readLines() })
+
+        fun ofFile(file: File): Labels = Labels(file.bufferedReader().use { it.readLines() })
 
         internal fun of(vararg lines: String) = Labels(lines.toList())
 
