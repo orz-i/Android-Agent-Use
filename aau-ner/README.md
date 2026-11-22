@@ -39,9 +39,28 @@ The graph is a bidirectional LSTM: it derives its own sequence length with a `WH
 
 LiteRT's `CompiledModel` also refuses it — `model_load.cc` rejects variable tensors, which is how the LSTM weights are stored. `LiteRtTextModel` therefore goes through the TFLite-compatible `Interpreter` shipped in the same artifact. That is the whole reason the text path and the icon path use different LiteRT APIs.
 
+## Running without an APK (`app_process`)
+
+A daemon started with `app_process` has no `nativeLibraryDir`, so LiteRT's own
+`System.loadLibrary("LiteRt")` fails with `dlopen failed: library "libLiteRt.so" not found`.
+Load the file by absolute path first — bionic records the SONAME, and the later
+`loadLibrary` hits the copy already in the process:
+
+```kotlin
+System.load("/data/local/tmp/aau/lib/libLiteRt.so")
+AauEntityExtractor.fromFiles(model, vocabulary, labels).use { it.extract(text) }
+```
+
+`fromFiles` skips `AssetManager` entirely, which is the point: the daemon's context belongs to
+`com.android.shell`, not to the APK that carries these assets. Measured on a PLK110
+(Android 17, uid 2000): after the `System.load`, one 512-character window takes 21 ms.
+`aau-server` wraps both steps in `NativeLibraries` and exposes `NerSelfCheck` for this.
+
 ## Size
 
 The model is 1.3 MB. The LiteRT runtime dominates: `libLiteRt.so` is 5.6 MB for `arm64-v8a`, 7.8 MB for `x86_64`, 3.7 MB for `armeabi-v7a`. An APK only packages the ABIs it declares, so the usual arm64-only build grows by about 7 MB. If that is too much for a particular consumer, exclude `:aau-ner` from that build rather than swapping the backend — there is nothing to swap.
+
+`:aau-server` takes the other trade: its standalone dex goes from 4.1 MB to 9.1 MB because the LiteRT Java classes come along, and the 5.6 MB `.so` is deployed next to the jar instead of inside it.
 
 ## Tests
 

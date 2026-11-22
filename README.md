@@ -358,7 +358,26 @@ val json = report.desensitize().toJson()
 ### 2. 打包独立服务端 Jar / Dex
 ```bash
 ./gradlew packageServerDex
-# 输出路径: aau-server/build/outputs/aau-server.jar
+# 输出: aau-server/build/outputs/aau-server.jar
+#       aau-server/build/outputs/classes.dex
+#       aau-server/build/outputs/native/arm64-v8a/libLiteRt.so
+```
+
+jar 里只有 dex。LiteRT 的原生库要单独部署：裸 `app_process` 进程没有 `nativeLibraryDir`，
+`System.loadLibrary` 只找 `/system/lib64`，所以守护进程启动时按绝对路径 `System.load`
+（见 `aau-server` 的 `NativeLibraries`）。库放在 jar 同级的 `lib/`，或下面的默认位置：
+
+```bash
+adb push aau-server/build/outputs/aau-server.jar /data/local/tmp/
+adb push aau-server/build/outputs/native/arm64-v8a/libLiteRt.so /data/local/tmp/aau/lib/
+```
+
+需要端上实体识别时再放模型（资产不入库，生成方式见 `aau-ner/README.md`）：
+
+```bash
+adb push aau-ner/src/main/assets/aau_ner_v1.* /data/local/tmp/ner/
+adb shell "CLASSPATH=/data/local/tmp/aau-server.jar app_process /system/bin \
+  com.agent.use.server.NerSelfCheck /data/local/tmp/ner"
 ```
 
 ### 3. 运行全链路单元测试

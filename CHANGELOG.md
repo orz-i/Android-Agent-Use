@@ -33,6 +33,17 @@
   词表或标签变了在导入期就失败，而不是到设备上悄悄输出乱码。
 - **测试**：15 条 JVM 用例覆盖分词、切窗、BIOES 解码（孤立 I/E、类型切换、越界 id）；
   6 条真机用例跑真模型（含跨窗口偏移、同一解释器重复调用一致、耗时护栏）；未安装资产时自动跳过。
+- **裸 `app_process` 进程也能跑**：这种进程没有 `nativeLibraryDir`，LiteRT 的
+  `System.loadLibrary("LiteRt")` 只会报 `dlopen failed: library "libLiteRt.so" not found`。
+  `NativeLibraries` 在守护进程启动时按绝对路径 `System.load`；`libLiteRt.so` 带 SONAME，
+  bionic 记下之后 LiteRT 自己的 `loadLibrary` 命中已载入的那份。实测（PLK110 / Android 17 /
+  uid 2000）一窗 512 字 **21ms**。反射改 `DexPathList.nativeLibraryDirectories` 那条路
+  在 Android 17 上字段已从 `File[]` 变成 `ArrayList`，不再通用，所以没采用。
+- **`AauEntityExtractor.fromFiles`**：给没有本 APK assets 的进程用，直接读磁盘上的
+  模型、词表、标签表；`LiteRtTextModel` 也接受现成的 `ByteBuffer`。
+- **`:aau-server` 自带 NER**：`packageServerDex` 同时导出 `native/arm64-v8a/libLiteRt.so`，
+  `NerSelfCheck` 在设备上从加载库到抽实体跑一遍。代价是独立 dex 从 4.1MB 涨到 9.1MB
+  （LiteRT 的 Java 类跟着进来），so 单独部署、不塞进 jar。
 
 ---
 
