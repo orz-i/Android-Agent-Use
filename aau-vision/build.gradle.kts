@@ -11,6 +11,7 @@ android {
 
     defaultConfig {
         minSdk = 30
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         if (backend == "mnn") {
             ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
             val sourceDir = providers.gradleProperty("aauMnnSourceDir").orNull
@@ -52,4 +53,8 @@ kotlin { jvmToolchain(17) }
 
 dependencies {
     if (backend == "litert") implementation(project(":aau-vision-litert"))
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }
