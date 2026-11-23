@@ -183,7 +183,17 @@ struct jni_event_extra {
     __u32 method_id;
     __u32 aux;      // REGISTER: method count | REGION: start offset in the array
     __u32 length;   // REGION: bytes in this chunk (0 for other directions)
-    __u32 pad;
+    // Candidate byte-lengths of the *input* jbyteArray, one per plausible ART
+    // array layout offset. The userspace side picks the one that matches a
+    // captured response body, which is the only exact identity this channel has:
+    // the wire frame names a native method, never a request.
+    __u32 in_len[4];
+    // First 16 bytes of the decoder's *input* array, copied at the return of
+    // GetByteArrayElements / GetPrimitiveArrayCritical on the array the caller
+    // passed in. This is the only identity that needs no ART layout guesswork:
+    // the bytes are the ciphertext, which the SSL layer already saw on the wire,
+    // so userspace can bind a plaintext to its response by comparing prefixes.
+    __u32 in_fp[4];
     __u64 key;      // REGION: array handle, used to reassemble chunked writes
 };
 
@@ -213,11 +223,29 @@ struct bpf_map_def jni_addr_map = {
 
 // tid -> method_id for the in-flight native call, so the return probe knows
 // which method it is closing. Entry probes can read the PC; return probes cannot.
+struct jni_call_val {
+    __u32 method_id;
+    __u32 in_len[4]; // see struct jni_event_extra: per-layout candidates
+    __u32 in_fp[4];  // first 16 bytes of the input array, filled by the array-read probe
+    __u64 array;     // handle the caller passed, so only its own reads are recorded
+};
+
+// tid -> what kind of array helper is currently on the stack (1 = data pointer,
+// 2 = length). Written by the entry probe, consumed by its exit probe.
+SEC("maps")
+struct bpf_map_def jni_arg_probe_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u64),
+    .value_size = sizeof(__u32),
+    .max_entries = 4096,
+    .map_flags = 0,
+};
+
 SEC("maps")
 struct bpf_map_def jni_call_map = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(__u64),
-    .value_size = sizeof(__u32),
+    .value_size = sizeof(struct jni_call_val),
     .max_entries = 4096,
     .map_flags = 0,
 };
@@ -660,6 +688,8 @@ static __inline __attribute__((always_inline)) void emit_jni_event_full(
     __u32 method_id,
     __u32 aux,
     __u32 length,
+    const __u32 *in_len,
+    const __u32 *in_fp,
     __u64 key
 ) {
     __u32 zero = 0;
@@ -680,7 +710,24 @@ static __inline __attribute__((always_inline)) void emit_jni_event_full(
     ex->method_id = method_id;
     ex->aux = aux;
     ex->length = length;
-    ex->pad = 0;
+    if (in_len) {
+        for (int i = 0; i < 4; i++) {
+            ex->in_len[i] = in_len[i];
+        }
+    } else {
+        for (int i = 0; i < 4; i++) {
+            ex->in_len[i] = 0;
+        }
+    }
+    if (in_fp) {
+        for (int i = 0; i < 4; i++) {
+            ex->in_fp[i] = in_fp[i];
+        }
+    } else {
+        for (int i = 0; i < 4; i++) {
+            ex->in_fp[i] = 0;
+        }
+    }
     ex->key = key;
 
     __u32 emit_size = (__u32)(sizeof(struct tls_event_hdr) + sizeof(struct jni_event_extra));
@@ -695,7 +742,7 @@ static __inline __attribute__((always_inline)) void emit_jni_event(
     __u32 method_id,
     __u32 aux
 ) {
-    emit_jni_event_full(ctx, uid, direction, ptr, method_id, aux, 0U, 0ULL);
+    emit_jni_event_full(ctx, uid, direction, ptr, method_id, aux, 0U, 0, 0, 0ULL);
 }
 
 // art::JNI<*>::RegisterNatives(JNIEnv* env [x0], jclass clazz [x1],
@@ -743,6 +790,149 @@ int probe_reg_natives_exit(struct pt_regs *ctx) {
     return 0;
 }
 
+// First jbyteArray argument of a registered native method: env, this/class, array.
+// ART hands out indirect handles, so the object may sit one dereference away; the
+// array length field moves with the ART version as well. Rather than guess, read
+// every plausible slot and let userspace line one of them up with a real response
+// body -- a wrong candidate simply matches nothing.
+#define JNI_INPUT_MAX_LEN (8U * 1024U * 1024U)
+
+static __inline __attribute__((always_inline)) void read_jni_input_lengths(
+    __u64 array,
+    __u32 *out
+) {
+    for (int i = 0; i < 4; i++) {
+        out[i] = 0;
+    }
+    if (!array) {
+        return;
+    }
+
+    __u64 base = array;
+    __u64 maybe = 0;
+    if (bpf_probe_read_user(&maybe, sizeof(maybe), (const void *)array) == 0 &&
+        maybe > 0x10000ULL) {
+        __u64 clean = maybe & ~0x3ULL;
+        if (clean != array) {
+            base = clean;
+        }
+    }
+
+    // mirror::Array length lives at 4/8/12/16 depending on ART build and on
+    // whether the object is direct (data inline) or an indirect handle.
+    static const __u32 offs[4] = {4U, 8U, 12U, 16U};
+    for (int i = 0; i < 4; i++) {
+        __u32 v = 0;
+        if (bpf_probe_read_user(&v, sizeof(v), (const void *)(base + offs[i])) != 0) {
+            continue;
+        }
+        out[i] = (v > 0U && v <= JNI_INPUT_MAX_LEN) ? v : 0U;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exact identity for an in-process plaintext.
+//
+// A wire frame names the native method, never the request, so userspace has to
+// guess which response a plaintext belongs to. Lengths read straight out of the
+// ART array object are a guess too (layout moves between ART builds), and a
+// wrong guess silently glues A's JSON onto B's response.
+//
+// The decoder has to make the same two JNI calls any native code would:
+// art::JNI::GetArrayLength() for the size and GetByteArrayElements() (or
+// GetPrimitiveArrayCritical) for the bytes. Both are exported, both name the
+// array in x1, so gating on "x1 == the array this call received" is exact:
+//   * length exit  -> x0 is the real byte length of the input array
+//   * bytes exit   -> x0 is a usable pointer to those bytes; copying 16 of them
+//                     gives a fingerprint userspace can match against the body
+//                     it already saw on the wire.
+// Nothing here guesses at ART internals.
+// ---------------------------------------------------------------------------
+
+static __inline __attribute__((always_inline)) void mark_arg_probe(__u32 kind, __u64 wanted_array) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct jni_call_val *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    if (!slot) {
+        return;
+    }
+    if (!wanted_array || slot->array != wanted_array) {
+        return;
+    }
+    bpf_map_update_elem(&jni_arg_probe_map, &pid_tgid, &kind, BPF_ANY);
+}
+
+static __inline __attribute__((always_inline)) int take_arg_probe(__u32 kind) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 *mark = bpf_map_lookup_elem(&jni_arg_probe_map, &pid_tgid);
+    if (!mark || *mark != kind) {
+        return 0;
+    }
+    bpf_map_delete_elem(&jni_arg_probe_map, &pid_tgid);
+    return 1;
+}
+
+// art::JNI<*>::GetArrayLength(JNIEnv* env [x0], jarray array [x1]) -> jsize
+SEC("uprobe/array_len")
+int probe_array_len_entry(struct pt_regs *ctx) {
+    mark_arg_probe(2U, (__u64)PT_REGS_PARM2(ctx));
+    return 0;
+}
+
+SEC("uretprobe/array_len_exit")
+int probe_array_len_exit(struct pt_regs *ctx) {
+    if (!take_arg_probe(2U)) {
+        return 0;
+    }
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct jni_call_val *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    if (!slot) {
+        return 0;
+    }
+    __s64 n = (__s64)PT_REGS_RC(ctx);
+    if (n <= 0 || n > (__s64)JNI_INPUT_MAX_LEN) {
+        return 0;
+    }
+    // This one is not a candidate, it is the answer.
+    slot->in_len[0] = (__u32)n;
+    slot->in_len[1] = 0;
+    slot->in_len[2] = 0;
+    slot->in_len[3] = 0;
+    return 0;
+}
+
+// art::JNI<*>::GetByteArrayElements(JNIEnv* env [x0], jbyteArray array [x1],
+//                                   jboolean* isCopy [x2]) -> jbyte*
+// art::JNI<*>::GetPrimitiveArrayCritical(... same shape ...) -> void*
+SEC("uprobe/array_get")
+int probe_array_get_entry(struct pt_regs *ctx) {
+    mark_arg_probe(1U, (__u64)PT_REGS_PARM2(ctx));
+    return 0;
+}
+
+SEC("uretprobe/array_get_exit")
+int probe_array_get_exit(struct pt_regs *ctx) {
+    if (!take_arg_probe(1U)) {
+        return 0;
+    }
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct jni_call_val *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    if (!slot) {
+        return 0;
+    }
+    __u64 p = (__u64)PT_REGS_RC(ctx);
+    if (!p) {
+        return 0;
+    }
+    __u32 fp[4];
+    if (bpf_probe_read_user(fp, sizeof(fp), (const void *)p) != 0) {
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        slot->in_fp[i] = fp[i];
+    }
+    return 0;
+}
+
 // Entry of a probed native method. The PC identifies which registered address
 // fired, so the method id is stashed under the calling thread until return.
 SEC("uprobe/jni_arg")
@@ -763,20 +953,33 @@ int probe_jni_entry(struct pt_regs *ctx) {
         return 0;
     }
 
-    __u32 method_id = *slot;
+    struct jni_call_val val;
+    val.method_id = *slot;
+    val.array = (__u64)PT_REGS_PARM3(ctx);
+    for (int i = 0; i < 4; i++) {
+        val.in_fp[i] = 0;
+    }
+    read_jni_input_lengths(val.array, val.in_len);
+
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&jni_call_map, &pid_tgid, &method_id, BPF_ANY);
+    bpf_map_update_elem(&jni_call_map, &pid_tgid, &val, BPF_ANY);
     return 0;
 }
 
 SEC("uretprobe/jni_ret")
 int probe_jni_return(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    struct jni_call_val *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
     if (!slot) {
         return 0;
     }
-    __u32 method_id = *slot;
+    __u32 method_id = slot->method_id;
+    __u32 in_len[4];
+    __u32 in_fp[4];
+    for (int i = 0; i < 4; i++) {
+        in_len[i] = slot->in_len[i];
+        in_fp[i] = slot->in_fp[i];
+    }
     bpf_map_delete_elem(&jni_call_map, &pid_tgid);
 
     __u32 uid = match_target_uid();
@@ -789,7 +992,7 @@ int probe_jni_return(struct pt_regs *ctx) {
         return 0;
     }
 
-    emit_jni_event(ctx, uid, DIRECTION_JNI_RETURN, ret, method_id, 0U);
+    emit_jni_event_full(ctx, uid, DIRECTION_JNI_RETURN, ret, method_id, 0U, 0U, in_len, in_fp, 0ULL);
     return 0;
 }
 
@@ -805,7 +1008,7 @@ int probe_jni_return(struct pt_regs *ctx) {
 SEC("uprobe/array_region")
 int probe_array_region(struct pt_regs *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
+    struct jni_call_val *slot = bpf_map_lookup_elem(&jni_call_map, &pid_tgid);
     if (!slot) {
         return 0;
     }
@@ -823,8 +1026,16 @@ int probe_array_region(struct pt_regs *ctx) {
         return 0;
     }
 
-    emit_jni_event_full(ctx, uid, DIRECTION_JNI_REGION, buf, *slot,
-                        (__u32)start, (__u32)len, array);
+    __u32 method_id = slot->method_id;
+    __u32 in_len[4];
+    __u32 in_fp[4];
+    for (int i = 0; i < 4; i++) {
+        in_len[i] = slot->in_len[i];
+        in_fp[i] = slot->in_fp[i];
+    }
+
+    emit_jni_event_full(ctx, uid, DIRECTION_JNI_REGION, buf, method_id,
+                        (__u32)start, (__u32)len, in_len, in_fp, array);
     return 0;
 }
 

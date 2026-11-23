@@ -1206,6 +1206,10 @@ typedef struct {
     int prog_jni_arg_fd;
     int prog_jni_ret_fd;
     int prog_array_region_fd;
+    int prog_array_len_entry_fd;
+    int prog_array_len_exit_fd;
+    int prog_array_get_entry_fd;
+    int prog_array_get_exit_fd;
     int jni_reg_args_map_fd;
     int jni_addr_map_fd;
 } bpf_bundle;
@@ -1348,7 +1352,11 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
         "uretprobe/reg_natives_exit",
         "uprobe/jni_arg",
         "uretprobe/jni_ret",
-        "uprobe/array_region"
+        "uprobe/array_region",
+        "uprobe/array_len",
+        "uretprobe/array_len_exit",
+        "uprobe/array_get",
+        "uretprobe/array_get_exit"
     };
     int *prog_fds[] = {
         &out->prog_write_fd,
@@ -1363,9 +1371,13 @@ static int load_bpf_object(const uint8_t *obj, size_t obj_len, int num_cpus, bpf
         &out->prog_reg_natives_exit_fd,
         &out->prog_jni_arg_fd,
         &out->prog_jni_ret_fd,
-        &out->prog_array_region_fd
+        &out->prog_array_region_fd,
+        &out->prog_array_len_entry_fd,
+        &out->prog_array_len_exit_fd,
+        &out->prog_array_get_entry_fd,
+        &out->prog_array_get_exit_fd
     };
-    const int prog_required[] = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int prog_required[] = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const int prog_count = (int)(sizeof(prog_secs) / sizeof(prog_secs[0]));
 
     for (int p = 0; p < prog_count; p++) {
@@ -2281,6 +2293,14 @@ typedef struct {
     uint32_t direction;
     uint32_t length;
     uint64_t ssl_ptr;
+    // Candidate byte-lengths of the decoder's *input* array. Only the JNI result
+    // frames fill this in; it is what lets userspace bind a plaintext to the
+    // response it came from, since the frame itself carries no request id.
+    uint32_t in_len[4];
+    // First 16 bytes of that same input array, i.e. the ciphertext userspace
+    // already saw on the wire. Pairs a plaintext with its response by content
+    // instead of by a length that ART's layout can make us misread.
+    uint32_t in_fp[4];
 } __attribute__((packed)) wire_tls_hdr;
 
 typedef struct {
@@ -2367,6 +2387,7 @@ static void flush_event_batch(void) {
     }
     for (int i = 0; i < g_batch_count; i++) {
         wire_tls_hdr wh;
+        memset(&wh, 0, sizeof(wh));
         wh.magic = 0x45554141U; // "AAUE" little-endian
         wh.pid = g_batch_metas[i].hdr.pid;
         wh.uid = g_batch_metas[i].hdr.uid;
@@ -2919,7 +2940,9 @@ static void write_jni_result_frame(
     uint32_t uid,
     uint32_t method_id,
     const uint8_t *data,
-    uint32_t len
+    uint32_t len,
+    const uint32_t *in_len,
+    const uint32_t *in_fp
 ) {
     wire_tls_hdr wh;
     memset(&wh, 0, sizeof(wh));
@@ -2929,6 +2952,12 @@ static void write_jni_result_frame(
     wh.direction = 9U;
     wh.length = len;
     wh.ssl_ptr = (uint64_t)method_id;
+    if (in_len) {
+        for (int i = 0; i < 4; i++) wh.in_len[i] = in_len[i];
+    }
+    if (in_fp) {
+        for (int i = 0; i < 4; i++) wh.in_fp[i] = in_fp[i];
+    }
     fwrite(&wh, 1, sizeof(wh), stdout);
     if (len > 0 && data) fwrite(data, 1, len, stdout);
     fflush(stdout);
@@ -3006,16 +3035,20 @@ static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra) {
         return;
     }
 
-    if (bh->direction == 11U && bh->length >= 24U) {
-        // extra layout: method_id | start | chunk length | pad | array handle
+    // extra layout: method_id | start | chunk length | in_len[4] | in_fp[4] | array handle
+    if (bh->direction == 11U && bh->length >= 8U) {
         uint32_t method_id = 0;
         uint32_t start = 0;
         uint32_t chunk = 0;
+        uint32_t in_len[4] = {0, 0, 0, 0};
+        uint32_t in_fp[4] = {0, 0, 0, 0};
         uint64_t key = 0;
         memcpy(&method_id, extra, sizeof(method_id));
         memcpy(&start, extra + 4, sizeof(start));
         memcpy(&chunk, extra + 8, sizeof(chunk));
-        memcpy(&key, extra + 16, sizeof(key));
+        if (bh->length >= 28U) memcpy(in_len, extra + 12, sizeof(in_len));
+        if (bh->length >= 44U) memcpy(in_fp, extra + 28, sizeof(in_fp));
+        if (bh->length >= 56U) memcpy(&key, extra + 44, sizeof(key));
         if (method_id >= (uint32_t)g_jni_target_count) return;
 
         const jni_target *t = &g_jni_targets[method_id];
@@ -3072,7 +3105,7 @@ static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra) {
         }
 
         if (shaped) {
-            write_jni_result_frame(bh->pid, bh->uid, method_id, a->buf, a->total);
+            write_jni_result_frame(bh->pid, bh->uid, method_id, a->buf, a->total, in_len, in_fp);
         }
         region_asm_release(a);
         return;
@@ -3080,7 +3113,11 @@ static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra) {
 
     if (bh->direction == 9U && bh->length >= 8U) {
         uint32_t method_id = 0;
+        uint32_t in_len[4] = {0, 0, 0, 0};
+        uint32_t in_fp[4] = {0, 0, 0, 0};
         memcpy(&method_id, extra, sizeof(method_id));
+        if (bh->length >= 28U) memcpy(in_len, extra + 12, sizeof(in_len));
+        if (bh->length >= 44U) memcpy(in_fp, extra + 28, sizeof(in_fp));
         if (method_id >= (uint32_t)g_jni_target_count) return;
 
         static uint8_t *jni_buf = NULL;
@@ -3102,7 +3139,7 @@ static void handle_jni_event(const bpf_tls_hdr *bh, const uint8_t *extra) {
             ret_seen++;
         }
         if (n <= 0) return;
-        write_jni_result_frame(bh->pid, bh->uid, method_id, jni_buf, (uint32_t)n);
+        write_jni_result_frame(bh->pid, bh->uid, method_id, jni_buf, (uint32_t)n, in_len, in_fp);
     }
 }
 
@@ -3139,6 +3176,14 @@ static int g_jni_reg_fds[2][128];
 static int g_jni_reg_fd_count[2] = {0, 0};
 static int g_jni_region_fds[128];
 static int g_jni_region_fd_count = 0;
+static int g_jni_len_entry_fds[128];
+static int g_jni_len_entry_fd_count = 0;
+static int g_jni_len_exit_fds[128];
+static int g_jni_len_exit_fd_count = 0;
+static int g_jni_get_entry_fds[128];
+static int g_jni_get_entry_fd_count = 0;
+static int g_jni_get_exit_fds[128];
+static int g_jni_get_exit_fd_count = 0;
 
 static void attach_jni_register_probes(bpf_bundle *bundle, uint32_t target_uid, int num_cpus) {
     if (!g_jni_hook_enabled || g_jni_rule_count == 0) return;
@@ -3234,6 +3279,73 @@ static void attach_jni_register_probes(bpf_bundle *bundle, uint32_t target_uid, 
         } else {
             fprintf(stderr, "WARN:jni_region_sym_not_found:%s\n", libart);
         }
+    }
+
+    // Third/fourth observation points: the array helpers the decoder itself calls.
+    // Its input array is the ciphertext userspace already has on the wire, so these
+    // give both the exact byte length and a 16-byte content fingerprint -- an
+    // identity that does not depend on guessing ART's array layout. Attached to
+    // every variant the runtime exports; a variant that does not exist is skipped.
+    static const char *len_syms[] = {
+        "3JNIILb0EE14GetArrayLengthE",
+        "3JNIILb1EE14GetArrayLengthE"
+    };
+    static const char *get_syms[] = {
+        "3JNIILb0EE20GetByteArrayElementsE",
+        "3JNIILb1EE20GetByteArrayElementsE",
+        "3JNIILb0EE25GetPrimitiveArrayCriticalE",
+        "3JNIILb1EE25GetPrimitiveArrayCriticalE"
+    };
+    int len_hooked = 0;
+    for (size_t i = 0; i < sizeof(len_syms) / sizeof(len_syms[0]); i++) {
+        uint64_t off = 0;
+        if (resolve_symtab_symbol_offset(libart, len_syms[i], &off) != 0) continue;
+        char suf_e[48];
+        char suf_x[48];
+        snprintf(suf_e, sizeof(suf_e), "jnilen_%de", (int)i);
+        snprintf(suf_x, sizeof(suf_x), "jnilen_%dx", (int)i);
+        if (bundle->prog_array_len_entry_fd >= 0 &&
+            attach_uprobe_pmu_or_tracefs(libart, off, 0, suf_e,
+                                         bundle->prog_array_len_entry_fd, num_cpus,
+                                         g_jni_len_entry_fds, &g_jni_len_entry_fd_count) == 0 &&
+            bundle->prog_array_len_exit_fd >= 0 &&
+            attach_uprobe_pmu_or_tracefs(libart, off, 1, suf_x,
+                                         bundle->prog_array_len_exit_fd, num_cpus,
+                                         g_jni_len_exit_fds, &g_jni_len_exit_fd_count) == 0) {
+            len_hooked++;
+            fprintf(stderr, "INFO:jni_array_len_probe lib=%s off=0x%llx sym=%s\n",
+                    libart, (unsigned long long)off, len_syms[i]);
+            fflush(stderr);
+        }
+    }
+    if (len_hooked == 0) {
+        fprintf(stderr, "WARN:jni_array_len_probe_all_failed\n");
+    }
+
+    int get_hooked = 0;
+    for (size_t i = 0; i < sizeof(get_syms) / sizeof(get_syms[0]); i++) {
+        uint64_t off = 0;
+        if (resolve_symtab_symbol_offset(libart, get_syms[i], &off) != 0) continue;
+        char suf_e[48];
+        char suf_x[48];
+        snprintf(suf_e, sizeof(suf_e), "jniget_%de", (int)i);
+        snprintf(suf_x, sizeof(suf_x), "jniget_%dx", (int)i);
+        if (bundle->prog_array_get_entry_fd >= 0 &&
+            attach_uprobe_pmu_or_tracefs(libart, off, 0, suf_e,
+                                         bundle->prog_array_get_entry_fd, num_cpus,
+                                         g_jni_get_entry_fds, &g_jni_get_entry_fd_count) == 0 &&
+            bundle->prog_array_get_exit_fd >= 0 &&
+            attach_uprobe_pmu_or_tracefs(libart, off, 1, suf_x,
+                                         bundle->prog_array_get_exit_fd, num_cpus,
+                                         g_jni_get_exit_fds, &g_jni_get_exit_fd_count) == 0) {
+            get_hooked++;
+            fprintf(stderr, "INFO:jni_array_get_probe lib=%s off=0x%llx sym=%s\n",
+                    libart, (unsigned long long)off, get_syms[i]);
+            fflush(stderr);
+        }
+    }
+    if (get_hooked == 0) {
+        fprintf(stderr, "WARN:jni_array_get_probe_all_failed\n");
     }
 }
 
