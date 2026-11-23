@@ -561,6 +561,18 @@ class AgentNetworkManager(
         get() = currentPackage
 
     /**
+     * 端侧 eBPF 引擎这次挂上的**进程内解密入口**(`nativeDecodeContent` 一类)。
+     *
+     * 空列表说明当前这个引擎没有蹲到目标 App 的 natives 注册:要么引擎起在它注册之后,
+     * 要么这个 App 根本不走这条通道。前者只能冷启动一次才好(见 PhoneNetworkPort.prepareCapture)。
+     */
+    fun localJniHookTargets(): List<String> =
+        (localEbpfEngine as? LocalRootEbpfCaptureEngine)?.jniHookTargetsSnapshot().orEmpty()
+
+    /** 本次抓包实际挂上的进程内解密入口数量。 */
+    fun localJniHookCount(): Int = localJniHookTargets().size
+
+    /**
      * 当前活跃的抓包配置契约。
      */
     val configuration: NetworkCaptureConfig?
