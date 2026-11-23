@@ -13,6 +13,7 @@ import com.agent.use.common.network.parser.TlsStreamParser
 import com.agent.use.common.network.plugin.EbpfDiscoveryReport
 import com.agent.use.common.network.plugin.EbpfProbeProfile
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.external.ExternalCapturePluginLoader
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -375,6 +376,22 @@ class LocalRootEbpfCaptureEngine(
                 } catch (t: Throwable) {
                     Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
                 }
+            }
+            // 外部插件包在这里也扫一次：抓包可能由模型直接触发，不走设置页那套加载。
+            // 注册表按 id 去重，重复加载是幂等的。
+            try {
+                val report = ExternalCapturePluginLoader.load(
+                    File(dir, ExternalCapturePluginLoader.PLUGINS_DIR_NAME),
+                    javaClass.classLoader,
+                )
+                if (report.loaded.isNotEmpty()) {
+                    Log.i(TAG, "Loaded external capture plugins: " + report.loaded.joinToString { it.id })
+                }
+                report.rejected.forEach {
+                    Log.w(TAG, "Rejected capture plugin ${it.path}: ${it.reason}")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to scan external capture plugins: ${t.message}")
             }
         }
 
