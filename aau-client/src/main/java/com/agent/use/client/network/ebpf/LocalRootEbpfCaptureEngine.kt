@@ -72,7 +72,7 @@ class LocalRootEbpfCaptureEngine(
         private const val TAG = "LocalRootEbpfEngine"
         private const val BINARY_NAME = "libaau_ebpf.so"
         internal const val WIRE_MAGIC_AAUE = 0x45554141
-        internal const val WIRE_HEADER_SIZE = 28
+        internal const val WIRE_HEADER_SIZE = 60
         internal const val DIRECTION_OUTBOUND_WRITE = 1
         internal const val DIRECTION_INBOUND_READ = 2
         internal const val DIRECTION_SNI_HOSTNAME = 3
@@ -329,7 +329,17 @@ class LocalRootEbpfCaptureEngine(
     private var stdoutThread: Thread? = null
     private val attachedLibraries = CopyOnWriteArrayList<String>()
 
+    /**
+     * 进程内解密入口(loader 的 `INFO:jni_hook`)。
+     *
+     * 这条才是"这个 App 的明文拿得到"的证据:uprobe 只有在目标进程**注册 natives 那一刻**才会命中。
+     * 空列表 = 抓包起来时它已经注册完了,再开就得冷启动(见 `CapturePreheat.RESTART_REQUIRED`)。
+     */
+    private val jniHooks = CopyOnWriteArrayList<String>()
+
     fun attachedLibrariesSnapshot(): List<String> = attachedLibraries.toList()
+
+    fun jniHookTargetsSnapshot(): List<String> = jniHooks.toList()
 
     override fun startCapture(config: NetworkCaptureConfig?, listener: INetworkEventListener?): Boolean {
         if (config == null || listener == null) {
@@ -340,6 +350,7 @@ class LocalRootEbpfCaptureEngine(
         stopCapture()
         lastError = null
         attachedLibraries.clear()
+        jniHooks.clear()
 
         val targetUid = if (config.targetUid > 0) config.targetUid else uidResolver(config.targetPackage)
         if (targetUid <= 0) {
@@ -418,6 +429,11 @@ class LocalRootEbpfCaptureEngine(
                                 attachedLibraries.addIfAbsent("cronet:$libInfo")
                             }
                             safeLogD("native attached cronet: $libInfo")
+                        } else if (line.startsWith("INFO:jni_hook ")) {
+                            // 真正命中了注册:从此这个进程的明文走 DIRECTION_JNI_RESULT 回来
+                            val detail = line.removePrefix("INFO:").trim()
+                            if (detail.isNotEmpty()) jniHooks.addIfAbsent(detail)
+                            safeLogD("jni bridge armed: $detail")
                         } else if (line.startsWith("WARN:")) {
                             synchronized(errLines) {
                                 if (errLines.size < 16) errLines.add(line)
@@ -534,6 +550,19 @@ class LocalRootEbpfCaptureEngine(
             val direction = hdrBuf.getInt(12)
             val length = hdrBuf.getInt(16)
             val sslPtr = hdrBuf.getLong(20)
+            // 仅 JNI 明文帧有效:解码器入参数组的候选长度(ART 数组布局随版本变,
+            // loader 把几个可能偏移都读出来,由 parser 挑能对上响应体长度的那个)。
+            val inLens = if (direction == DIRECTION_JNI_RESULT) {
+                IntArray(4) { hdrBuf.getInt(28 + it * 4) }
+            } else {
+                null
+            }
+            // 解码器入参数组的前 16 字节(= 线上那包密文)。按字节配对,不靠长度猜。
+            val inFp = if (direction == DIRECTION_JNI_RESULT) {
+                IntArray(4) { hdrBuf.getInt(44 + it * 4) }
+            } else {
+                null
+            }
 
             val maxAllowed = if (direction == DIRECTION_JNI_RESULT) {
                 MAX_JNI_FRAME_PAYLOAD
@@ -567,7 +596,7 @@ class LocalRootEbpfCaptureEngine(
                 DIRECTION_CRONET_RESP_HDR -> streamParser.onCronetResponseStarted(connId, payload)
                 DIRECTION_CRONET_BODY -> streamParser.onCronetReadCompleted(connId, payload)
                 DIRECTION_CRONET_FINISH -> streamParser.onCronetFinish(connId)
-                DIRECTION_JNI_RESULT -> streamParser.onDecodedJniBody(sslPtr.toInt(), payload)
+                DIRECTION_JNI_RESULT -> streamParser.onDecodedJniBody(sslPtr.toInt(), payload, inLens, inFp)
             }
         }
     }
@@ -582,6 +611,7 @@ class LocalRootEbpfCaptureEngine(
         stdoutThread?.interrupt()
         stdoutThread = null
         attachedLibraries.clear()
+        jniHooks.clear()
         parser?.clear()
         parser = null
     }

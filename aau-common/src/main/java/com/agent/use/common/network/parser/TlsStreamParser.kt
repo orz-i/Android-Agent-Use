@@ -30,8 +30,15 @@ class TlsStreamParser @JvmOverloads constructor(
     companion object {
         private const val TAG = "TlsStreamParser"
         private const val MAX_CACHED_BODIES = 500
-        private const val MAX_PENDING_DECODED_BODIES = 32
+        private const val MAX_PENDING_DECODED_BODIES = 64
+        /** 等明文时留存的密文开头长度，和 loader 采集的指纹长度对齐。 */
+        private const val STAGED_HEAD_BYTES = 16
         private const val DECODED_BODY_TTL_MS = 3000L
+        /** 明文比响应晚到时,这条响应最多等多久。比 [DECODED_BODY_TTL_MS] 略长:要先等明文产生。 */
+        private const val AWAITING_PLAINTEXT_TTL_MS = 5000L
+        private const val MAX_AWAITING_PLAINTEXT = 64
+        /** 解出明文/剥过容器时挂在响应头上的标记。 */
+        internal const val AUX_DECODE_HINT_HEADER = "x-aau-decode-hint"
         val HTTP2_PREFACE_PREFIX = "PRI ".toByteArray(StandardCharsets.ISO_8859_1)
 
         /**
@@ -145,7 +152,56 @@ class TlsStreamParser @JvmOverloads constructor(
         }
     )
 
-    private class DecodedBody(val producedAt: Long, val bytes: ByteArray)
+    /**
+     * A plaintext decoded inside the process, plus the lengths its source body could have had.
+     *
+     * [srcSizes] comes from the decoder call's *input* array — the ciphertext — so it identifies
+     * the response exactly. Responses that compress before encrypting decode to something longer
+     * than the wire bytes, which is why the plaintext's own size is not a usable identity.
+     */
+    private class DecodedBody(
+        val producedAt: Long,
+        val bytes: ByteArray,
+        val srcSizes: Set<Int>,
+        /** 解码器入参数组的开头若干字节，也就是线上那包密文：按内容配对，不靠长度猜。 */
+        val srcPrefix: ByteArray? = null
+    ) {
+        /**
+         * 这条响应的长度对不对得上。
+         *
+         * 解码器入参数组的字节数就是线上那包密文的长度，[srcSizes] 记的是
+         * `GetArrayLength` 读回来的真值，所以这一道是精确的。
+         */
+        fun sizeMatches(cipherSize: Int): Boolean =
+            if (srcSizes.isEmpty()) bytes.size == cipherSize else srcSizes.contains(cipherSize)
+
+        /**
+         * 内容指纹对不对得上。
+         *
+         * 指纹是**否决项**，不是加分项：同一套信封的密文前缀本来就一样（同一个密钥流 +
+         * 同样的 `{"code":0,...` 开头），单靠它认不出是哪一条，所以它不能替代长度；
+         * 而长度撞车、其实不是同一家的两包，只有它能分开。拿它当门槛时最坏结果是
+         * "这次没贴上、继续留密文"，反过来最坏结果是"贴错一包、内容张冠李戴"——
+         * 后者更糟，所以宁可作废。
+         *
+         * 长度和指纹都指着同一包时才算数；loader 没给指纹(空)时退回只看长度。
+         */
+        fun fingerprintMatches(stagedHead: ByteArray?): Boolean {
+            val want = srcPrefix
+            if (want == null || want.isEmpty()) return true
+            if (stagedHead == null) return true
+            val n = minOf(want.size, stagedHead.size)
+            if (n < 4) return true
+            for (i in 0 until n) {
+                if (stagedHead[i] != want[i]) return false
+            }
+            return true
+        }
+
+        /** 长度与指纹都通过，才算这条响应的明文。 */
+        fun matches(cipherSize: Int, stagedHead: ByteArray?): Boolean =
+            sizeMatches(cipherSize) && fingerprintMatches(stagedHead)
+    }
 
     // Plaintext decoded inside the target process by the JNI bridge, waiting for its
     // matching HTTP response. Entries expire so a stray decode cannot attach to a
@@ -154,15 +210,65 @@ class TlsStreamParser @JvmOverloads constructor(
     private val decodedBodyLock = Any()
 
     /**
+     * Responses that arrived as ciphertext and are still waiting for their plaintext.
+     *
+     * The in-process decoder runs *after* the bytes are on the wire, and the helper hands
+     * captured frames over in ~250ms batches, so most plaintext shows up slightly after the
+     * response is dispatched. Waiting in [pendingDecodedBodies] alone would lose every one of
+     * those: the entry would sit there until it expired or, worse, be glued onto the next
+     * response. Instead the response is remembered here and re-dispatched once its plaintext
+     * arrives (see [attachLatePlaintext]).
+     */
+    private class AwaitingPlaintext(
+        val requestId: String,
+        val event: HttpResponseEvent,
+        val stagedSize: Int,
+        /** 密文开头，用来和明文的 [DecodedBody.srcPrefix] 逐字节对。 */
+        val stagedHead: ByteArray,
+        val at: Long
+    )
+
+    private val awaitingPlaintext = ArrayDeque<AwaitingPlaintext>()
+    private val awaitingLock = Any()
+
+    /**
      * Receives plaintext produced by an in-process native decoder (JNI bridge probe).
      *
      * Apps like BOSS encrypt response bodies *above* TLS, so the SSL layer only ever
      * yields ciphertext. This channel carries the post-decryption bytes observed at
      * the native decoder's return value — no injection, no key material required.
+     *
+     * [sourceLengths] are candidate byte-lengths of the array that was handed to the decoder,
+     * i.e. the response body it came from. Without them a plaintext can only be paired by its
+     * own length, which fails as soon as the app compresses before encrypting.
      */
-    fun onDecodedJniBody(methodId: Int, body: ByteArray) {
+    @JvmOverloads
+    fun onDecodedJniBody(
+        methodId: Int,
+        body: ByteArray,
+        sourceLengths: IntArray? = null,
+        sourcePrefix: IntArray? = null
+    ) {
         if (body.isEmpty()) return
         val normalized = normalizeDecodedBody(body)
+        val sources = sourceLengths
+            ?.filter { it > 0 }
+            ?.toSet()
+            .orEmpty()
+        // 指纹是小端 u32 序列，原样摊回字节；全 0 说明这次没抓到入参数组的字节。
+        val prefix = sourcePrefix
+            ?.takeIf { words -> words.any { it != 0 } }
+            ?.let { words ->
+                val out = ByteArray(words.size * 4)
+                for (i in words.indices) {
+                    val w = words[i]
+                    out[i * 4] = (w and 0xFF).toByte()
+                    out[i * 4 + 1] = ((w ushr 8) and 0xFF).toByte()
+                    out[i * 4 + 2] = ((w ushr 16) and 0xFF).toByte()
+                    out[i * 4 + 3] = ((w ushr 24) and 0xFF).toByte()
+                }
+                out
+            }
         val now = System.currentTimeMillis()
         synchronized(decodedBodyLock) {
             while (pendingDecodedBodies.isNotEmpty() &&
@@ -170,13 +276,125 @@ class TlsStreamParser @JvmOverloads constructor(
             ) {
                 pendingDecodedBodies.removeFirst()
             }
-            pendingDecodedBodies.addLast(DecodedBody(now, normalized))
+            pendingDecodedBodies.addLast(DecodedBody(now, normalized, sources, prefix))
             while (pendingDecodedBodies.size > MAX_PENDING_DECODED_BODIES) {
                 pendingDecodedBodies.removeFirst()
             }
         }
         if (Log.isLoggable(TAG, Log.VERBOSE)) {
-            Log.v(TAG, "decoded jni body method=$methodId bytes=${normalized.size}")
+            Log.v(TAG, "decoded jni body method=$methodId bytes=${normalized.size} src=$sources fp=${prefix?.size ?: 0}")
+        }
+        attachLatePlaintext(DecodedBody(now, normalized, sources, prefix))
+    }
+
+    /**
+     * Hands a late-arriving plaintext to the response it belongs to, and re-dispatches it.
+     *
+     * The frame names the native method, never the request, so identity comes from the decoder's
+     * input length — the response body's own size. Only a single unambiguous fit is used: when
+     * two responses share that size the plaintext stays queued instead of overwriting one of
+     * them, because a body left as ciphertext can still be retried while a wrong JSON cannot.
+     */
+    private fun attachLatePlaintext(plain: DecodedBody) {
+        // 长度对上还不够:误读的 jbyteArray 也能凑巧同长,贴上去就是拿垃圾盖掉密文。
+        if (!looksRecognizable(plain.bytes)) return
+        val now = System.currentTimeMillis()
+        val target = synchronized(awaitingLock) {
+            while (awaitingPlaintext.isNotEmpty() && now - awaitingPlaintext.first().at > AWAITING_PLAINTEXT_TTL_MS) {
+                awaitingPlaintext.removeFirst()
+            }
+            val fits = awaitingPlaintext.filter { plain.matches(it.stagedSize, it.stagedHead) }
+            val chosen = fits.singleOrNull()
+            if (chosen == null) {
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(
+                        TAG,
+                        "late plaintext ${plain.bytes.size} src=${plain.srcSizes} fp=${plain.srcPrefix?.size ?: 0} joined " +
+                            "${fits.size} of ${awaitingPlaintext.map { it.stagedSize }}"
+                    )
+                }
+                return
+            }
+            awaitingPlaintext.remove(chosen)
+            chosen
+        }
+        // 这份明文已经在 [pendingDecodedBodies] 里排着了,别让后面同长的响应再收到它一次。
+        dropQueuedPlaintext(plain.bytes)
+
+        val maxBytes = config.maxBodySizeBytes.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+        val out = ByteArrayOutputStream()
+        val toWrite = minOf(plain.bytes.size, maxBytes)
+        if (toWrite > 0) out.write(plain.bytes, 0, toWrite)
+        synchronized(responseBodies) { responseBodies[target.requestId] = out }
+
+        Log.d(TAG, "late plaintext for ${target.requestId}: ${target.stagedSize} bytes")
+        // 再走一遍正常响应:中间件还要在明文上再剥一层容器,listener 也按 requestId 覆盖上一条。
+        // 带上 hint 既留证,也避免这次重派发再把自己登记回等待队列。
+        val hinted = target.event.copy(
+            headers = target.event.headers + HttpHeader(AUX_DECODE_HINT_HEADER, "jni-late:${plain.bytes.size}")
+        )
+        dispatchResponse(hinted)
+    }
+
+    /** 从待配对队列里摘掉一份已经用掉的明文(同一份字节可能被重复上报)。 */
+    private fun dropQueuedPlaintext(plain: ByteArray) {
+        synchronized(decodedBodyLock) {
+            val hit = pendingDecodedBodies.firstOrNull { it.bytes.contentEquals(plain) } ?: return
+            pendingDecodedBodies.remove(hit)
+        }
+    }
+
+    /**
+     * 这条响应还是密文:值得等明文。
+     *
+     * 不再要求响应自称 JSON——真机上就撞见过 `content-type` 与实际内容对不上的接口,
+     * 而按 `mimeType` 兜底又漏掉了 h2 上只到 mimeType 的那些。判据只留"体不是 JSON",
+     * 贴错的风险由 [attachLatePlaintext] 的精确长度配对兜住。
+     */
+    /**
+     * 这条响应还是密文:值得等明文。
+     *
+     * 判据只能看响应体本身。中间件也会挂 `x-aau-decode-hint`,但它挂的 `bzp-aes:`/`bzp-raw:`
+     * 恰恰是"解不开、需要 native 解"的标记——把这些当成"已经解过",就永远等不到明文,
+     * 而这正是这条链路上最难发现的失效方式。只有我们自己补发时打的 `jni*` 才算已解。
+     */
+    private fun needsLatePlaintext(event: HttpResponseEvent): Boolean {
+        val decodedByUs = event.headers.any {
+            it.name.equals(AUX_DECODE_HINT_HEADER, ignoreCase = true) && it.value.startsWith("jni")
+        }
+        if (decodedByUs) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "no wait for ${event.requestId}: already republished")
+            return false
+        }
+        val body = getResponseBody(event.requestId)
+        if (body == null || body.isEmpty()) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "no wait for ${event.requestId}: body=${body?.size}")
+            return false
+        }
+        if (isLikelyJsonPayload(body)) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "no wait for ${event.requestId}: already plaintext")
+            return false
+        }
+        return true
+    }
+
+    private fun rememberAwaiting(event: HttpResponseEvent) {
+        val staged = getResponseBody(event.requestId) ?: return
+        val size = staged.size
+        val head = staged.copyOfRange(0, minOf(STAGED_HEAD_BYTES, staged.size))
+        val now = System.currentTimeMillis()
+        synchronized(awaitingLock) {
+            awaitingPlaintext.removeAll { it.requestId == event.requestId }
+            while (awaitingPlaintext.isNotEmpty() && now - awaitingPlaintext.first().at > AWAITING_PLAINTEXT_TTL_MS) {
+                awaitingPlaintext.removeFirst()
+            }
+            awaitingPlaintext.addLast(AwaitingPlaintext(event.requestId, event, size, head, now))
+            while (awaitingPlaintext.size > MAX_AWAITING_PLAINTEXT) {
+                awaitingPlaintext.removeFirst()
+            }
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "waiting plaintext for ${event.requestId}: $size bytes")
+            }
         }
     }
 
@@ -198,28 +416,60 @@ class TlsStreamParser @JvmOverloads constructor(
     }
 
     /**
-     * Pops the oldest staged plaintext that satisfies [accept].
+     * Pops the staged plaintext that belongs to the response whose body is [cipherSize] bytes.
      *
-     * The shape filter matters: the loader already refuses to emit payloads it cannot
-     * positively identify, but a mis-resolved `jbyteArray` can still slip through as
-     * printable garbage. Letting such a frame replace a good ciphertext body would make
-     * the response *less* useful than leaving it untouched, so non-matching entries are
-     * left in the queue (they may pair with a later response within the TTL) instead of
-     * being discarded.
+     * The app decodes above TLS, and the frame it arrives in names the native method, not the
+     * request, so the parser used to pair first-in-first-out. With a batch of h2 responses in
+     * flight that glued A's plaintext onto B — the result looked decoded and was wrong, which is
+     * worse than no plaintext at all.
+     *
+     * Identity now comes from the decoder's *input* length, which [DecodedBody.srcSizes] carries
+     * and which is exactly the response body size. Note that the plaintext's own size is not a
+     * substitute: when the app compresses before encrypting, the decoded body is larger than what
+     * travelled on the wire (BOSS batch endpoints answer 20 KB of ciphertext with 100 KB+ JSON).
+     * Older loaders cannot report the input size; those entries fall back to comparing sizes,
+     * which still holds for the uncompressed family.
+     *
+     * When nothing fits, nothing is consumed: a body left as ciphertext can be retried, a body
+     * holding the wrong JSON cannot.
+     *
+     * The shape filter [accept] still applies. The loader already refuses payloads it cannot
+     * positively identify, but a mis-resolved `jbyteArray` can slip through as printable garbage;
+     * such entries stay queued in case a later response fits them instead of being thrown away.
      */
-    private fun takeDecodedBody(accept: (ByteArray) -> Boolean = { true }): ByteArray? {
+    private fun takeDecodedBody(
+        cipherSize: Int,
+        stagedHead: ByteArray? = null,
+        accept: (ByteArray) -> Boolean = { true }
+    ): ByteArray? {
         val now = System.currentTimeMillis()
         synchronized(decodedBodyLock) {
-            var scanned = 0
-            while (scanned < pendingDecodedBodies.size) {
-                val entry = pendingDecodedBodies.removeFirst()
-                if (now - entry.producedAt > DECODED_BODY_TTL_MS) continue
-                if (accept(entry.bytes)) return entry.bytes
-                pendingDecodedBodies.addLast(entry)
-                scanned++
+            while (pendingDecodedBodies.isNotEmpty() &&
+                now - pendingDecodedBodies.first().producedAt > DECODED_BODY_TTL_MS
+            ) {
+                pendingDecodedBodies.removeFirst()
             }
+            val usable = pendingDecodedBodies.filter { accept(it.bytes) }
+            if (usable.isEmpty()) return null
+
+            val fitting = usable.filter { it.matches(cipherSize, stagedHead) }
+            val first = fitting.firstOrNull()
+            // 同一份明文被重复上报是常态(chunked 写入会重放),内容一致就照收;
+            // 内容不同说明真的判不出来,宁可留着密文。
+            val chosen = when {
+                first == null -> null
+                fitting.all { it.bytes.contentEquals(first.bytes) } -> first
+                else -> null
+            }
+            if (chosen == null) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "no decoded body for $cipherSize bytes: ${usable.map { it.bytes.size }}, keeping ciphertext")
+                }
+                return null
+            }
+            pendingDecodedBodies.remove(chosen)
+            return chosen.bytes
         }
-        return null
     }
 
     fun setConnectionHostHint(connectionId: String, hostHint: String) {
@@ -592,6 +842,8 @@ class TlsStreamParser @JvmOverloads constructor(
         } catch (e: RemoteException) {
             Log.w(TAG, "RemoteException dispatching onResponseReceived: ${e.message}")
         }
+        // 明文通常比响应晚一点点到(解码发生在进程内、抓包是 250ms 一批),先登记等它。
+        if (needsLatePlaintext(effective)) rememberAwaiting(effective)
     }
 
     /**
@@ -608,7 +860,8 @@ class TlsStreamParser @JvmOverloads constructor(
         if (isLikelyJsonPayload(staged)) return event
         if (!advertisesJson(event)) return event
 
-        val decoded = takeDecodedBody(::looksRecognizable) ?: return event
+        val head = staged.copyOfRange(0, minOf(STAGED_HEAD_BYTES, staged.size))
+        val decoded = takeDecodedBody(staged.size, head, ::looksRecognizable) ?: return event
         if (decoded.isEmpty()) return event
 
         val maxBytes = config.maxBodySizeBytes.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
@@ -621,7 +874,7 @@ class TlsStreamParser @JvmOverloads constructor(
         Log.d(TAG, "decoded body override $requestId $hint")
         return event.copy(
             contentLength = out.size().toLong(),
-            headers = event.headers + HttpHeader("x-aau-decode-hint", hint)
+            headers = event.headers + HttpHeader(AUX_DECODE_HINT_HEADER, hint)
         )
     }
 
