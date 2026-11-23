@@ -190,10 +190,30 @@ data class EbpfProbeProfile(
                     EbpfCronetAbiRule(rawHdr, iobuf, strMode, slots, sigs)
                 }
                 val replaceBuiltins = (obj["replaceBuiltinOffsets"] as? Boolean) ?: false
+                // JSON 覆盖里也能写 jniHookRules:漏读它会让一份"看起来完整"的覆盖配置
+                // 静默丢掉进程内明文通道,而抓包本身照常工作——最难查的那种。
+                val jniRules = (obj["jniHookRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
+                    val m = item as? Map<String, Any?> ?: return@mapNotNull null
+                    val sub = m["libSubstring"] as? String ?: return@mapNotNull null
+                    val names = (m["methodNames"] as? List<Any?>).orEmpty()
+                        .mapNotNull { it as? String }
+                        .filter { it.isNotBlank() }
+                    if (sub.isBlank() || names.isEmpty()) return@mapNotNull null
+                    JniHookRule(
+                        libSubstring = sub,
+                        methodNames = names,
+                        captureReturn = (m["captureReturn"] as? Boolean) ?: true,
+                        expectJson = (m["expectJson"] as? Boolean) ?: true,
+                        magic = (m["magic"] as? String)?.takeIf { it.isNotBlank() },
+                        maxBytes = ((parseLongValue(m["maxBytes"]) ?: (4L * 1024 * 1024)).toInt())
+                            .coerceIn(1, 4 * 1024 * 1024)
+                    )
+                }
                 result[pkg] = EbpfProbeProfile(
                     sslOffsetRules = sslRules,
                     cronetOffsetRules = cronetRules,
                     cronetAbiRule = abiRule,
+                    jniHookRules = jniRules,
                     replaceBuiltinOffsets = replaceBuiltins
                 )
             }
@@ -265,6 +285,31 @@ data class EbpfProbeProfile(
                     }
                     sb.append("]\n")
                     sb.append("    }")
+                    needComma = true
+                }
+                if (profile.jniHookRules.isNotEmpty()) {
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"jniHookRules\": [\n")
+                    profile.jniHookRules.forEachIndexed { rIdx, rule ->
+                        sb.append("      {\n")
+                        sb.append("        \"libSubstring\": \"").append(escapeJson(rule.libSubstring)).append("\",\n")
+                        sb.append("        \"methodNames\": [")
+                        rule.methodNames.forEachIndexed { mIdx, name ->
+                            if (mIdx > 0) sb.append(", ")
+                            sb.append("\"").append(escapeJson(name)).append("\"")
+                        }
+                        sb.append("],\n")
+                        sb.append("        \"captureReturn\": ").append(rule.captureReturn).append(",\n")
+                        sb.append("        \"expectJson\": ").append(rule.expectJson).append(",\n")
+                        rule.magic?.takeIf { it.isNotBlank() }?.let {
+                            sb.append("        \"magic\": \"").append(escapeJson(it)).append("\",\n")
+                        }
+                        sb.append("        \"maxBytes\": ").append(rule.maxBytes).append("\n")
+                        sb.append("      }")
+                        if (rIdx + 1 < profile.jniHookRules.size) sb.append(",")
+                        sb.append("\n")
+                    }
+                    sb.append("    ]")
                     needComma = true
                 }
                 if (needComma) sb.append("\n")
