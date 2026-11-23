@@ -6,6 +6,7 @@ import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.getIgnoreCase
 import com.agent.use.common.network.parser.HttpContentDecoder
+import com.agent.use.common.network.parser.Lz4BlockDecoder
 
 /**
  * 防止畸形头部把内存打爆。文件级常量，供 [BzpBlockCodec] 与其内部 sink 共用。
@@ -84,115 +85,26 @@ internal object BzpBlockCodec {
     /**
      * LZ4 block 格式解压（非 frame，无魔数、无校验和）。
      *
-     * 序列结构：`token(1B) [额外 literal 长度][literal 数据] [offset(2B LE)][额外 match 长度]`
-     * 结束条件：literal 段正好吃掉剩余输入。
+     * 具体实现已抽到 [Lz4BlockDecoder]，声明式解码管道的 `algo = "lz4-block"` 共用同一份代码。
      */
     fun lz4BlockDecompress(
         src: ByteArray,
         srcOffset: Int,
         srcLength: Int,
         expectedSize: Int,
-    ): ByteArray? {
-        val end = srcOffset + srcLength
-        if (srcLength <= 0 || end > src.size) return null
-
-        val sink = ExpandingSink(
-            if (expectedSize in 1..MAX_DECODED_BYTES) expectedSize else minOf(MAX_DECODED_BYTES, srcLength * 8 + 64)
-        )
-        var i = srcOffset
-
-        while (i < end) {
-            val token = src[i].toInt() and 0xFF
-            i++
-
-            var literalLength = token ushr 4
-            if (literalLength == 15) {
-                while (i < end) {
-                    val b = src[i].toInt() and 0xFF
-                    i++
-                    literalLength += b
-                    if (b != 255) break
-                }
-            }
-            if (literalLength > 0) {
-                if (i + literalLength > end) {
-                    // 输入被截断：把还能拿到的 literal 写出去就收工
-                    val partial = end - i
-                    if (partial > 0 && sink.ensure(partial)) {
-                        sink.put(src, i, partial)
-                    }
-                    break
-                }
-                if (!sink.ensure(literalLength)) return null
-                sink.put(src, i, literalLength)
-                i += literalLength
-            }
-
-            // literal 段刚好用完输入 = 正常的最后一个序列
-            if (i >= end) break
-            if (i + 2 > end) break
-
-            val matchOffset = (src[i].toInt() and 0xFF) or ((src[i + 1].toInt() and 0xFF) shl 8)
-            i += 2
-            if (matchOffset == 0 || matchOffset > sink.length) return null
-
-            var matchLength = token and 0x0F
-            if (matchLength == 15) {
-                while (i < end) {
-                    val b = src[i].toInt() and 0xFF
-                    i++
-                    matchLength += b
-                    if (b != 255) break
-                }
-            }
-            matchLength += 4
-
-            if (!sink.ensure(matchLength)) return null
-            sink.copyWithin(matchOffset, matchLength)
-        }
-
-        return sink.takeIf { it.length > 0 }?.toByteArray()
-    }
+    ): ByteArray? = Lz4BlockDecoder.decode(
+        src = src,
+        srcOffset = srcOffset,
+        srcLength = srcLength,
+        expectedSize = expectedSize,
+        maxOutputBytes = MAX_DECODED_BYTES,
+    )
 
     private fun readLeInt(bytes: ByteArray, offset: Int): Int =
         (bytes[offset].toInt() and 0xFF) or
             ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
             ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
             ((bytes[offset + 3].toInt() and 0xFF) shl 24)
-
-    /** LZ4 允许 match 段与输出区重叠，必须逐字节复制，不能走 System.arraycopy。 */
-    private class ExpandingSink(initialCapacity: Int) {
-        private var buf = ByteArray(initialCapacity.coerceIn(256, MAX_DECODED_BYTES))
-        var length: Int = 0
-            private set
-
-        fun ensure(extra: Int): Boolean {
-            if (extra < 0) return false
-            if (length + extra <= buf.size) return true
-            if (length + extra > MAX_DECODED_BYTES) return false
-            var next = buf.size
-            while (next < length + extra) {
-                next = if (next >= MAX_DECODED_BYTES / 2) MAX_DECODED_BYTES else next * 2
-            }
-            buf = buf.copyOf(next)
-            return true
-        }
-
-        fun put(src: ByteArray, offset: Int, count: Int) {
-            System.arraycopy(src, offset, buf, length, count)
-            length += count
-        }
-
-        fun copyWithin(matchOffset: Int, count: Int) {
-            var read = length - matchOffset
-            for (k in 0 until count) {
-                buf[length + k] = buf[read + k]
-            }
-            length += count
-        }
-
-        fun toByteArray(): ByteArray = if (length == buf.size) buf else buf.copyOf(length)
-    }
 }
 
 /**

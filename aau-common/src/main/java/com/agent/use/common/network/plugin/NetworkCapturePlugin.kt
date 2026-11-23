@@ -8,6 +8,9 @@ import com.agent.use.common.network.parser.HttpContentDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
+/** 外部插件包注册进注册表时使用的 id 前缀。内置插件不带这个前缀。 */
+const val EXTERNAL_PLUGIN_ID_PREFIX = "external."
+
 data class EbpfSslOffsetRule(
     val libSubstring: String,
     val writeOffset: Long,
@@ -84,7 +87,14 @@ data class EbpfProbeProfile(
     val cronetOffsetRules: List<EbpfCronetOffsetRule> = emptyList(),
     val cronetAbiRule: EbpfCronetAbiRule? = null,
     val jniHookRules: List<JniHookRule> = emptyList(),
-    val replaceBuiltinOffsets: Boolean = false
+    val replaceBuiltinOffsets: Boolean = false,
+    /**
+     * 数据的另一半：`unknown-host` 补全与响应体解码管道。
+     *
+     * 探测规则（偏移、JNI 入口）只决定"能不能看到字节"，这里决定"看到之后怎么读"。
+     * 两者都来自同一份 JSON，所以一个新 App 可以纯配置接入，不必重编 aau。
+     */
+    val declarative: DeclarativeConfig = DeclarativeConfig.EMPTY
 ) {
     fun toCliArgs(): List<String> {
         val args = ArrayList<String>()
@@ -156,68 +166,80 @@ data class EbpfProbeProfile(
     }
 
     companion object {
-        @Suppress("UNCHECKED_CAST")
         fun fromJson(json: String): Map<String, EbpfProbeProfile> {
             val root = SimpleJsonReader(json).parseValue() as? Map<String, Any?> ?: return emptyMap()
             val result = LinkedHashMap<String, EbpfProbeProfile>()
             for ((pkg, rawProfile) in root) {
                 val obj = rawProfile as? Map<String, Any?> ?: continue
-                val sslRules = (obj["sslOffsetRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
-                    val m = item as? Map<String, Any?> ?: return@mapNotNull null
-                    val sub = m["libSubstring"] as? String ?: return@mapNotNull null
-                    val write = parseLongValue(m["writeOffset"]) ?: return@mapNotNull null
-                    val read = parseLongValue(m["readOffset"]) ?: return@mapNotNull null
-                    val sni = parseLongValue(m["sniOffset"]) ?: 0L
-                    EbpfSslOffsetRule(sub, write, read, sni)
-                }
-                val cronetRules = (obj["cronetOffsetRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
-                    val m = item as? Map<String, Any?> ?: return@mapNotNull null
-                    val sub = m["libSubstring"] as? String ?: return@mapNotNull null
-                    val create = parseLongValue(m["createOffset"]) ?: return@mapNotNull null
-                    val hdr = parseLongValue(m["responseStartedOffset"]) ?: return@mapNotNull null
-                    val body = parseLongValue(m["readCompletedOffset"]) ?: return@mapNotNull null
-                    val fin = parseLongValue(m["succeededOffset"]) ?: return@mapNotNull null
-                    EbpfCronetOffsetRule(sub, create, hdr, body, fin)
-                }
-                val abiObj = obj["cronetAbiRule"] as? Map<String, Any?>
-                val abiRule = abiObj?.let { m ->
-                    val rawHdr = (parseLongValue(m["rawHeadersOffset"]) ?: 0x20L).toInt()
-                    val iobuf = (parseLongValue(m["ioBufferDataOffset"]) ?: 0x10L).toInt()
-                    val strMode = (parseLongValue(m["stringLayoutMode"]) ?: 0L).toInt()
-                    val slotsRaw = (m["vtableSlots"] as? List<Any?>).orEmpty().mapNotNull { parseLongValue(it)?.toInt() }
-                    val slots = if (slotsRaw.size >= 3) Triple(slotsRaw[0], slotsRaw[1], slotsRaw[2]) else Triple(3, 4, 5)
-                    val sigs = (m["jniSignatures"] as? List<Any?>).orEmpty().mapNotNull { it as? String }
-                    EbpfCronetAbiRule(rawHdr, iobuf, strMode, slots, sigs)
-                }
-                val replaceBuiltins = (obj["replaceBuiltinOffsets"] as? Boolean) ?: false
-                // JSON 覆盖里也能写 jniHookRules:漏读它会让一份"看起来完整"的覆盖配置
-                // 静默丢掉进程内明文通道,而抓包本身照常工作——最难查的那种。
-                val jniRules = (obj["jniHookRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
-                    val m = item as? Map<String, Any?> ?: return@mapNotNull null
-                    val sub = m["libSubstring"] as? String ?: return@mapNotNull null
-                    val names = (m["methodNames"] as? List<Any?>).orEmpty()
-                        .mapNotNull { it as? String }
-                        .filter { it.isNotBlank() }
-                    if (sub.isBlank() || names.isEmpty()) return@mapNotNull null
-                    JniHookRule(
-                        libSubstring = sub,
-                        methodNames = names,
-                        captureReturn = (m["captureReturn"] as? Boolean) ?: true,
-                        expectJson = (m["expectJson"] as? Boolean) ?: true,
-                        magic = (m["magic"] as? String)?.takeIf { it.isNotBlank() },
-                        maxBytes = ((parseLongValue(m["maxBytes"]) ?: (4L * 1024 * 1024)).toInt())
-                            .coerceIn(1, 4 * 1024 * 1024)
-                    )
-                }
-                result[pkg] = EbpfProbeProfile(
+                result[pkg] = parseProfileObject(obj)
+            }
+            return result
+        }
+
+        /**
+         * 解析「单个包」的配置对象。
+         *
+         * 插件包（L3）里的 `ebpfProfile` 也走这条路——两处各写一份字段解读，迟早会出现
+         * "文件里写了、加载时没读到" 这种最难查的偏差。
+         */
+        @Suppress("UNCHECKED_CAST")
+        internal fun parseProfileObject(obj: Map<String, Any?>): EbpfProbeProfile {
+            val sslRules = (obj["sslOffsetRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
+                val m = item as? Map<String, Any?> ?: return@mapNotNull null
+                val sub = m["libSubstring"] as? String ?: return@mapNotNull null
+                val write = parseLongValue(m["writeOffset"]) ?: return@mapNotNull null
+                val read = parseLongValue(m["readOffset"]) ?: return@mapNotNull null
+                val sni = parseLongValue(m["sniOffset"]) ?: 0L
+                EbpfSslOffsetRule(sub, write, read, sni)
+            }
+            val cronetRules = (obj["cronetOffsetRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
+                val m = item as? Map<String, Any?> ?: return@mapNotNull null
+                val sub = m["libSubstring"] as? String ?: return@mapNotNull null
+                val create = parseLongValue(m["createOffset"]) ?: return@mapNotNull null
+                val hdr = parseLongValue(m["responseStartedOffset"]) ?: return@mapNotNull null
+                val body = parseLongValue(m["readCompletedOffset"]) ?: return@mapNotNull null
+                val fin = parseLongValue(m["succeededOffset"]) ?: return@mapNotNull null
+                EbpfCronetOffsetRule(sub, create, hdr, body, fin)
+            }
+            val abiObj = obj["cronetAbiRule"] as? Map<String, Any?>
+            val abiRule = abiObj?.let { m ->
+                val rawHdr = (parseLongValue(m["rawHeadersOffset"]) ?: 0x20L).toInt()
+                val iobuf = (parseLongValue(m["ioBufferDataOffset"]) ?: 0x10L).toInt()
+                val strMode = (parseLongValue(m["stringLayoutMode"]) ?: 0L).toInt()
+                val slotsRaw = (m["vtableSlots"] as? List<Any?>).orEmpty().mapNotNull { parseLongValue(it)?.toInt() }
+                val slots = if (slotsRaw.size >= 3) Triple(slotsRaw[0], slotsRaw[1], slotsRaw[2]) else Triple(3, 4, 5)
+                val sigs = (m["jniSignatures"] as? List<Any?>).orEmpty().mapNotNull { it as? String }
+                EbpfCronetAbiRule(rawHdr, iobuf, strMode, slots, sigs)
+            }
+            val replaceBuiltins = (obj["replaceBuiltinOffsets"] as? Boolean) ?: false
+            // JSON 覆盖里也能写 jniHookRules:漏读它会让一份"看起来完整"的覆盖配置
+            // 静默丢掉进程内明文通道,而抓包本身照常工作——最难查的那种。
+            val jniRules = (obj["jniHookRules"] as? List<Any?>).orEmpty().mapNotNull { item ->
+                val m = item as? Map<String, Any?> ?: return@mapNotNull null
+                val sub = m["libSubstring"] as? String ?: return@mapNotNull null
+                val names = (m["methodNames"] as? List<Any?>).orEmpty()
+                    .mapNotNull { it as? String }
+                    .filter { it.isNotBlank() }
+                if (sub.isBlank() || names.isEmpty()) return@mapNotNull null
+                JniHookRule(
+                    libSubstring = sub,
+                    methodNames = names,
+                    captureReturn = (m["captureReturn"] as? Boolean) ?: true,
+                    expectJson = (m["expectJson"] as? Boolean) ?: true,
+                    magic = (m["magic"] as? String)?.takeIf { it.isNotBlank() },
+                    maxBytes = ((parseLongValue(m["maxBytes"]) ?: (4L * 1024 * 1024)).toInt())
+                        .coerceIn(1, 4 * 1024 * 1024)
+                )
+            }
+                return EbpfProbeProfile(
                     sslOffsetRules = sslRules,
                     cronetOffsetRules = cronetRules,
                     cronetAbiRule = abiRule,
                     jniHookRules = jniRules,
-                    replaceBuiltinOffsets = replaceBuiltins
+                    replaceBuiltinOffsets = replaceBuiltins,
+                    // 同一份 JSON 里的解码管道；漏读它会让"配置看起来生效、明文始终出不来"
+                    declarative = DeclarativeCodecJson.parseConfig(obj)
                 )
-            }
-            return result
         }
 
         fun parseOffset(raw: String): Long? = parseLongValue(raw)
@@ -310,6 +332,23 @@ data class EbpfProbeProfile(
                         sb.append("\n")
                     }
                     sb.append("    ]")
+                    needComma = true
+                }
+                profile.declarative.hostFix?.let { fix ->
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"hostFix\": ")
+                    sb.append(DeclarativeCodecJson.render(DeclarativeCodecJson.hostFixValue(fix), "    "))
+                    needComma = true
+                }
+                if (profile.declarative.responseCodecs.isNotEmpty()) {
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"responseCodecs\": ")
+                    sb.append(
+                        DeclarativeCodecJson.render(
+                            DeclarativeCodecJson.codecRulesValue(profile.declarative.responseCodecs),
+                            "    "
+                        )
+                    )
                     needComma = true
                 }
                 if (needComma) sb.append("\n")
@@ -589,6 +628,10 @@ object NetworkCapturePluginRegistry {
     fun listJsonProfileOverrides(): Map<String, EbpfProbeProfile> =
         LinkedHashMap(jsonProfileOverrides)
 
+    /** 该包是否由外部插件包提供，用于设置页区分「内置」与「外部」。 */
+    fun isExternalPluginPackage(targetPackage: String): Boolean =
+        plugins.any { it.id.startsWith(EXTERNAL_PLUGIN_ID_PREFIX) && it.matchesPackage(targetPackage) }
+
     fun registerJsonProfileOverride(packageName: String, profile: EbpfProbeProfile) {
         jsonProfileOverrides[packageName] = profile
     }
@@ -650,11 +693,15 @@ object NetworkCapturePluginRegistry {
         val jniRules = ArrayList<JniHookRule>()
         val jniSigs = LinkedHashSet<String>()
         var chosenAbi: EbpfCronetAbiRule? = null
+        var chosenHostFix: HostFixRule? = null
+        val declarativeRules = ArrayList<ResponseCodecRule>()
 
         for (p in prioritized) {
             sslRules.addAll(p.sslOffsetRules)
             cronetRules.addAll(p.cronetOffsetRules)
             jniRules.addAll(p.jniHookRules)
+            if (chosenHostFix == null) chosenHostFix = p.declarative.hostFix
+            declarativeRules.addAll(p.declarative.responseCodecs)
             p.cronetAbiRule?.let { abi ->
                 if (chosenAbi == null) {
                     chosenAbi = abi
@@ -668,7 +715,11 @@ object NetworkCapturePluginRegistry {
             sslOffsetRules = sslRules.distinct(),
             cronetOffsetRules = cronetRules.distinct(),
             cronetAbiRule = finalAbi,
-            jniHookRules = jniRules.distinct()
+            jniHookRules = jniRules.distinct(),
+            declarative = DeclarativeConfig(
+                hostFix = chosenHostFix,
+                responseCodecs = declarativeRules.distinct(),
+            )
         )
     }
 
@@ -689,8 +740,23 @@ object NetworkCapturePluginRegistry {
                 }
             }
         }
+        // 配置驱动的解码排在内置中间件之后：内置的精确逻辑优先，声明式管道作为补充/兜底，
+        // 这样给一个已有内置插件的 App 加规则不会改变它原有的行为。
+        val declarative = resolveEbpfProfile(targetPackage).declarative
+        if (!declarative.isEmpty) {
+            val id = declarativeMiddlewareId(targetPackage)
+            if (seen.add(id)) {
+                result.add(DeclarativeTrafficMiddleware(id, declarative))
+            }
+        }
         return result
     }
+
+    fun declarativeMiddlewareId(targetPackage: String): String = "declarative:$targetPackage"
+
+    /** 当前解析出的声明式配置（解码管道 + host 补全），供设置页与诊断使用。 */
+    fun resolveDeclarativeConfig(targetPackage: String): DeclarativeConfig =
+        resolveEbpfProfile(targetPackage).declarative
 }
 
 data class DiscoveredLibraryProbe(
@@ -851,12 +917,22 @@ data class EbpfDiscoveryReport(
     }
 }
 
-private class SimpleJsonReader(private val input: String) {
+/**
+ * 极简 JSON 读取器。
+ *
+ * [strict] = false 时保持历史上"读到哪儿算哪儿"的宽松行为（发现报告这类带前后日志的输出要用）；
+ * [strict] = true 时语法错误直接抛异常——配置文件必须这样，否则一条写错的规则会被静默解析成
+ * 空配置，用户以为配好了、实际什么都没生效。
+ */
+internal class SimpleJsonReader(private val input: String, private val strict: Boolean = false) {
     private var pos = 0
 
     fun parseValue(): Any? {
         skipWhitespace()
-        if (pos >= input.length) return null
+        if (pos >= input.length) {
+            if (strict) fail("unexpected_end")
+            return null
+        }
         return when (val c = input[pos]) {
             '{' -> parseObject()
             '[' -> parseArray()
@@ -864,7 +940,7 @@ private class SimpleJsonReader(private val input: String) {
             't', 'f' -> parseBoolean()
             'n' -> parseNull()
             '-', in '0'..'9' -> parseNumber()
-            else -> throw IllegalArgumentException("Unexpected JSON char '$c' at $pos")
+            else -> fail("unexpected_char:$c")
         }
     }
 
@@ -878,22 +954,31 @@ private class SimpleJsonReader(private val input: String) {
         }
         while (pos < input.length) {
             skipWhitespace()
-            if (pos >= input.length || input[pos] != '"') break
+            if (pos >= input.length || input[pos] != '"') {
+                if (strict) fail("object_key")
+                return map
+            }
             val key = parseString()
             skipWhitespace()
-            if (pos >= input.length || input[pos] != ':') break
+            if (pos >= input.length || input[pos] != ':') {
+                if (strict) fail("object_colon")
+                return map
+            }
             pos++
             map[key] = parseValue()
             skipWhitespace()
             if (pos < input.length && input[pos] == ',') {
                 pos++
-            } else if (pos < input.length && input[pos] == '}') {
-                pos++
-                break
-            } else {
-                break
+                continue
             }
+            if (pos < input.length && input[pos] == '}') {
+                pos++
+                return map
+            }
+            if (strict) fail("object_separator")
+            return map
         }
+        if (strict) fail("object_unterminated")
         return map
     }
 
@@ -910,13 +995,16 @@ private class SimpleJsonReader(private val input: String) {
             skipWhitespace()
             if (pos < input.length && input[pos] == ',') {
                 pos++
-            } else if (pos < input.length && input[pos] == ']') {
-                pos++
-                break
-            } else {
-                break
+                continue
             }
+            if (pos < input.length && input[pos] == ']') {
+                pos++
+                return list
+            }
+            if (strict) fail("array_separator")
+            return list
         }
+        if (strict) fail("array_unterminated")
         return list
     }
 
@@ -988,4 +1076,13 @@ private class SimpleJsonReader(private val input: String) {
     private fun skipWhitespace() {
         while (pos < input.length && input[pos].isWhitespace()) pos++
     }
+
+    /** 严格模式下用于确认整份文本都被消费掉（尾部多出来的字符也算语法错误）。 */
+    fun ensureFullyConsumed() {
+        skipWhitespace()
+        if (pos < input.length) fail("trailing_content")
+    }
+
+    private fun fail(reason: String): Nothing =
+        throw IllegalArgumentException("$reason@$pos")
 }
