@@ -212,6 +212,64 @@ class LocalRootEbpfCaptureEngine(
             }
         }
 
+        /**
+         * 把三类规则源装进注册表：内置包 → 外部包 → 覆盖配置。
+         *
+         * 抓包与探测都走这里。分开写两套的下场是某天只改了其中一处，
+         * 表现成"设置页里明明有规则，探测/抓包却按默认值跑"。
+         *
+         * 覆盖必须最后落：它是改参数，压在插件包上面才算数。
+         */
+        private fun loadPluginSources(context: Context?, parent: ClassLoader) {
+            val dir = context?.filesDir ?: return
+            // 内置插件包：先把 assets 里的包铺到私有目录，再按"内置 = builtin. 前缀"加载。
+            // 内置与外部走同一套解析，App 规则不再编在 Kotlin 里。
+            try {
+                val builtin = BuiltinCapturePluginPackages.loadFromAssets(
+                    context.assets,
+                    File(dir, ExternalCapturePluginLoader.BUILTIN_PLUGINS_DIR_NAME),
+                    parent,
+                )
+                with(builtin) {
+                    if (install.installed.isNotEmpty()) {
+                        Log.i(TAG, "Installed builtin capture plugins: ${install.installed.joinToString()}")
+                    }
+                    install.failed.forEach { Log.w(TAG, "Failed to install builtin capture plugin: $it") }
+                    load.rejected.forEach {
+                        Log.w(TAG, "Rejected builtin capture plugin ${it.path}: ${it.reason}")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to install builtin capture plugins: ${t.message}")
+            }
+            // 外部插件包：抓包可能由模型直接触发，不走设置页那套加载。
+            // 注册表按 id 去重，重复加载是幂等的。
+            try {
+                val report = ExternalCapturePluginLoader.load(
+                    File(dir, ExternalCapturePluginLoader.PLUGINS_DIR_NAME),
+                    parent,
+                )
+                if (report.loaded.isNotEmpty()) {
+                    Log.i(TAG, "Loaded external capture plugins: " + report.loaded.joinToString { it.id })
+                }
+                report.rejected.forEach {
+                    Log.w(TAG, "Rejected capture plugin ${it.path}: ${it.reason}")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to scan external capture plugins: ${t.message}")
+            }
+            // 覆盖配置最后落，顺序与 CapturePluginProfileStore.loadIntoRegistry 一致。
+            val overrideFile = File(dir, PLUGIN_OVERRIDE_FILE_NAME)
+            if (overrideFile.isFile) {
+                try {
+                    val loaded = NetworkCapturePluginRegistry.replaceJsonOverrides(overrideFile.readText())
+                    Log.i(TAG, "Loaded $loaded JSON capture plugin override(s) from ${overrideFile.absolutePath}")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
+                }
+            }
+        }
+
         @JvmOverloads
         fun discoverAppProfile(
             context: Context?,
@@ -240,17 +298,7 @@ class LocalRootEbpfCaptureEngine(
             val libDir = libDirOverride ?: context?.let { resolveNativeLibraryDir(it, targetPackage) }
             // 探测也要拿到 cronet ABI，而它来自兜底插件包；这里没加载就会出现
             // "设置页能列出规则、探测却按默认值跑"的错位。
-            if (context != null) {
-                runCatching {
-                    context.filesDir?.let { dir ->
-                        BuiltinCapturePluginPackages.loadFromAssets(
-                            context.assets,
-                            File(dir, ExternalCapturePluginLoader.BUILTIN_PLUGINS_DIR_NAME),
-                            javaClass.classLoader,
-                        )
-                    }
-                }
-            }
+            loadPluginSources(context, javaClass.classLoader)
             val abiArgs = if (useHeuristicsOnly) {
                 NetworkCapturePluginRegistry.resolveDiscoveryAbiCliArgs(targetPackage)
             } else {
@@ -381,53 +429,8 @@ class LocalRootEbpfCaptureEngine(
             return false
         }
 
-        context?.filesDir?.let { dir ->
-            val overrideFile = File(dir, PLUGIN_OVERRIDE_FILE_NAME)
-            if (overrideFile.isFile) {
-                try {
-                    val loaded = NetworkCapturePluginRegistry.replaceJsonOverrides(overrideFile.readText())
-                    Log.i(TAG, "Loaded $loaded JSON capture plugin override(s) from ${overrideFile.absolutePath}")
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
-                }
-            }
-            // 内置插件包：先把 assets 里的包铺到私有目录，再按"内置 = builtin. 前缀"加载。
-            // 内置与外部走同一套解析，App 规则不再编在 Kotlin 里。
-            try {
-                val builtin = BuiltinCapturePluginPackages.loadFromAssets(
-                    context.assets,
-                    File(dir, ExternalCapturePluginLoader.BUILTIN_PLUGINS_DIR_NAME),
-                    javaClass.classLoader,
-                )
-                with(builtin) {
-                    if (install.installed.isNotEmpty()) {
-                        Log.i(TAG, "Installed builtin capture plugins: ${install.installed.joinToString()}")
-                    }
-                    install.failed.forEach { Log.w(TAG, "Failed to install builtin capture plugin: $it") }
-                    load.rejected.forEach {
-                        Log.w(TAG, "Rejected builtin capture plugin ${it.path}: ${it.reason}")
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to install builtin capture plugins: ${t.message}")
-            }
-            // 外部插件包在这里也扫一次：抓包可能由模型直接触发，不走设置页那套加载。
-            // 注册表按 id 去重，重复加载是幂等的。
-            try {
-                val report = ExternalCapturePluginLoader.load(
-                    File(dir, ExternalCapturePluginLoader.PLUGINS_DIR_NAME),
-                    javaClass.classLoader,
-                )
-                if (report.loaded.isNotEmpty()) {
-                    Log.i(TAG, "Loaded external capture plugins: " + report.loaded.joinToString { it.id })
-                }
-                report.rejected.forEach {
-                    Log.w(TAG, "Rejected capture plugin ${it.path}: ${it.reason}")
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to scan external capture plugins: ${t.message}")
-            }
-        }
+        // 内置 → 外部 → 覆盖，一处实现；探测与抓包共用。
+        loadPluginSources(context, javaClass.classLoader)
 
         val streamParser = TlsStreamParser(config, listener)
         parser = streamParser

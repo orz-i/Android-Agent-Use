@@ -452,6 +452,12 @@ object NetworkCapturePluginRegistry {
         plugins.removeAll { it.id == pluginId }
     }
 
+    /**
+     * 所有插件包（内置 + 外部）声明的包名 → 规则。
+     *
+     * 名字里的 builtin 是历史包袱：内置包化之后这里已经不只内置。想区分来源用
+     * [isBuiltinPluginPackage] / [isExternalPluginPackage]。
+     */
     fun listBuiltinProfiles(): Map<String, EbpfProbeProfile> {
         val result = LinkedHashMap<String, EbpfProbeProfile>()
         for (plugin in plugins) {
@@ -467,13 +473,20 @@ object NetworkCapturePluginRegistry {
     fun listJsonProfileOverrides(): Map<String, EbpfProbeProfile> =
         LinkedHashMap(jsonProfileOverrides)
 
-    /** 该包是否由用户放的插件包提供，用于设置页区分「随 APK 内置」与「外部」。 */
-    fun isExternalPluginPackage(targetPackage: String): Boolean =
-        plugins.any { it.id.startsWith(EXTERNAL_PLUGIN_ID_PREFIX) && it.matchesPackage(targetPackage) }
+    /**
+     * 该包是否由用户放的插件包**显式声明**，用于设置页区分「随 APK 内置」与「外部」。
+     *
+     * 只认 `defaultPackages` 里的精确包名，不走 `matchesPackage`：兜底包声明的是 `*`，
+     * 用 `matchesPackage` 判断的话，任何一个 `packages: ["*"]` 的外部包都会把列表里
+     * 每一项都说成"外部"，用户看到的所有内置规则一夜之间全变了来源。
+     */
+    fun isExternalPluginPackage(targetPackage: String): Boolean = isDeclaredBy(EXTERNAL_PLUGIN_ID_PREFIX, targetPackage)
 
-    /** 该包是否由随 APK 分发、由 assets 安装的插件包提供。 */
-    fun isBuiltinPluginPackage(targetPackage: String): Boolean =
-        plugins.any { it.id.startsWith(BUILTIN_PLUGIN_ID_PREFIX) && it.matchesPackage(targetPackage) }
+    /** 该包是否由随 APK 分发、由 assets 安装的插件包**显式声明**。语义同 [isExternalPluginPackage]。 */
+    fun isBuiltinPluginPackage(targetPackage: String): Boolean = isDeclaredBy(BUILTIN_PLUGIN_ID_PREFIX, targetPackage)
+
+    private fun isDeclaredBy(idPrefix: String, targetPackage: String): Boolean =
+        plugins.any { it.id.startsWith(idPrefix) && targetPackage in it.defaultPackages }
 
     /** 诊断用：当前注册了哪些插件包（id 前缀能看出内置/外部）。 */
     fun listPluginIds(): List<String> = plugins.map { it.id }
