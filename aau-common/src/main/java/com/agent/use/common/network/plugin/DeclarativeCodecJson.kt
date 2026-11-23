@@ -37,9 +37,12 @@ internal object DeclarativeCodecJson {
         val rules = (root["responseCodecs"] as? List<Any?>).orEmpty()
             .mapNotNull { parseRule(it as? Map<String, Any?>) }
         val inlineRule = parseRule(root["responseCodec"] as? Map<String, Any?>)
+        val diagnose = (root["diagnose"] as? List<Any?>).orEmpty()
+            .mapNotNull { parseDiagnose(it as? Map<String, Any?>) }
         return DeclarativeConfig(
             hostFix = hostFix,
             responseCodecs = if (inlineRule != null) rules + inlineRule else rules,
+            diagnose = diagnose,
         )
     }
 
@@ -47,11 +50,28 @@ internal object DeclarativeCodecJson {
         val headers = (obj["headerPriority"] as? List<Any?>).orEmpty()
             .mapNotNull { (it as? String)?.trim()?.takeIf(String::isNotEmpty) }
         val defaultHost = (obj["defaultHost"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val pathContains = (obj["defaultHostPathContains"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
         if (headers.isEmpty() && defaultHost == null) return null
         return HostFixRule(
             headerPriority = if (headers.isEmpty()) HostFixRule.DEFAULT_HEADERS else headers,
             defaultHost = defaultHost,
+            defaultHostPathContains = pathContains,
+            applyOnRequest = (obj["onRequest"] as? Boolean) ?: true,
         )
+    }
+
+    private fun parseDiagnose(obj: Map<String, Any?>?): DiagnoseRule? {
+        if (obj == null) return null
+        val label = (obj["label"] as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val rawWhen = obj["when"] ?: obj["conditions"]
+        val conditions = when (rawWhen) {
+            is List<Any?> -> rawWhen.mapNotNull { parseCondition(it as? Map<String, Any?>) }
+            is Map<*, *> -> listOfNotNull(parseCondition(rawWhen as? Map<String, Any?>))
+            else -> emptyList()
+        }
+        val headers = (obj["headers"] as? List<Any?>).orEmpty()
+            .mapNotNull { (it as? String)?.trim()?.takeIf(String::isNotEmpty) }
+        return DiagnoseRule(whenConditions = conditions, label = label, headers = headers)
     }
 
     private fun parseRule(obj: Map<String, Any?>?): ResponseCodecRule? {
@@ -77,13 +97,15 @@ internal object DeclarativeCodecJson {
         if (obj == null) return null
         val header = (obj["header"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
         val magic = (obj["magic"] as? String)?.takeIf { it.isNotEmpty() }
-        if (header == null && magic == null) return null
+        val magicHex = (obj["magicHex"] as? String)?.takeIf { it.isNotEmpty() }
+        if (header == null && magic == null && magicHex == null) return null
         return CodecCondition(
             header = header,
             equals = (obj["equals"] as? String) ?: (obj["eq"] as? String),
             contains = (obj["contains"] as? String) ?: (obj["has"] as? String),
             absent = (obj["absent"] as? Boolean) ?: false,
             magic = magic,
+            magicHex = magicHex,
         )
     }
 
@@ -124,6 +146,26 @@ internal object DeclarativeCodecJson {
         buildList {
             add("headerPriority" to J.Arr(rule.headerPriority.map(J::Str)))
             rule.defaultHost?.takeIf { it.isNotBlank() }?.let { add("defaultHost" to J.Str(it)) }
+            rule.defaultHostPathContains?.takeIf { it.isNotBlank() }
+                ?.let { add("defaultHostPathContains" to J.Str(it)) }
+            if (!rule.applyOnRequest) add("onRequest" to J.Bool(false))
+        }
+    )
+
+    /** `"diagnose": <这个值>`。 */
+    fun diagnoseValue(rules: List<DiagnoseRule>): J = J.Arr(
+        rules.map { rule ->
+            J.Obj(
+                buildList {
+                    if (rule.whenConditions.isNotEmpty()) {
+                        add("when" to J.Arr(rule.whenConditions.map(::conditionValue)))
+                    }
+                    add("label" to J.Str(rule.label))
+                    if (rule.headers.isNotEmpty()) {
+                        add("headers" to J.Arr(rule.headers.map(J::Str)))
+                    }
+                }
+            )
         }
     )
 
@@ -148,6 +190,7 @@ internal object DeclarativeCodecJson {
             condition.contains?.let { add("contains" to J.Str(it)) }
             if (condition.absent) add("absent" to J.Bool(true))
             condition.magic?.let { add("magic" to J.Str(it)) }
+            condition.magicHex?.let { add("magicHex" to J.Str(it)) }
         }
     )
 

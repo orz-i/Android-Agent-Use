@@ -9,6 +9,7 @@ import com.agent.use.common.network.plugin.EbpfCronetOffsetRule
 import com.agent.use.common.network.plugin.EbpfDiscoveryReport
 import com.agent.use.common.network.plugin.EbpfProbeProfile
 import com.agent.use.common.network.plugin.EbpfSslOffsetRule
+import com.agent.use.common.network.plugin.BuiltinPluginFixture
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
 import com.agent.use.common.network.plugin.NetworkTrafficMiddleware
 import org.junit.Assert.assertArrayEquals
@@ -16,6 +17,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
@@ -23,6 +25,12 @@ import java.util.Base64
 import java.util.zip.GZIPOutputStream
 
 class HttpParserComprehensiveTest {
+
+    /** 内置 App 规则现在是 assets 里的插件包，注册表启动时为空。 */
+    @Before
+    fun loadBuiltinPluginPackages() {
+        BuiltinPluginFixture.ensureLoaded()
+    }
 
     private fun huffmanEncode(text: String): ByteArray {
         val bytes = text.toByteArray(StandardCharsets.UTF_8)
@@ -759,7 +767,7 @@ class HttpParserComprehensiveTest {
 
     @Test
     fun testTlsStreamParserRunsPluginMiddlewaresForRequestAndResponse() {
-        // 1. Built-in XiaohongshuTrafficMiddleware resolves remaining /api/sns/ unknown-host only for com.xingin.xhs
+        // 1. 内置包 xiaohongshu 只在响应阶段补 /api/sns/ 的 unknown-host（请求阶段留给解析器从 Set-Cookie 学域名）
         val xhsRequests = ArrayList<HttpRequestEvent>()
         val xhsResponses = ArrayList<HttpResponseEvent>()
         val xhsParser = TlsStreamParser(
@@ -898,9 +906,9 @@ class HttpParserComprehensiveTest {
                 .toByteArray(StandardCharsets.ISO_8859_1) + fakeDictZstd
         )
         assertEquals(2, dyResponses.size)
-        assertEquals(
-            "zstd-dict:0x5",
-            dyResponses[1].headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value
-        )
+        val dictHint = dyResponses[1].headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value.orEmpty()
+        // 诊断只保留"这条需要字典"，具体字典 id 不再反解——那需要按 zstd 帧头逐位解析，
+        // 属于解码器职责，规则层不做。
+        assertTrue(dictHint, dictHint.startsWith("undecoded:zstd-dict:") && dictHint.endsWith(":${fakeDictZstd.size}"))
     }
 }

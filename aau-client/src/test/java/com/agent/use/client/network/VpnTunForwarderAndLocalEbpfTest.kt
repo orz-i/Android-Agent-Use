@@ -12,11 +12,14 @@ import com.agent.use.common.network.HttpResponseEvent
 import com.agent.use.common.network.INetworkCapture
 import com.agent.use.common.network.INetworkEventListener
 import com.agent.use.common.network.NetworkCaptureConfig
+import com.agent.use.common.network.plugin.BUILTIN_PLUGIN_ID_PREFIX
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.external.ExternalCapturePluginLoader
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -34,6 +37,28 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPOutputStream
 
 class VpnTunForwarderAndLocalEbpfTest {
+
+    /**
+     * 内置 App 规则现在是 assets 里的插件包，注册表启动时为空。
+     * 这里直接把 assets 目录当插件包根目录加载（两者布局一致），拿到与真机一致的那套规则。
+     */
+    @Before
+    fun loadBuiltinPluginPackages() {
+        val candidates = listOf(
+            File("../aau-common/src/main/assets/aau_capture_plugins"),
+            File("aau/aau-common/src/main/assets/aau_capture_plugins"),
+            File("src/main/assets/aau_capture_plugins"),
+        )
+        val root = candidates.firstOrNull { it.isDirectory }
+            ?: error("找不到内置插件包目录: " + candidates.joinToString { it.absolutePath })
+        val report = ExternalCapturePluginLoader.load(
+            root,
+            javaClass.classLoader,
+            idPrefix = BUILTIN_PLUGIN_ID_PREFIX,
+        )
+        check(report.loaded.isNotEmpty()) { "没有加载到任何内置插件包: ${root.absolutePath}" }
+        check(report.rejected.isEmpty()) { "内置插件包被拒: ${report.rejected}" }
+    }
 
     private fun aaueFrame(pid: Int, uid: Int, direction: Int, sslPtr: Long, payload: ByteArray): ByteArray {
         val hdr = ByteBuffer.allocate(LocalRootEbpfCaptureEngine.WIRE_HEADER_SIZE)

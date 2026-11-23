@@ -35,11 +35,32 @@ object DeclarativeCodecEngine {
         maxBytes: Int = MAX_DECODED_BYTES,
     ): Decoded? {
         if (body.isEmpty() || rules.isEmpty()) return null
+        // 规则之间是"谁会解谁上"：先返回真正解出 JSON 的那条；都解不出 JSON 就退回第一条成功的。
+        // 这样一份配置里可以同时写「容器+lz4+gzip」与「容器+lz4」，不必让调用方枚举组合。
+        var fallback: Decoded? = null
         for (rule in rules) {
             if (!matches(rule, headers, body)) continue
-            applyRule(rule, body, maxBytes)?.let { return it }
+            val decoded = applyRule(rule, body, maxBytes) ?: continue
+            if (looksLikeJson(decoded.bytes)) return decoded
+            if (fallback == null) fallback = decoded
         }
-        return null
+        return fallback
+    }
+
+    /**
+     * 解不开时的诊断标签，形如 `aes` / `raw`。
+     *
+     * 只在解码失败后调用：让下游知道"这条确实抓到了，只是内容要 App 的密钥"，
+     * 而不是把它当成明文继续读。
+     */
+    fun diagnose(body: ByteArray, headers: List<HttpHeader>, rules: List<DiagnoseRule>): DiagnoseRule? =
+        rules.firstOrNull { rule -> rule.whenConditions.all { matches(it, headers, body) } }
+
+    fun diagnoseHint(rule: DiagnoseRule, headers: List<HttpHeader>, size: Int): String {
+        val extras = rule.headers
+            .mapNotNull { name -> headers.getIgnoreCase(name)?.let { "$name=$it" } }
+        val suffix = if (extras.isEmpty()) "" else ":" + extras.joinToString(",")
+        return "undecoded:${rule.label}$suffix:$size"
     }
 
     fun matches(rule: ResponseCodecRule, headers: List<HttpHeader>, body: ByteArray): Boolean {
@@ -52,6 +73,10 @@ object DeclarativeCodecEngine {
     private fun matches(condition: CodecCondition, headers: List<HttpHeader>, body: ByteArray): Boolean {
         condition.magic?.let { magic ->
             val bytes = magic.toByteArray(StandardCharsets.UTF_8)
+            if (!startsWith(body, bytes, 0)) return false
+        }
+        condition.magicHex?.let { hex ->
+            val bytes = parseHex(hex) ?: return false
             if (!startsWith(body, bytes, 0)) return false
         }
         val header = condition.header ?: return true
@@ -145,16 +170,18 @@ object DeclarativeCodecEngine {
     }
 
     private fun CodecStep.magicBytes(): ByteArray? {
-        magicHex?.let { hex ->
-            val clean = hex.trim().removePrefix("0x").filterNot { it == ' ' || it == ':' }
-            if (clean.length % 2 != 0) return null
-            val out = ByteArray(clean.length / 2)
-            for (i in out.indices) {
-                out[i] = clean.substring(i * 2, i * 2 + 2).toIntOrNull(16)?.toByte() ?: return null
-            }
-            return out
-        }
+        magicHex?.let { hex -> return parseHex(hex) }
         return magic?.toByteArray(StandardCharsets.UTF_8)
+    }
+
+    private fun parseHex(hex: String): ByteArray? {
+        val clean = hex.trim().removePrefix("0x").filterNot { it == ' ' || it == ':' }
+        if (clean.isEmpty() || clean.length % 2 != 0) return null
+        val out = ByteArray(clean.length / 2)
+        for (i in out.indices) {
+            out[i] = clean.substring(i * 2, i * 2 + 2).toIntOrNull(16)?.toByte() ?: return null
+        }
+        return out
     }
 
     private fun startsWith(bytes: ByteArray, prefix: ByteArray, offset: Int): Boolean {
@@ -189,8 +216,9 @@ class DeclarativeTrafficMiddleware(
 
     override fun onRequest(targetPackage: String, event: HttpRequestEvent): HttpRequestEvent {
         val fix = config.hostFix ?: return event
+        if (!fix.applyOnRequest) return event
         if (!event.url.contains(UNKNOWN_HOST)) return event
-        val host = resolveHost(event.headers, fix) ?: return event
+        val host = resolveHost(event.headers, fix, event.url) ?: return event
         return event.copy(url = event.url.replace(UNKNOWN_HOST, "://$host"))
     }
 
@@ -204,17 +232,26 @@ class DeclarativeTrafficMiddleware(
 
         val fix = config.hostFix
         if (fix != null && nextEvent.url.contains(UNKNOWN_HOST)) {
-            val host = resolveHost(nextEvent.headers, fix)
+            val host = resolveHost(nextEvent.headers, fix, nextEvent.url)
             if (host != null) {
                 nextEvent = nextEvent.copy(url = nextEvent.url.replace(UNKNOWN_HOST, "://$host"))
             }
         }
 
         if (nextBody == null || nextBody.isEmpty()) return nextEvent to nextBody
-        val decoded = DeclarativeCodecEngine.decode(nextBody, nextEvent.headers, config.responseCodecs)
-            ?: return nextEvent to nextBody
-
         val originalSize = nextBody.size
+        val decoded = DeclarativeCodecEngine.decode(nextBody, nextEvent.headers, config.responseCodecs)
+        if (decoded == null) {
+            // 解不开也要留一句：是加密、是未知容器、还是本来就没抓全。
+            val diagnose = DeclarativeCodecEngine.diagnose(nextBody, nextEvent.headers, config.diagnose)
+            if (diagnose != null) {
+                nextEvent = nextEvent.withDecodeHint(
+                    DeclarativeCodecEngine.diagnoseHint(diagnose, nextEvent.headers, originalSize)
+                )
+            }
+            return nextEvent to nextBody
+        }
+
         nextBody = decoded.bytes
 
         val wantedType = decoded.contentType
@@ -225,20 +262,25 @@ class DeclarativeTrafficMiddleware(
         ) {
             nextEvent = nextEvent.copy(mimeType = wantedType)
         }
-        if (nextEvent.headers.none { it.name.equals(DeclarativeCodecEngine.DECODE_HINT_HEADER, ignoreCase = true) }) {
-            val hint = "${decoded.trace}:$originalSize->${nextBody.size}"
-            nextEvent = nextEvent.copy(
-                headers = nextEvent.headers + HttpHeader(DeclarativeCodecEngine.DECODE_HINT_HEADER, hint)
-            )
-        }
+        nextEvent = nextEvent.withDecodeHint("${decoded.trace}:$originalSize->${nextBody.size}")
         return nextEvent to nextBody
     }
 
-    private fun resolveHost(headers: List<HttpHeader>, fix: HostFixRule): String? =
+    private fun HttpResponseEvent.withDecodeHint(hint: String): HttpResponseEvent {
+        if (headers.any { it.name.equals(DeclarativeCodecEngine.DECODE_HINT_HEADER, ignoreCase = true) }) return this
+        return copy(headers = headers + HttpHeader(DeclarativeCodecEngine.DECODE_HINT_HEADER, hint))
+    }
+
+    private fun resolveHost(headers: List<HttpHeader>, fix: HostFixRule, url: String): String? {
         fix.headerPriority.asSequence()
             .mapNotNull { headers.getIgnoreCase(it)?.trim()?.takeIf(String::isNotEmpty) }
             .firstOrNull()
-            ?: fix.defaultHost?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        val fallback = fix.defaultHost?.takeIf { it.isNotBlank() } ?: return null
+        val gate = fix.defaultHostPathContains
+        if (gate != null && !url.contains(gate)) return null
+        return fallback
+    }
 
     private companion object {
         const val UNKNOWN_HOST = "://unknown-host"

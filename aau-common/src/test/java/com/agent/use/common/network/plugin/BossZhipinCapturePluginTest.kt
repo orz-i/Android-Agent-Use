@@ -3,22 +3,30 @@ package com.agent.use.common.network.plugin
 import com.agent.use.common.network.HttpHeader
 import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
+import com.agent.use.common.network.parser.Lz4BlockDecoder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import java.util.zip.GZIPOutputStream
 
 /**
- * BOSS 直聘插件：`BZPBlock` + LZ4 block 解码链路回归测试。
+ * 内置包 `bosszhipin`：`BZPBlock` + LZ4 的完整链路。
  *
- * 样本全部在测试内构造，不依赖抓包产物，覆盖 literal-only、match、扩展长度三种 LZ4 序列形态。
+ * 规则不再写在 Kotlin 里，测试读的是**真正随 APK 发出去的那份 `plugin.json`**，
+ * 所以这里同时验证两件事：配置能被解析，解析出来的规则行为正确。
  */
 class BossZhipinCapturePluginTest {
+
+    @Before
+    fun setUp() {
+        BuiltinPluginFixture.ensureLoaded()
+    }
 
     // ------------------------------------------------------------------ 样本构造
 
@@ -49,7 +57,7 @@ class BossZhipinCapturePluginTest {
 
     private fun bzpWrap(compressed: ByteArray, rawSize: Int): ByteArray {
         val out = ByteArrayOutputStream()
-        out.write(BzpBlockCodec.MAGIC.toByteArray(StandardCharsets.US_ASCII))
+        out.write(MAGIC.toByteArray(StandardCharsets.US_ASCII))
         out.write(le32(0))
         out.write(le32(compressed.size))
         out.write(le32(rawSize))
@@ -58,73 +66,45 @@ class BossZhipinCapturePluginTest {
         return out.toByteArray()
     }
 
-    // ------------------------------------------------------------------ 头部
+    private fun decodeBody(body: ByteArray, headers: List<HttpHeader> = emptyList()): ByteArray? =
+        DeclarativeCodecEngine.decode(body, headers, BuiltinPluginFixture.declarative("bosszhipin").responseCodecs)
+            ?.bytes
 
-    @Test
-    fun testReadHeaderLittleEndian() {
-        val payload = "{\"code\":0}".toByteArray()
-        val wrapped = bzpWrap(lz4LiteralOnly(payload), payload.size)
-
-        assertTrue(BzpBlockCodec.hasMagic(wrapped))
-        val header = BzpBlockCodec.readHeader(wrapped)
-        assertNotNull(header)
-        assertEquals(0, header!!.version)
-        assertEquals(wrapped.size - BzpBlockCodec.HEADER_SIZE, header.payloadSize)
-        assertEquals(payload.size, header.rawSize)
-    }
-
-    @Test
-    fun testHasMagicRejectsShortOrForeignBuffer() {
-        assertFalse(BzpBlockCodec.hasMagic(ByteArray(0)))
-        assertFalse(BzpBlockCodec.hasMagic("BZPBloc".toByteArray()))
-        assertFalse(BzpBlockCodec.hasMagic("{\"code\":0,\"message\":\"ok\"}".toByteArray()))
-        assertNull(BzpBlockCodec.readHeader("{\"a\":1}".toByteArray()))
-    }
-
-    // ------------------------------------------------------------------ LZ4
+    // ------------------------------------------------------------------ 容器 + LZ4
 
     @Test
     fun testDecodeLiteralOnlyShortPayload() {
         val payload = "{\"code\":0,\"message\":\"Success\"}".toByteArray()
-        val decoded = BzpBlockCodec.decode(bzpWrap(lz4LiteralOnly(payload), payload.size))
-        assertNotNull(decoded)
-        assertArrayEquals(payload, decoded)
+        assertArrayEquals(payload, decodeBody(bzpWrap(lz4LiteralOnly(payload), payload.size)))
     }
 
     @Test
     fun testDecodeLiteralOnlyExtendedLength() {
         // > 15 字节触发 token 高位的扩展长度字节；> 270 触发连续 0xFF 累加
         val payload = ByteArray(1200) { ('a'.code + (it % 26)).toByte() }
-        val decoded = BzpBlockCodec.decode(bzpWrap(lz4LiteralOnly(payload), payload.size))
-        assertNotNull(decoded)
-        assertArrayEquals(payload, decoded)
+        assertArrayEquals(payload, decodeBody(bzpWrap(lz4LiteralOnly(payload), payload.size)))
     }
 
     @Test
     fun testDecodeWithMatchCopiesWithinOutput() {
-        // token 0x51 -> literal 5B "hello"，matchLen = 1 + 4 = 5，offset = 5 => 输出 "hellohello"
+        // token 0x51 -> literal 5B "hello"，matchLen = 1 + 4 = 5，offset = 5 => "hellohello"
         val compressed = byteArrayOf(
             0x51,
             'h'.code.toByte(), 'e'.code.toByte(), 'l'.code.toByte(), 'l'.code.toByte(), 'o'.code.toByte(),
             0x05, 0x00,
         )
-        val decoded = BzpBlockCodec.decode(bzpWrap(compressed, 10))
-        assertNotNull(decoded)
-        assertEquals("hellohello", String(decoded!!, StandardCharsets.US_ASCII))
+        assertEquals("hellohello", String(decodeBody(bzpWrap(compressed, 10))!!, StandardCharsets.US_ASCII))
     }
 
     @Test
     fun testDecodeMatchMayOverrunIntoNewlyWrittenBytes() {
         // matchOffset 小于 match 长度时，后半段读的是本轮刚写出的字节
-        // token 0x52 -> literal 5B "hello"，matchLen = 2 + 4 = 6 => "hello" + "helloh"
         val compressed = byteArrayOf(
             0x52,
             'h'.code.toByte(), 'e'.code.toByte(), 'l'.code.toByte(), 'l'.code.toByte(), 'o'.code.toByte(),
             0x05, 0x00,
         )
-        val decoded = BzpBlockCodec.decode(bzpWrap(compressed, 11))
-        assertNotNull(decoded)
-        assertEquals("hellohelloh", String(decoded!!, StandardCharsets.US_ASCII))
+        assertEquals("hellohelloh", String(decodeBody(bzpWrap(compressed, 11))!!, StandardCharsets.US_ASCII))
     }
 
     @Test
@@ -136,7 +116,7 @@ class BossZhipinCapturePluginTest {
             0x02, 0x00,
             179.toByte(),
         )
-        val decoded = BzpBlockCodec.decode(bzpWrap(compressed, 200))
+        val decoded = decodeBody(bzpWrap(compressed, 200))
         assertNotNull(decoded)
         assertEquals(200, decoded!!.size)
         assertEquals("ab".repeat(100), String(decoded, StandardCharsets.US_ASCII))
@@ -144,36 +124,36 @@ class BossZhipinCapturePluginTest {
 
     @Test
     fun testDecodeRejectsImpossibleMatchOffset() {
-        // offset 指向输出起点之前，属于畸形流 -> 整体判失败，保留原始字节
-        val compressed = byteArrayOf(
-            0x11, 'a'.code.toByte(),
-            0x05, 0x00,
-        )
-        assertNull(BzpBlockCodec.decode(bzpWrap(compressed, 6)))
+        // offset 指向输出起点之前，属于畸形流 -> 整条规则判失败，保留原始字节
+        val compressed = byteArrayOf(0x11, 'a'.code.toByte(), 0x05, 0x00)
+        assertNull(decodeBody(bzpWrap(compressed, 6)))
     }
 
     @Test
     fun testDecodeRejectsZeroMatchOffset() {
-        val compressed = byteArrayOf(
-            0x11, 'a'.code.toByte(),
-            0x00, 0x00,
-        )
-        assertNull(BzpBlockCodec.decode(bzpWrap(compressed, 6)))
+        val compressed = byteArrayOf(0x11, 'a'.code.toByte(), 0x00, 0x00)
+        assertNull(decodeBody(bzpWrap(compressed, 6)))
     }
 
     @Test
     fun testDecodeToleratesTruncatedPayload() {
         // 声明 64B 解压结果，实际只给了 4B literal —— 应返回已解出的前缀而不是整体失败
         val compressed = byteArrayOf(0x40, 'a'.code.toByte(), 'b'.code.toByte(), 'c'.code.toByte(), 'd'.code.toByte())
-        val decoded = BzpBlockCodec.decode(bzpWrap(compressed, 64))
+        val decoded = decodeBody(bzpWrap(compressed, 64))
         assertNotNull(decoded)
         assertEquals("abcd", String(decoded!!, StandardCharsets.US_ASCII))
+    }
+
+    @Test
+    fun testLz4DecoderRejectsGarbage() {
+        // 直接打解码器：容器魔数对了但内部不是 LZ4 时不能吐半截乱码
+        assertNull(Lz4BlockDecoder.decode(ByteArray(0)))
+        assertNull(Lz4BlockDecoder.decode(byteArrayOf(0x00, 0x00, 0x00), expectedSize = 16))
     }
 
     // ------------------------------------------------------------------ 中间件
 
     private fun responseEvent(
-        pkg: String = "com.hpbr.bosszhipin",
         headers: List<HttpHeader> = emptyList(),
         mimeType: String? = "application/octet-stream",
         url: String = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
@@ -186,34 +166,34 @@ class BossZhipinCapturePluginTest {
         mimeType = mimeType,
     )
 
+    private fun bossMiddleware(): NetworkTrafficMiddleware =
+        NetworkCapturePluginRegistry.resolveMiddlewares("com.hpbr.bosszhipin")
+            .first { it.id == NetworkCapturePluginRegistry.declarativeMiddlewareId("com.hpbr.bosszhipin") }
+
     @Test
     fun testMiddlewareDecodesBzpBlockAndFixesMimeType() {
         val payload = "{\"code\":0,\"message\":\"Success\",\"zpData\":{\"jobList\":[]}}".toByteArray()
         val body = bzpWrap(lz4LiteralOnly(payload), payload.size)
 
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
-            "com.hpbr.bosszhipin",
-            responseEvent(),
-            body,
-        )
+        val (event, out) = bossMiddleware().onResponse("com.hpbr.bosszhipin", responseEvent(), body)
 
         assertNotNull(out)
         assertArrayEquals(payload, out)
         assertEquals("application/json; charset=utf-8", event.mimeType)
         val hint = event.headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value
         assertNotNull(hint)
-        assertTrue(hint!!, hint.startsWith("bzp-lz4:") && hint.endsWith("->${payload.size}"))
+        assertTrue(hint!!, hint.startsWith("bzp>lz4:") && hint.endsWith("->${payload.size}"))
     }
 
     @Test
     fun testMiddlewareDecodesNestedGzipInsideBzpBlock() {
         val inner = "{\"code\":0,\"zpData\":{\"token\":\"abc\"}}".toByteArray()
         val gzipped = ByteArrayOutputStream().also { bos ->
-            java.util.zip.GZIPOutputStream(bos).use { it.write(inner) }
+            GZIPOutputStream(bos).use { it.write(inner) }
         }.toByteArray()
         val body = bzpWrap(lz4LiteralOnly(gzipped), gzipped.size)
 
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
+        val (event, out) = bossMiddleware().onResponse(
             "com.hpbr.bosszhipin",
             responseEvent(headers = listOf(HttpHeader("zp-compressing", "2"))),
             body,
@@ -221,13 +201,13 @@ class BossZhipinCapturePluginTest {
 
         assertNotNull(out)
         assertArrayEquals(inner, out)
-        assertTrue(event.headers.first { it.name == "x-aau-decode-hint" }.value.startsWith("bzp-lz4>gzip:"))
+        assertTrue(event.headers.first { it.name == "x-aau-decode-hint" }.value.startsWith("bzp>lz4>gzip:"))
     }
 
     @Test
     fun testMiddlewareLeavesPlainJsonUntouched() {
         val payload = "{\"code\":0,\"message\":\"Success\"}".toByteArray()
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
+        val (event, out) = bossMiddleware().onResponse(
             "com.hpbr.bosszhipin",
             responseEvent(mimeType = "application/json"),
             payload,
@@ -238,22 +218,19 @@ class BossZhipinCapturePluginTest {
     }
 
     @Test
-    fun testMiddlewareIgnoresOtherPackages() {
-        val payload = "{\"code\":0}".toByteArray()
-        val body = bzpWrap(lz4LiteralOnly(payload), payload.size)
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
-            "com.example.other",
-            responseEvent(pkg = "com.example.other"),
-            body,
-        )
-        assertArrayEquals(body, out)
-        assertTrue(event.headers.none { it.name == "x-aau-decode-hint" })
+    fun testMiddlewareDecodesStandaloneGzip() {
+        val inner = "{\"code\":0}".toByteArray()
+        val gzipped = ByteArrayOutputStream().also { bos ->
+            GZIPOutputStream(bos).use { it.write(inner) }
+        }.toByteArray()
+        val (_, out) = bossMiddleware().onResponse("com.hpbr.bosszhipin", responseEvent(), gzipped)
+        assertArrayEquals(inner, out)
     }
 
     @Test
     fun testMiddlewareMarksEncryptedBody() {
         val opaque = ByteArray(42) { (it * 31 + 0xF4).toByte() }
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
+        val (event, out) = bossMiddleware().onResponse(
             "com.hpbr.bosszhipin",
             responseEvent(
                 headers = listOf(
@@ -265,20 +242,20 @@ class BossZhipinCapturePluginTest {
         )
         assertArrayEquals(opaque, out)
         val hint = event.headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value.orEmpty()
-        assertTrue(hint, hint == "bzp-aes:42")
+        assertEquals("undecoded:aes:42", hint)
     }
 
     @Test
     fun testMiddlewareMarksUnknownContainerWithoutEncryption() {
         val opaque = ByteArray(64) { (it * 7).toByte() }
-        val (event, out) = BossZhipinTrafficMiddleware.onResponse(
+        val (event, out) = bossMiddleware().onResponse(
             "com.hpbr.bosszhipin",
             responseEvent(headers = listOf(HttpHeader("zp-compressing", "3"))),
             opaque,
         )
         assertArrayEquals(opaque, out)
         val hint = event.headers.firstOrNull { it.name == "x-aau-decode-hint" }?.value.orEmpty()
-        assertTrue(hint, hint.startsWith("bzp-raw:") && hint.contains("compress=3"))
+        assertTrue(hint, hint.startsWith("undecoded:raw:") && hint.contains("zp-compressing=3"))
     }
 
     @Test
@@ -288,7 +265,7 @@ class BossZhipinCapturePluginTest {
             url = "https://unknown-host/wapi/zpgeek/search/joblist.json",
             method = "GET",
         )
-        val fixed = BossZhipinTrafficMiddleware.onRequest("com.hpbr.bosszhipin", request)
+        val fixed = bossMiddleware().onRequest("com.hpbr.bosszhipin", request)
         assertTrue(fixed.url, fixed.url.startsWith("https://www.zhipin.com/"))
     }
 
@@ -299,11 +276,13 @@ class BossZhipinCapturePluginTest {
         val middlewares = NetworkCapturePluginRegistry.resolveMiddlewares("com.hpbr.bosszhipin")
         assertTrue(
             middlewares.map { it.id }.toString(),
-            middlewares.any { it.id == BossZhipinTrafficMiddleware.id },
+            middlewares.any { it.id == NetworkCapturePluginRegistry.declarativeMiddlewareId("com.hpbr.bosszhipin") },
         )
-        // 其它 App 不应被 BOSS 中间件污染
+        assertTrue(NetworkCapturePluginRegistry.listPluginIds().contains("builtin.bosszhipin"))
+        // 其它 App 不应被 BOSS 的规则污染
         val other = NetworkCapturePluginRegistry.resolveMiddlewares("com.example.other")
-        assertTrue(other.none { it.id == BossZhipinTrafficMiddleware.id })
+        assertTrue(other.none { it.id.contains("com.hpbr.bosszhipin") })
+        assertTrue(NetworkCapturePluginRegistry.resolveDeclarativeConfig("com.example.other").responseCodecs.isEmpty())
     }
 
     @Test
@@ -339,16 +318,18 @@ class BossZhipinCapturePluginTest {
         if (!file.isFile) return
 
         val raw = java.util.Base64.getMimeDecoder().decode(file.readText(StandardCharsets.US_ASCII))
-        val header = BzpBlockCodec.readHeader(raw)
-        assertNotNull("样本缺少 BZPBlock 头: $path", header)
+        assertTrue("样本缺少 BZPBlock 魔数: $path", raw.size > 24 && String(raw, 0, 8, StandardCharsets.US_ASCII) == MAGIC)
 
-        val decoded = BzpBlockCodec.decode(raw)
+        val decoded = decodeBody(raw)
         assertNotNull("LZ4 解压失败: $path", decoded)
-        assertEquals("解压尺寸与头部声明不一致", header!!.rawSize, decoded!!.size)
 
-        val text = String(decoded, StandardCharsets.UTF_8).trim()
+        val text = String(decoded!!, StandardCharsets.UTF_8).trim()
         assertTrue(text.take(32), text.startsWith("{"))
         assertTrue(text, text.contains("\"code\""))
         println("[boss-sample] $path raw=${raw.size} decoded=${decoded.size} jsonChars=${text.length}")
+    }
+
+    private companion object {
+        const val MAGIC = "BZPBlock"
     }
 }

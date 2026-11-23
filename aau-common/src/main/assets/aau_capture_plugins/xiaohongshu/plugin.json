@@ -1,0 +1,38 @@
+{
+  "id": "xiaohongshu",
+  "apiVersion": 1,
+  "version": 1,
+  "packages": ["com.xingin.xhs"],
+  "hostFix": {
+    "headerPriority": [":authority", "host"],
+    "defaultHost": "edith.xiaohongshu.com",
+    "defaultHostPathContains": "/api/sns/",
+    "onRequest": false
+  },
+  "ebpfProfile": {
+    "sslOffsetRules": [
+      {
+        "libSubstring": "libcronet.114.0.5735.38.so",
+        "writeOffset": "0x4ea720",
+        "readOffset": "0x4ea438",
+        "sniOffset": "0x4eb0c8"
+      }
+    ],
+    "cronetOffsetRules": [
+      {
+        "libSubstring": "libcronet.114.0.5735.38.so",
+        "createOffset": "0x226c34",
+        "responseStartedOffset": "0x206dd4",
+        "readCompletedOffset": "0x206f34",
+        "succeededOffset": "0x206ffc"
+      }
+    ],
+    "cronetAbiRule": {
+      "rawHeadersOffset": "0x20",
+      "ioBufferDataOffset": "0x10",
+      "stringLayoutMode": 0,
+      "vtableSlots": [3, 4, 5],
+      "jniSignatures": ["(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"]
+    }
+  }
+}

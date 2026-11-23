@@ -5,9 +5,9 @@ package com.agent.use.common.network.parser
  *
  * 序列结构：`token(1B) [额外 literal 长度...][literal 数据] [offset(2B LE)][额外 match 长度...]`
  *
- * 两个使用方：[com.agent.use.common.network.plugin.BzpBlockCodec]（BOSS 的 `BZPBlock` 容器）
- * 与声明式解码管道（`op = "decompress", algo = "lz4-block"`）。抽出来是为了让"新 App 用
- * 同样的压缩"不必再抄一遍解码循环。
+ * 两个使用方：BOSS 的 `BZPBlock` 容器与声明式解码管道（`op = "decompress", algo = "lz4-block"`）。
+ * 抽出来是为了让"新 App 用同样的压缩"不必再抄一遍解码循环——BOSS 那套现在本身就是一份
+ * `plugin.json`。
  */
 object Lz4BlockDecoder {
 

@@ -13,6 +13,7 @@ import com.agent.use.common.network.parser.TlsStreamParser
 import com.agent.use.common.network.plugin.EbpfDiscoveryReport
 import com.agent.use.common.network.plugin.EbpfProbeProfile
 import com.agent.use.common.network.plugin.NetworkCapturePluginRegistry
+import com.agent.use.common.network.plugin.external.BuiltinCapturePluginPackages
 import com.agent.use.common.network.plugin.external.ExternalCapturePluginLoader
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
@@ -237,6 +238,19 @@ class LocalRootEbpfCaptureEngine(
                 )
             }
             val libDir = libDirOverride ?: context?.let { resolveNativeLibraryDir(it, targetPackage) }
+            // 探测也要拿到 cronet ABI，而它来自兜底插件包；这里没加载就会出现
+            // "设置页能列出规则、探测却按默认值跑"的错位。
+            if (context != null) {
+                runCatching {
+                    context.filesDir?.let { dir ->
+                        BuiltinCapturePluginPackages.loadFromAssets(
+                            context.assets,
+                            File(dir, ExternalCapturePluginLoader.BUILTIN_PLUGINS_DIR_NAME),
+                            javaClass.classLoader,
+                        )
+                    }
+                }
+            }
             val abiArgs = if (useHeuristicsOnly) {
                 NetworkCapturePluginRegistry.resolveDiscoveryAbiCliArgs(targetPackage)
             } else {
@@ -376,6 +390,26 @@ class LocalRootEbpfCaptureEngine(
                 } catch (t: Throwable) {
                     Log.w(TAG, "Failed to load JSON plugin overrides from ${overrideFile.absolutePath}: ${t.message}")
                 }
+            }
+            // 内置插件包：先把 assets 里的包铺到私有目录，再按"内置 = builtin. 前缀"加载。
+            // 内置与外部走同一套解析，App 规则不再编在 Kotlin 里。
+            try {
+                val builtin = BuiltinCapturePluginPackages.loadFromAssets(
+                    context.assets,
+                    File(dir, ExternalCapturePluginLoader.BUILTIN_PLUGINS_DIR_NAME),
+                    javaClass.classLoader,
+                )
+                with(builtin) {
+                    if (install.installed.isNotEmpty()) {
+                        Log.i(TAG, "Installed builtin capture plugins: ${install.installed.joinToString()}")
+                    }
+                    install.failed.forEach { Log.w(TAG, "Failed to install builtin capture plugin: $it") }
+                    load.rejected.forEach {
+                        Log.w(TAG, "Rejected builtin capture plugin ${it.path}: ${it.reason}")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to install builtin capture plugins: ${t.message}")
             }
             // 外部插件包在这里也扫一次：抓包可能由模型直接触发，不走设置页那套加载。
             // 注册表按 id 去重，重复加载是幂等的。

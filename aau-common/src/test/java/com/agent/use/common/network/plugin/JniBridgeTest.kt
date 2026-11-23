@@ -10,10 +10,16 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.nio.charset.StandardCharsets
 
 class JniBridgeTest {
+
+    @Before
+    fun setUp() {
+        BuiltinPluginFixture.ensureLoaded()
+    }
 
     private fun cliOf(rule: JniHookRule): List<String> = rule.toCliArgs()
 
@@ -121,7 +127,7 @@ class JniBridgeTest {
 
     @Test
     fun testBossPluginDeclaresYzwgDecoder() {
-        val profile = BossZhipinCapturePlugin.provideEbpfProfile("com.hpbr.bosszhipin")
+        val profile = NetworkCapturePluginRegistry.resolveEbpfProfile("com.hpbr.bosszhipin")
         assertEquals(1, profile.jniHookRules.size)
         val rule = profile.jniHookRules.first()
         assertEquals("libyzwg.so", rule.libSubstring)
@@ -132,7 +138,7 @@ class JniBridgeTest {
 
     @Test
     fun testBossPluginDeclaresBzpBlockMagic() {
-        val rule = BossZhipinCapturePlugin.provideEbpfProfile("com.hpbr.bosszhipin")
+        val rule = NetworkCapturePluginRegistry.resolveEbpfProfile("com.hpbr.bosszhipin")
             .jniHookRules.first()
         assertEquals("BZPBlock", rule.magic)
         val cli = rule.toCliArgs()
@@ -143,7 +149,7 @@ class JniBridgeTest {
 
     @Test
     fun testBossPluginIgnoresForeignPackage() {
-        val profile = BossZhipinCapturePlugin.provideEbpfProfile("com.example.other")
+        val profile = NetworkCapturePluginRegistry.resolveEbpfProfile("com.example.other")
         assertTrue(profile.jniHookRules.isEmpty())
     }
 
@@ -654,7 +660,7 @@ class JniBridgeTest {
     fun testJsonProfileKeepsJniHooks() {
 
         // JSON 覆盖配置里漏读 jniHookRules 会让"看起来完整"的配置静默丢掉进程内明文通道。
-        val profile = BossZhipinCapturePlugin.provideEbpfProfile("com.hpbr.bosszhipin")
+        val profile = NetworkCapturePluginRegistry.resolveEbpfProfile("com.hpbr.bosszhipin")
         val json = EbpfProbeProfile.toJson(mapOf("com.hpbr.bosszhipin" to profile))
         val parsed = EbpfProbeProfile.fromJson(json)["com.hpbr.bosszhipin"]
 

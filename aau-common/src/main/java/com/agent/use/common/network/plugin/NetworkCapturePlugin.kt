@@ -1,15 +1,15 @@
 package com.agent.use.common.network.plugin
 
-import com.agent.use.common.network.HttpHeader
 import com.agent.use.common.network.HttpRequestEvent
 import com.agent.use.common.network.HttpResponseEvent
-import com.agent.use.common.network.getIgnoreCase
-import com.agent.use.common.network.parser.HttpContentDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** 外部插件包注册进注册表时使用的 id 前缀。内置插件不带这个前缀。 */
+/** 插件包注册进注册表时使用的 id 前缀。内置包与用户放的包只差这个前缀。 */
 const val EXTERNAL_PLUGIN_ID_PREFIX = "external."
+
+/** 随 APK 分发、由 assets 安装到私有目录的插件包前缀。 */
+const val BUILTIN_PLUGIN_ID_PREFIX = "builtin."
 
 data class EbpfSslOffsetRule(
     val libSubstring: String,
@@ -351,6 +351,17 @@ data class EbpfProbeProfile(
                     )
                     needComma = true
                 }
+                if (profile.declarative.diagnose.isNotEmpty()) {
+                    if (needComma) sb.append(",\n")
+                    sb.append("    \"diagnose\": ")
+                    sb.append(
+                        DeclarativeCodecJson.render(
+                            DeclarativeCodecJson.diagnoseValue(profile.declarative.diagnose),
+                            "    "
+                        )
+                    )
+                    needComma = true
+                }
                 if (needComma) sb.append("\n")
                 sb.append("  }")
                 if (idx + 1 < entries.size) sb.append(",")
@@ -405,6 +416,14 @@ interface NetworkCapturePlugin {
 
     val defaultPackages: List<String> get() = emptyList()
 
+    /**
+     * 兜底插件：匹配所有包，只在没有任何专项规则时才起作用。
+     *
+     * 由 `plugin.json` 的 `"fallback": true` 声明，注册表靠它区分"通用能力"与"这个 App 的
+     * 专属规则"——用户要求替换内置偏移时，兜底能力必须留着，否则连 TLS 都看不到了。
+     */
+    val fallback: Boolean get() = false
+
     fun matchesPackage(targetPackage: String): Boolean
 
     fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile? = null
@@ -412,195 +431,15 @@ interface NetworkCapturePlugin {
     fun provideMiddlewares(targetPackage: String): List<NetworkTrafficMiddleware> = emptyList()
 }
 
-object GenericCronetCapturePlugin : NetworkCapturePlugin {
-    override val id: String = "builtin.generic_cronet"
-
-    override val defaultPackages: List<String> = listOf("*")
-
-    override fun matchesPackage(targetPackage: String): Boolean = true
-
-    override fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile =
-        EbpfProbeProfile(
-            cronetAbiRule = EbpfCronetAbiRule(
-                rawHeadersOffset = 0x20,
-                ioBufferDataOffset = 0x10,
-                stringLayoutMode = 0,
-                vtableSlots = Triple(3, 4, 5),
-                jniSignatures = listOf("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J")
-            )
-        )
-}
-
-object XiaohongshuTrafficMiddleware : NetworkTrafficMiddleware {
-    override val id: String = "builtin.xiaohongshu.middleware"
-
-    override fun onResponse(
-        targetPackage: String,
-        event: HttpResponseEvent,
-        body: ByteArray?
-    ): Pair<HttpResponseEvent, ByteArray?> {
-        if (targetPackage != "com.xingin.xhs") return event to body
-        if (event.url.contains("://unknown-host/api/sns/")) {
-            return event.copy(
-                url = event.url.replace("://unknown-host", "://edith.xiaohongshu.com")
-            ) to body
-        }
-        return event to body
-    }
-}
-
-object XiaohongshuCapturePlugin : NetworkCapturePlugin {
-    override val id: String = "builtin.xiaohongshu"
-
-    override val defaultPackages: List<String> = listOf("com.xingin.xhs")
-
-    private const val XHS_CRONET_LIB = "libcronet.114.0.5735.38.so"
-
-    override fun matchesPackage(targetPackage: String): Boolean = targetPackage == "com.xingin.xhs"
-
-    override fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile =
-        EbpfProbeProfile(
-            sslOffsetRules = listOf(
-                EbpfSslOffsetRule(
-                    libSubstring = XHS_CRONET_LIB,
-                    writeOffset = 0x4ea720L,
-                    readOffset = 0x4ea438L,
-                    sniOffset = 0x4eb0c8L
-                )
-            ),
-            cronetOffsetRules = listOf(
-                EbpfCronetOffsetRule(
-                    libSubstring = XHS_CRONET_LIB,
-                    createOffset = 0x226c34L,
-                    responseStartedOffset = 0x206dd4L,
-                    readCompletedOffset = 0x206f34L,
-                    succeededOffset = 0x206ffcL
-                )
-            ),
-            cronetAbiRule = EbpfCronetAbiRule(
-                rawHeadersOffset = 0x20,
-                ioBufferDataOffset = 0x10,
-                stringLayoutMode = 0,
-                vtableSlots = Triple(3, 4, 5),
-                jniSignatures = listOf("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J")
-            )
-        )
-
-    override fun provideMiddlewares(targetPackage: String): List<NetworkTrafficMiddleware> =
-        listOf(XiaohongshuTrafficMiddleware)
-}
-
-object DouyinTrafficMiddleware : NetworkTrafficMiddleware {
-    override val id: String = "builtin.douyin.middleware"
-
-    private val handledPackages = setOf(
-        "com.ss.android.ugc.aweme",
-        "com.ss.android.ugc.aweme.lite",
-        "com.ss.android.article.news",
-        "com.ss.android.article.lite"
-    )
-
-    override fun onResponse(
-        targetPackage: String,
-        event: HttpResponseEvent,
-        body: ByteArray?
-    ): Pair<HttpResponseEvent, ByteArray?> {
-        if (targetPackage !in handledPackages) return event to body
-
-        var nextEvent = event
-        var nextBody = body
-
-        // Resolve TTNet unknown-host API paths when SNI / Host header was omitted on resumed connections
-        if (nextEvent.url.contains("://unknown-host/")) {
-            val hostHint = nextEvent.headers.getIgnoreCase("x-tt-host")
-                ?: nextEvent.headers.getIgnoreCase(":authority")
-                ?: nextEvent.headers.getIgnoreCase("host")
-                ?: if (nextEvent.url.contains("/aweme/v")) "aweme.snssdk.com" else null
-            if (!hostHint.isNullOrBlank()) {
-                nextEvent = nextEvent.copy(url = nextEvent.url.replace("://unknown-host", "://$hostHint"))
-            }
-        }
-
-        if (nextBody != null && nextBody.isNotEmpty()) {
-            if (HttpContentDecoder.hasZstdMagic(nextBody)) {
-                val zstdInfo = HttpContentDecoder.inspectZstdFrame(nextBody)
-                val unpacked = HttpContentDecoder.decompressZstd(nextBody)
-                if (unpacked != null && !unpacked.contentEquals(nextBody)) {
-                    nextBody = unpacked
-                } else if (zstdInfo.hasDictionaryId) {
-                    val hintVal = "zstd-dict:${zstdInfo.dictId?.let { "0x" + it.toString(16) } ?: "unknown"}"
-                    if (nextEvent.headers.none { it.name.equals("x-aau-decode-hint", ignoreCase = true) }) {
-                        nextEvent = nextEvent.copy(headers = nextEvent.headers + HttpHeader("x-aau-decode-hint", hintVal))
-                    }
-                }
-            } else {
-                val encoding = nextEvent.headers.getIgnoreCase("content-encoding")?.lowercase().orEmpty()
-                if (encoding.contains("br") && !looksLikeJson(nextBody)) {
-                    HttpContentDecoder.decompressBrotli(nextBody)?.let { nextBody = it }
-                } else if (encoding.contains("zstd")) {
-                    HttpContentDecoder.decompressZstd(nextBody)?.let { nextBody = it }
-                }
-            }
-
-            if (looksLikeJson(nextBody) &&
-                (nextEvent.mimeType.isNullOrBlank() || nextEvent.mimeType.equals("application/octet-stream", ignoreCase = true))
-            ) {
-                nextEvent = nextEvent.copy(mimeType = "application/json; charset=utf-8")
-            }
-        }
-
-        return nextEvent to nextBody
-    }
-
-    private fun looksLikeJson(bytes: ByteArray): Boolean {
-        for (b in bytes) {
-            val c = b.toInt() and 0xFF
-            if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) continue
-            return c == '{'.code || c == '['.code
-        }
-        return false
-    }
-}
-
-object DouyinCapturePlugin : NetworkCapturePlugin {
-    override val id: String = "builtin.douyin"
-
-    private val targetPackages = setOf(
-        "com.ss.android.ugc.aweme",
-        "com.ss.android.ugc.aweme.lite",
-        "com.ss.android.article.news",
-        "com.ss.android.article.lite"
-    )
-
-    override val defaultPackages: List<String> = listOf("com.ss.android.ugc.aweme")
-
-    override fun matchesPackage(targetPackage: String): Boolean = targetPackage in targetPackages
-
-    override fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile =
-        EbpfProbeProfile(
-            cronetAbiRule = EbpfCronetAbiRule(
-                rawHeadersOffset = 0x20,
-                ioBufferDataOffset = 0x10,
-                stringLayoutMode = 0,
-                vtableSlots = Triple(3, 4, 5),
-                jniSignatures = listOf(
-                    "(Ljava/lang/Object;JLjava/lang/String;IIZZZIZIIJ)J",
-                    "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"
-                )
-            )
-        )
-
-    override fun provideMiddlewares(targetPackage: String): List<NetworkTrafficMiddleware> =
-        listOf(DouyinTrafficMiddleware)
-}
-
 object NetworkCapturePluginRegistry {
-    private val plugins = CopyOnWriteArrayList<NetworkCapturePlugin>().apply {
-        add(GenericCronetCapturePlugin)
-        add(XiaohongshuCapturePlugin)
-        add(DouyinCapturePlugin)
-        add(BossZhipinCapturePlugin)
-    }
+    /**
+     * 启动时为空。
+     *
+     * 内置 App 规则（BOSS / 抖音 / 小红书 / cronet 兜底）全部是插件包，由 assets 安装后
+     * 走 [com.agent.use.common.network.plugin.external.ExternalCapturePluginLoader] 注册。
+     * 这里再写一份 Kotlin 对象就等于又开了"改一个 App 要重编 aau"的口子。
+     */
+    private val plugins = CopyOnWriteArrayList<NetworkCapturePlugin>()
 
     private val jsonProfileOverrides = ConcurrentHashMap<String, EbpfProbeProfile>()
 
@@ -628,9 +467,16 @@ object NetworkCapturePluginRegistry {
     fun listJsonProfileOverrides(): Map<String, EbpfProbeProfile> =
         LinkedHashMap(jsonProfileOverrides)
 
-    /** 该包是否由外部插件包提供，用于设置页区分「内置」与「外部」。 */
+    /** 该包是否由用户放的插件包提供，用于设置页区分「随 APK 内置」与「外部」。 */
     fun isExternalPluginPackage(targetPackage: String): Boolean =
         plugins.any { it.id.startsWith(EXTERNAL_PLUGIN_ID_PREFIX) && it.matchesPackage(targetPackage) }
+
+    /** 该包是否由随 APK 分发、由 assets 安装的插件包提供。 */
+    fun isBuiltinPluginPackage(targetPackage: String): Boolean =
+        plugins.any { it.id.startsWith(BUILTIN_PLUGIN_ID_PREFIX) && it.matchesPackage(targetPackage) }
+
+    /** 诊断用：当前注册了哪些插件包（id 前缀能看出内置/外部）。 */
+    fun listPluginIds(): List<String> = plugins.map { it.id }
 
     fun registerJsonProfileOverride(packageName: String, profile: EbpfProbeProfile) {
         jsonProfileOverrides[packageName] = profile
@@ -670,11 +516,12 @@ object NetworkCapturePluginRegistry {
         val specificProfiles = ArrayList<EbpfProbeProfile>()
         for (plugin in plugins) {
             if (!plugin.matchesPackage(targetPackage)) continue
-            val isGeneric = plugin.id == GenericCronetCapturePlugin.id
-            if (replaceBuiltin && !isGeneric) continue
+            // 兜底插件（`*` + fallback）在用户要求替换内置偏移时必须留着：
+            // 它是最底层的 TLS 能力，拆掉它连"抓得到"都做不到。
+            if (replaceBuiltin && !plugin.fallback) continue
             val profile = plugin.provideEbpfProfile(targetPackage) ?: continue
             matchedProfiles.add(profile)
-            if (!isGeneric) {
+            if (!plugin.fallback) {
                 specificProfiles.add(profile)
             }
         }
@@ -695,6 +542,7 @@ object NetworkCapturePluginRegistry {
         var chosenAbi: EbpfCronetAbiRule? = null
         var chosenHostFix: HostFixRule? = null
         val declarativeRules = ArrayList<ResponseCodecRule>()
+        val diagnoseRules = ArrayList<DiagnoseRule>()
 
         for (p in prioritized) {
             sslRules.addAll(p.sslOffsetRules)
@@ -702,6 +550,7 @@ object NetworkCapturePluginRegistry {
             jniRules.addAll(p.jniHookRules)
             if (chosenHostFix == null) chosenHostFix = p.declarative.hostFix
             declarativeRules.addAll(p.declarative.responseCodecs)
+            diagnoseRules.addAll(p.declarative.diagnose)
             p.cronetAbiRule?.let { abi ->
                 if (chosenAbi == null) {
                     chosenAbi = abi
@@ -719,6 +568,7 @@ object NetworkCapturePluginRegistry {
             declarative = DeclarativeConfig(
                 hostFix = chosenHostFix,
                 responseCodecs = declarativeRules.distinct(),
+                diagnose = diagnoseRules.distinct(),
             )
         )
     }

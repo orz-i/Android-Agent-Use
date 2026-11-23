@@ -12,7 +12,9 @@ import java.io.File
 import java.security.MessageDigest
 
 /**
- * 外部抓包插件包加载器（L3）。
+ * 抓包插件包加载器（L3）。内置包与外部包共用这一份实现，区别只在 [load] 的 `idPrefix`：
+ * 内置包由 [BuiltinCapturePluginPackages] 从 assets 装到 `capture_plugins_builtin/` 后带
+ * `builtin.` 前缀加载。
  *
  * 目的是把「新增一个 App」从"改代码 → 重编 aau → 重打 APK"变成"放一个目录"。一个插件包就是一个
  * 目录，里面有一份 `plugin.json`，可以再带一个 dex：
@@ -56,7 +58,10 @@ object ExternalCapturePluginLoader {
     const val PLUGIN_FILE_NAME = "plugin.json"
     const val PLUGINS_DIR_NAME = "capture_plugins"
 
-    /** 注册进 [NetworkCapturePluginRegistry] 的插件 id 前缀，便于区分内置与外部。 */
+    /** 随 APK 内置的包安装到的目录。与用户放的包分开，覆盖升级时不会互相踩。 */
+    const val BUILTIN_PLUGINS_DIR_NAME = "capture_plugins_builtin"
+
+    /** 用户放的包注册进 [NetworkCapturePluginRegistry] 时用的 id 前缀。 */
     const val PLUGIN_ID_PREFIX = com.agent.use.common.network.plugin.EXTERNAL_PLUGIN_ID_PREFIX
 
     private const val MAX_SPEC_BYTES = 512 * 1024
@@ -107,6 +112,7 @@ object ExternalCapturePluginLoader {
         parentClassLoader: ClassLoader,
         allowCode: Boolean = true,
         dexLoaderFactory: DexClassLoaderFactory = defaultDexLoader,
+        idPrefix: String = PLUGIN_ID_PREFIX,
         registry: NetworkCapturePluginRegistry = NetworkCapturePluginRegistry,
     ): Report {
         val root = rootDir ?: return Report()
@@ -123,7 +129,7 @@ object ExternalCapturePluginLoader {
         for (dir in dirs) {
             val specFile = File(dir, PLUGIN_FILE_NAME)
             if (!specFile.isFile) continue
-            val outcome = runCatching { loadOne(dir, specFile, parentClassLoader, allowCode, dexLoaderFactory) }
+            val outcome = runCatching { loadOne(dir, specFile, parentClassLoader, allowCode, dexLoaderFactory, idPrefix) }
             outcome.fold(
                 onSuccess = { plugin ->
                     registry.register(plugin.plugin)
@@ -145,6 +151,7 @@ object ExternalCapturePluginLoader {
         parentClassLoader: ClassLoader,
         allowCode: Boolean,
         dexLoaderFactory: DexClassLoaderFactory,
+        idPrefix: String,
     ): Loaded {
         if (specFile.length() > MAX_SPEC_BYTES) reject("spec_too_large:${specFile.length()}")
         val spec = parseSpec(specFile.readText())
@@ -184,7 +191,7 @@ object ExternalCapturePluginLoader {
             instantiate(it, classLoader, NetworkTrafficMiddleware::class.java, "middleware_class")
         }
 
-        val plugin = ExternalCapturePlugin(spec, pluginImpl, middleware)
+        val plugin = ExternalCapturePlugin(spec, pluginImpl, middleware, idPrefix)
         return Loaded(
             plugin = plugin,
             report = LoadedPlugin(
@@ -216,7 +223,11 @@ object ExternalCapturePluginLoader {
     internal data class Spec(
         val id: String,
         val apiVersion: Int,
+        /** 内置包升级/覆盖用的版本号；用户放的包可以不写。 */
+        val version: Int,
         val enabled: Boolean,
+        /** 兜底包：匹配所有包，只在没有专项规则时生效。 */
+        val fallback: Boolean,
         val packages: List<String>,
         val dexFile: String?,
         val sha256: String?,
@@ -246,7 +257,9 @@ object ExternalCapturePluginLoader {
         return Spec(
             id = id,
             apiVersion = (root["apiVersion"] as? Number)?.toInt() ?: 1,
+            version = (root["version"] as? Number)?.toInt() ?: 1,
             enabled = (root["enabled"] as? Boolean) ?: true,
+            fallback = (root["fallback"] as? Boolean) ?: false,
             packages = packages,
             dexFile = (root["dex"] as? String)?.trim()?.takeIf { it.isNotEmpty() },
             sha256 = (root["sha256"] as? String)?.trim()?.takeIf { it.isNotEmpty() },
@@ -281,14 +294,20 @@ private class ExternalCapturePlugin(
     private val spec: ExternalCapturePluginLoader.Spec,
     private val impl: NetworkCapturePlugin?,
     private val middleware: NetworkTrafficMiddleware?,
+    idPrefix: String,
 ) : NetworkCapturePlugin {
 
-    override val id: String = ExternalCapturePluginLoader.PLUGIN_ID_PREFIX + spec.id
+    override val id: String = idPrefix + spec.id
 
     override val defaultPackages: List<String> = spec.packages
 
+    override val fallback: Boolean = spec.fallback
+
+    /** `packages` 里写 `*` 就等于"匹配所有包"，这是插件包表达兜底能力的唯一方式。 */
     override fun matchesPackage(targetPackage: String): Boolean =
-        targetPackage in spec.packages || impl?.matchesPackage(targetPackage) == true
+        targetPackage in spec.packages ||
+            spec.packages.contains(WILDCARD_PACKAGE) ||
+            impl?.matchesPackage(targetPackage) == true
 
     override fun provideEbpfProfile(targetPackage: String): EbpfProbeProfile {
         val specProfile = spec.ebpfProfile
@@ -307,6 +326,10 @@ private class ExternalCapturePlugin(
                 responseCodecs = (spec.declarative.responseCodecs +
                     specProfile?.declarative?.responseCodecs.orEmpty() +
                     implProfile?.declarative?.responseCodecs.orEmpty()).distinct(),
+                // 解不开时的诊断也是规则的一部分：漏了它，加密响应会安静地以密文形态流到下游。
+                diagnose = (spec.declarative.diagnose +
+                    specProfile?.declarative?.diagnose.orEmpty() +
+                    implProfile?.declarative?.diagnose.orEmpty()).distinct(),
             ),
         )
     }
@@ -322,6 +345,8 @@ private class ExternalCapturePlugin(
 
 /** 加载失败时把原因塞进异常信息，由 [ExternalCapturePluginLoader.load] 收进报告。 */
 private fun reject(reason: String): Nothing = throw IllegalStateException(reason)
+
+private const val WILDCARD_PACKAGE = "*"
 
 private fun rejectReason(t: Throwable): String =
     t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName

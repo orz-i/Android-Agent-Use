@@ -1,0 +1,48 @@
+{
+  "id": "douyin",
+  "apiVersion": 1,
+  "version": 1,
+  "packages": [
+    "com.ss.android.ugc.aweme",
+    "com.ss.android.ugc.aweme.lite",
+    "com.ss.android.article.news",
+    "com.ss.android.article.lite"
+  ],
+  "hostFix": {
+    "headerPriority": ["x-tt-host", ":authority", "host"],
+    "defaultHost": "aweme.snssdk.com",
+    "defaultHostPathContains": "/aweme/v"
+  },
+  "responseCodecs": [
+    {
+      "id": "zstd",
+      "when": [{ "magicHex": "28b52ffd" }],
+      "steps": [{ "op": "decompress", "algo": "zstd" }]
+    },
+    {
+      "id": "brotli",
+      "when": [{ "header": "content-encoding", "contains": "br" }],
+      "steps": [{ "op": "decompress", "algo": "br" }]
+    },
+    {
+      "id": "zstd-encoding",
+      "when": [{ "header": "content-encoding", "contains": "zstd" }],
+      "steps": [{ "op": "decompress", "algo": "zstd" }]
+    }
+  ],
+  "diagnose": [
+    { "when": [{ "magicHex": "28b52ffd" }], "label": "zstd-dict" }
+  ],
+  "ebpfProfile": {
+    "cronetAbiRule": {
+      "rawHeadersOffset": "0x20",
+      "ioBufferDataOffset": "0x10",
+      "stringLayoutMode": 0,
+      "vtableSlots": [3, 4, 5],
+      "jniSignatures": [
+        "(Ljava/lang/Object;JLjava/lang/String;IIZZZIZIIJ)J",
+        "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"
+      ]
+    }
+  }
+}

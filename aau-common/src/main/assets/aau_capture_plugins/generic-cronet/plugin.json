@@ -1,0 +1,16 @@
+{
+  "id": "generic-cronet",
+  "apiVersion": 1,
+  "version": 1,
+  "fallback": true,
+  "packages": ["*"],
+  "ebpfProfile": {
+    "cronetAbiRule": {
+      "rawHeadersOffset": "0x20",
+      "ioBufferDataOffset": "0x10",
+      "stringLayoutMode": 0,
+      "vtableSlots": [3, 4, 5],
+      "jniSignatures": ["(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"]
+    }
+  }
+}

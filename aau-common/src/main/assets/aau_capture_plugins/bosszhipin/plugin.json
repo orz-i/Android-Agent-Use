@@ -1,0 +1,92 @@
+{
+  "id": "bosszhipin",
+  "apiVersion": 1,
+  "version": 1,
+  "packages": ["com.hpbr.bosszhipin", "com.hpbr.bosszhipin.lite"],
+  "hostFix": {
+    "headerPriority": ["x-bz-host", ":authority", "host"],
+    "defaultHost": "www.zhipin.com"
+  },
+  "responseCodecs": [
+    {
+      "id": "bzp-block-gzip",
+      "when": [{ "magic": "BZPBlock" }],
+      "steps": [
+        {
+          "op": "container",
+          "magic": "BZPBlock",
+          "headerSize": 24,
+          "payloadLen": { "at": 12 },
+          "rawLen": { "at": 16 },
+          "label": "bzp"
+        },
+        { "op": "decompress", "algo": "lz4-block", "label": "lz4" },
+        { "op": "decompress", "algo": "gzip", "label": "gzip" }
+      ]
+    },
+    {
+      "id": "bzp-block",
+      "when": [{ "magic": "BZPBlock" }],
+      "steps": [
+        {
+          "op": "container",
+          "magic": "BZPBlock",
+          "headerSize": 24,
+          "payloadLen": { "at": 12 },
+          "rawLen": { "at": 16 },
+          "label": "bzp"
+        },
+        { "op": "decompress", "algo": "lz4-block", "label": "lz4" }
+      ]
+    },
+    {
+      "id": "gzip",
+      "when": [{ "magicHex": "1f8b08" }],
+      "steps": [{ "op": "decompress", "algo": "gzip" }]
+    },
+    {
+      "id": "zstd",
+      "when": [{ "magicHex": "28b52ffd" }],
+      "steps": [{ "op": "decompress", "algo": "zstd" }]
+    },
+    {
+      "id": "brotli",
+      "when": [{ "header": "content-encoding", "contains": "br" }],
+      "steps": [{ "op": "decompress", "algo": "br" }]
+    },
+    {
+      "id": "deflate",
+      "when": [{ "header": "content-encoding", "contains": "deflate" }],
+      "steps": [{ "op": "decompress", "algo": "zlib" }]
+    }
+  ],
+  "diagnose": [
+    { "when": [{ "header": "content-encrypt", "equals": "yes" }], "label": "aes" },
+    { "when": [{ "header": "zp-encrypting", "equals": "1" }], "label": "aes" },
+    {
+      "when": [{ "header": "zp-compressing" }],
+      "label": "raw",
+      "headers": ["zp-compressing", "zp-encrypting"]
+    }
+  ],
+  "ebpfProfile": {
+    "sslOffsetRules": [
+      {
+        "libSubstring": "libzp-sdk-transport.so",
+        "writeOffset": "0x1e1ec8",
+        "readOffset": "0x1e1a6c",
+        "sniOffset": "0x0"
+      }
+    ],
+    "jniHookRules": [
+      {
+        "libSubstring": "libyzwg.so",
+        "methodNames": ["nativeDecodeContent", "nativeDecodeRequestBody"],
+        "captureReturn": true,
+        "expectJson": true,
+        "magic": "BZPBlock",
+        "maxBytes": 4194304
+      }
+    ]
+  }
+}

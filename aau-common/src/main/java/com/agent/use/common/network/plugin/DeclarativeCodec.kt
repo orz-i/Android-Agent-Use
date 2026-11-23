@@ -35,13 +35,29 @@ package com.agent.use.common.network.plugin
 data class DeclarativeConfig(
     val hostFix: HostFixRule? = null,
     val responseCodecs: List<ResponseCodecRule> = emptyList(),
+    /** 解不开时写进 hint 的判断，用来区分「没抓到」和「抓到了但需要 App 的密钥」。 */
+    val diagnose: List<DiagnoseRule> = emptyList(),
 ) {
-    val isEmpty: Boolean get() = hostFix == null && responseCodecs.isEmpty()
+    val isEmpty: Boolean get() = hostFix == null && responseCodecs.isEmpty() && diagnose.isEmpty()
 
     companion object {
         val EMPTY = DeclarativeConfig()
     }
 }
+
+/**
+ * 响应体解不开时的诊断标签。
+ *
+ * 抓包最怕的不是"解不开"，而是"解不开却看不出原因"——模型会把密文当明文读，人也会以为抓包坏了。
+ * 命中第一条 [whenConditions] 就把 `undecoded:<label>[:k=v,...]:<size>` 写进
+ * `x-aau-decode-hint`，明确告诉下游这条是加密/未知容器，而不是漏抓。
+ */
+data class DiagnoseRule(
+    val whenConditions: List<CodecCondition> = emptyList(),
+    val label: String,
+    /** 附加到 hint 里的头部名，按顺序取 `k=v`。 */
+    val headers: List<String> = emptyList(),
+)
 
 /**
  * 把 `https://unknown-host/...` 补回真实 Host。
@@ -54,6 +70,21 @@ data class HostFixRule(
     val headerPriority: List<String> = emptyList(),
     /** 所有头部都空时的兜底域名。 */
     val defaultHost: String? = null,
+    /**
+     * 兜底域名只在 URL 含该片段时使用。
+     *
+     * 有的 App 只在特定前缀下省略 Host（小红书 `/api/sns/`、抖音 `/aweme/v`），对这些之外
+     * 的连接硬补一个域名会把 URL 编造成不存在的主机——比留着 `unknown-host` 更难查。
+     */
+    val defaultHostPathContains: String? = null,
+    /**
+     * 是否在**请求**阶段就补 Host。默认 `true`。
+     *
+     * 有的 App 请求里根本没有任何 Host 线索，补出来的域名只能靠猜；解析器本来会从响应的
+     * `Set-Cookie: Domain=` 学习真实域名并在下次请求回填。提前补等于抢在证据之前下结论，
+     * 这种情况要设成 `false`，只在响应阶段补。
+     */
+    val applyOnRequest: Boolean = true,
 ) {
     companion object {
         val DEFAULT_HEADERS = listOf("x-tt-host", ":authority", "host")
@@ -70,7 +101,7 @@ data class ResponseCodecRule(
 )
 
 data class CodecCondition(
-    /** 头部名（忽略大小写）。为空时只看 [magic]。 */
+    /** 头部名（忽略大小写）。为空时只看 [magic] / [magicHex]。 */
     val header: String? = null,
     /** 头部值完全相等（忽略大小写）。 */
     val equals: String? = null,
@@ -80,6 +111,8 @@ data class CodecCondition(
     val absent: Boolean = false,
     /** 响应体前缀（UTF-8）；用于"按容器魔数分流"。 */
     val magic: String? = null,
+    /** 二进制魔数（十六进制）；gzip / zstd 这类非文本魔数走这里。 */
+    val magicHex: String? = null,
 )
 
 data class CodecStep(
@@ -159,6 +192,9 @@ object DeclarativeConfigs {
             config.hostFix?.let { add("hostFix" to DeclarativeCodecJson.hostFixValue(it)) }
             if (config.responseCodecs.isNotEmpty()) {
                 add("responseCodecs" to DeclarativeCodecJson.codecRulesValue(config.responseCodecs))
+            }
+            if (config.diagnose.isNotEmpty()) {
+                add("diagnose" to DeclarativeCodecJson.diagnoseValue(config.diagnose))
             }
         }
         return DeclarativeCodecJson.render(DeclarativeCodecJson.J.Obj(entries), "")
