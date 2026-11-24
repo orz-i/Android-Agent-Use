@@ -86,6 +86,71 @@ class BuiltinPluginPackagesTest {
     }
 
     @Test
+    fun replacingOffsetsKeepsTheDecoderPipeline() {
+        // 真机上的常见形态：用户为了修一个偏移，把整条 profile 存在覆盖文件里，
+        // 顺带把 replaceBuiltinOffsets 也置了 true。这只该让偏移以他为准，
+        // 不该连内置包的解码管道一起拆掉——否则升级一次，明文解不出来还不知道为什么。
+        NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        try {
+            NetworkCapturePluginRegistry.registerJsonProfileOverride(
+                "com.hpbr.bosszhipin",
+                EbpfProbeProfile(
+                    sslOffsetRules = listOf(EbpfSslOffsetRule("libzp-sdk-transport.so", 0x1L, 0x2L)),
+                    replaceBuiltinOffsets = true,
+                ),
+            )
+
+            val resolved = NetworkCapturePluginRegistry.resolveEbpfProfile("com.hpbr.bosszhipin")
+            assertEquals("偏移以覆盖为准", 0x1L, resolved.sslOffsetRules.single().writeOffset)
+            assertTrue(
+                "内置包的 BZPBlock 解码管道不能跟着偏移一起被拆掉",
+                resolved.declarative.responseCodecs.any { it.id == "bzp-block" },
+            )
+            assertTrue(
+                "加密诊断也得留着，不然密文流下去看着像抓包坏了",
+                resolved.declarative.diagnose.any { it.label == "aes" },
+            )
+        } finally {
+            NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        }
+    }
+
+    @Test
+    fun replacingOffsetsKeepsTheBuiltinJniSignatures() {
+        // 真机实录（抖音 com.ss.android.ugc.aweme）：内置包给了两条 cronet JNI 签名，
+        // 用户覆盖只写了自己手头那一条。签名是并集匹配——少一条只是少认一种调用形态，
+        // 但覆盖把内置包整包跳过后，那条不该静默消失。
+        NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        try {
+            NetworkCapturePluginRegistry.registerJsonProfileOverride(
+                "com.ss.android.ugc.aweme",
+                EbpfProbeProfile(
+                    sslOffsetRules = listOf(EbpfSslOffsetRule("libttboringssl.so", 0x44bb0L, 0x4894cL)),
+                    cronetAbiRule = EbpfCronetAbiRule(
+                        jniSignatures = listOf("(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J"),
+                    ),
+                    replaceBuiltinOffsets = true,
+                ),
+            )
+
+            val resolved = NetworkCapturePluginRegistry.resolveEbpfProfile("com.ss.android.ugc.aweme")
+            val sigs = resolved.cronetAbiRule?.jniSignatures.orEmpty()
+            assertTrue(
+                "覆盖自带的签名要在: $sigs",
+                "(Ljava/lang/Object;JLjava/lang/String;IZZZIZIIJ)J" in sigs,
+            )
+            assertTrue(
+                "内置包的另一条签名被覆盖吃掉了: $sigs",
+                "(Ljava/lang/Object;JLjava/lang/String;IIZZZIZIIJ)J" in sigs,
+            )
+            assertEquals("重复的签名不该展开成两条: $sigs", 2, sigs.size)
+            assertEquals("偏移仍以覆盖为准", 0x44bb0L, resolved.sslOffsetRules.single().writeOffset)
+        } finally {
+            NetworkCapturePluginRegistry.clearJsonProfileOverrides()
+        }
+    }
+
+    @Test
     fun installUpgradesOnlyWhenTheVersionIsHigher() {
         val root = tempFolder.newFolder("capture_plugins_builtin")
         val packages = packages()

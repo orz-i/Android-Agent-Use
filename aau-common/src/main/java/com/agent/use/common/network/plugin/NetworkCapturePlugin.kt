@@ -527,12 +527,21 @@ object NetworkCapturePluginRegistry {
 
         val matchedProfiles = ArrayList<EbpfProbeProfile>()
         val specificProfiles = ArrayList<EbpfProbeProfile>()
+        // 用户说"偏移用我的"，没说"别解明文"。replaceBuiltinOffsets 只该停掉偏移/JNI/ABI，
+        // 内置包的解码管道（容器、压缩、host 补全、诊断）照样要留着——否则升级一次，
+        // 老设备上那份只写了偏移的覆盖会把新增的解码能力静默拆掉。
+        // 同理，JNI 签名是「并集匹配」而不是「单选」：覆盖只写了自己关心的那几条时，
+        // 内置包里剩下的那条不该跟着消失（抖音内置 2 条、用户覆盖常见只写 1 条）。
+        val skippedProfiles = ArrayList<EbpfProbeProfile>()
         for (plugin in plugins) {
             if (!plugin.matchesPackage(targetPackage)) continue
+            val profile = plugin.provideEbpfProfile(targetPackage) ?: continue
             // 兜底插件（`*` + fallback）在用户要求替换内置偏移时必须留着：
             // 它是最底层的 TLS 能力，拆掉它连"抓得到"都做不到。
-            if (replaceBuiltin && !plugin.fallback) continue
-            val profile = plugin.provideEbpfProfile(targetPackage) ?: continue
+            if (replaceBuiltin && !plugin.fallback) {
+                skippedProfiles.add(profile)
+                continue
+            }
             matchedProfiles.add(profile)
             if (!plugin.fallback) {
                 specificProfiles.add(profile)
@@ -570,6 +579,15 @@ object NetworkCapturePluginRegistry {
                 }
                 jniSigs.addAll(abi.jniSignatures)
             }
+        }
+
+        // 被"替换内置"跳过的插件只剩解码管道，排最后：偏移归用户，怎么解明文还是越专业越靠前。
+        for (profile in skippedProfiles) {
+            if (chosenHostFix == null) chosenHostFix = profile.declarative.hostFix
+            declarativeRules.addAll(profile.declarative.responseCodecs)
+            diagnoseRules.addAll(profile.declarative.diagnose)
+            // 只并签名，不并 ABI 布局：布局按覆盖里写的读，签名多认一种只会多解一份明文。
+            profile.cronetAbiRule?.let { jniSigs.addAll(it.jniSignatures) }
         }
 
         val finalAbi = chosenAbi?.copy(jniSignatures = jniSigs.toList())
