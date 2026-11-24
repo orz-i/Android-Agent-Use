@@ -71,6 +71,8 @@ open class AgentShellEngine(
     private val exitProcessFn: () -> Unit = { exitProcess(0) },
 ) {
     val context: Context = ShellContext.create()
+    /** 免无障碍读屏通道：UiAutomation 不走 enabled_accessibility_services，应用侧查不到。 */
+    private val uiReader by lazy { com.agent.use.common.uiauto.UiAutomationReader() }
     private val displays = HashMap<Int, VirtualDisplay>()
     private var orientationWatch: DisplayOrientationWatch? = null
     private val requestedOrientations = ConcurrentHashMap<Int, Int>()
@@ -707,6 +709,81 @@ open class AgentShellEngine(
         exec("am", "display", "move-stack", "$taskId", "$displayId") == 0
     }
 
+    /**
+     * 免无障碍读屏：读当前焦点屏的节点树，返回扁平 JSON（结构见 [UiAutomationReader.dump]）。
+     * 通道是 UiAutomation，不注册 AccessibilityService，应用侧的
+     * `getEnabledAccessibilityServiceList` 看不到它；因此不需要无障碍权限也能读到 text/bounds/id。
+     */
+    fun inspectUi(maxDepth: Int = 30, maxNodes: Int = 1200): String =
+        uiReader.dump(maxDepth, maxNodes)
+
+    /**
+     * 把系统焦点挪到指定屏。
+     *
+     * UiAutomation（[inspectUi] 那条通道）只读焦点屏：Mika 的任务跑在虚拟屏上，
+     * 虚拟屏不是焦点屏时读到的永远是用户主屏。
+     *
+     * Android 17 上没有 `DisplayManagerGlobal.setFocusedDisplay`（IDisplayManager 里查无此方法），
+     * 能用的入口在 ActivityTaskManager：`setFocusedTask(taskId)` 会让那块屏的根任务成为焦点，
+     * 连带把 `mTopFocusedDisplayId` 切过去。先试它，再退到 `focusTopTask(displayId)`。
+     */
+    fun focusDisplay(displayId: Int): Boolean = setFocusedDisplay(displayId)
+
+    /** 把焦点还给用户主屏。 */
+    fun focusMainDisplay(): Boolean = setFocusedDisplay(Display.DEFAULT_DISPLAY)
+
+    private fun setFocusedDisplay(displayId: Int): Boolean {
+        if (displayId < 0) return false
+        val atm = try {
+            Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)
+        } catch (t: Throwable) {
+            Log.w(tag, "ActivityTaskManager unavailable", t)
+            return setFocusedDisplayViaGlobal(displayId)
+        }
+        val methods = atm.javaClass.methods
+        // 1) setFocusedTask(taskId)：能真正把 focused display 换过去
+        val task = runCatching { topTaskId(displayId) }.getOrDefault(-1)
+        if (task > 0) {
+            val setTask = methods.firstOrNull { it.name == "setFocusedTask" && it.parameterTypes.size == 1 }
+            if (setTask != null) {
+                try {
+                    setTask.invoke(atm, task)
+                    Log.i(tag, "setFocusedTask($task) for display $displayId")
+                    return true
+                } catch (t: Throwable) {
+                    Log.w(tag, "setFocusedTask($task) failed", t)
+                }
+            }
+        }
+        // 2) focusTopTask(displayId)：至少让这块屏的顶层任务拿到焦点
+        val focusTop = methods.firstOrNull { it.name == "focusTopTask" && it.parameterTypes.size == 1 }
+        if (focusTop != null) {
+            try {
+                focusTop.invoke(atm, displayId)
+                Log.i(tag, "focusTopTask($displayId)")
+                return true
+            } catch (t: Throwable) {
+                Log.w(tag, "focusTopTask($displayId) failed", t)
+            }
+        }
+        return setFocusedDisplayViaGlobal(displayId)
+    }
+
+    /** 老版本（Android 14 前后）走 DisplayManagerGlobal.setFocusedDisplay，留作兜底。 */
+    private fun setFocusedDisplayViaGlobal(displayId: Int): Boolean = try {
+        val globalCls = Class.forName("android.hardware.display.DisplayManagerGlobal")
+        val global = globalCls.getMethod("getInstance").invoke(null)
+        val method = globalCls.methods.firstOrNull {
+            it.name == "setFocusedDisplay" && it.parameterTypes.size == 1
+        } ?: return false
+        method.invoke(global, displayId)
+        Log.i(tag, "focused display via DisplayManagerGlobal -> $displayId")
+        true
+    } catch (t: Throwable) {
+        Log.w(tag, "focus display $displayId via DisplayManagerGlobal failed", t)
+        false
+    }
+
     fun finishDisplay(displayId: Int, keep: Array<String>?, close: Array<String>?): Bundle? {
         synchronized(launchLock) { if (!ownDisplay(displayId)) return null }
         return try {
@@ -1194,13 +1271,96 @@ open class AgentShellEngine(
         return AsciiTextKeys.DISPATCHED
     }
 
+    /**
+     * 真实触摸屏在输入系统里的 deviceId。系统注入的事件默认 `deviceId = 0`、`toolType = UNKNOWN`，
+     * 应用一眼就能认出不是手指；带上这块屏的 id 和 `TOOL_TYPE_FINGER`，应用看到的事件来源与真手指一致。
+     * 设备重连后 id 会重新分配，所以只在首次用到时查（查不到下次再查）。
+     */
+    @Volatile
+    private var touchDeviceId: Int = -1
+
+    private fun realTouchDeviceId(): Int {
+        val cached = touchDeviceId
+        if (cached >= 0) return cached
+        val found = runCatching {
+            InputDevice.getDeviceIds()
+                .asSequence()
+                .mapNotNull { InputDevice.getDevice(it) }
+                .filter { !it.isVirtual && (it.sources and InputDevice.SOURCE_TOUCHSCREEN) != 0 }
+                .firstOrNull()
+                ?.id
+        }.getOrNull() ?: -1
+        if (found >= 0) touchDeviceId = found
+        return found
+    }
+
+    /** 亚像素抖动的自增源，保证同一坐标连续出现时小数部分也不重复。 */
+    private val naturalSeq = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * 把整数落点还原成真手指那样的带小数坐标。
+     *
+     * 触摸屏量程是屏幕像素的 16 倍（`ABS_MT_POSITION_X` 0..20351 对应 1272px），真手指几乎不会正好落在整数像素上；
+     * 而注入的整数坐标在 `MotionEvent.toString()` 里是 `x[0]=636.0`，服务端一眼就能看出不是手指。
+     * 补上的小数在半个像素以内，不影响命中，也不会让相邻两次点击落到同一点。
+     */
+    private fun natural(v: Float): Float {
+        val base = v.toInt()
+        if (v != base.toFloat()) return v // 调用方已经带了小数，原样保留
+        val h = base * 1103515245L + naturalSeq.incrementAndGet() * 2654435761L
+        val mag = ((h ushr 8) % 39 + 6).toInt() / 100f // 0.06..0.44，避开 toString 里 %.1f 的整数显示
+        val out = if (h and 0x100L == 0L) v + mag else v - mag
+        return out.coerceAtLeast(0f)
+    }
+
+    /**
+     * 与真手指同源的单指事件：来源是那块触摸屏、工具类型是手指、坐标保留小数。
+     * [deviceId] 传 [realTouchDeviceId] 的结果，查不到时退回 0（不比原行为更差）。
+     */
+    private fun touchEvent(
+        downTime: Long,
+        eventTime: Long,
+        action: Int,
+        x: Float,
+        y: Float,
+        deviceId: Int,
+    ): MotionEvent {
+        val props = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = natural(x)
+            this.y = natural(y)
+            pressure = 1f
+            size = 1f
+        }
+        return MotionEvent.obtain(
+            downTime,
+            eventTime,
+            action,
+            1,
+            arrayOf(props),
+            arrayOf(coords),
+            0,
+            0,
+            1f,
+            1f,
+            deviceId,
+            0,
+            InputDevice.SOURCE_TOUCHSCREEN,
+            0,
+        )
+    }
+
     fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
         val now = SystemClock.uptimeMillis()
-        val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), 0)
-        val up = MotionEvent.obtain(now, now + TAP_MS, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat(), 0)
+        val deviceId = realTouchDeviceId()
+        val down = touchEvent(now, now, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), deviceId)
+        // 真手指按下与抬起不会落在同一像素；起终点完全重合是注入事件的固定特征
+        val up = touchEvent(now, now + TAP_MS, MotionEvent.ACTION_UP, x + 1f, y - 1f, deviceId)
+        Log.i(tag, "injectTap display=$displayId dev=$deviceId $down")
         return try {
-            down.source = InputDevice.SOURCE_TOUCHSCREEN
-            up.source = InputDevice.SOURCE_TOUCHSCREEN
             injectPair(down, up, displayId) { exec("input", "-d", "$displayId", "tap", "$x", "$y") == 0 }
         } finally {
             down.recycle()
@@ -1217,39 +1377,23 @@ open class AgentShellEngine(
             return false
         }
         val down = SystemClock.uptimeMillis()
-        fun event(i: Int, action: Int): MotionEvent {
-            val props = MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            }
-            val coords = MotionEvent.PointerCoords().apply {
-                x = xs[i].toFloat()
-                y = ys[i].toFloat()
-                pressure = 1f
-                size = 1f
-            }
-            return MotionEvent.obtain(
-                down,
-                down + times[i],
-                action,
-                1,
-                arrayOf(props),
-                arrayOf(coords),
-                0,
-                0,
-                1f,
-                1f,
-                0,
-                0,
-                InputDevice.SOURCE_TOUCHSCREEN,
-                0,
-            )
-        }
+        // 同一条滑动的每个点都来自同一块真实触摸屏，deviceId 一致
+        val deviceId = realTouchDeviceId()
+        fun event(i: Int, action: Int): MotionEvent =
+            touchEvent(down, down + times[i], action, xs[i].toFloat(), ys[i].toFloat(), deviceId)
 
         fun send(i: Int, action: Int): Boolean {
             val wait = down + times[i] - SystemClock.uptimeMillis()
             if (wait > 0) SystemClock.sleep(wait)
             val e = event(i, action)
+            // 应用侧反自动化上报的就是这个字符串，落一行日志便于核对字段是否与真手指一致
+            if (action != MotionEvent.ACTION_MOVE) {
+                // 先定向再打印，日志里才是应用真正看到的 displayId（inject 里会再设一次，幂等）
+                runCatching {
+                    e.javaClass.getMethod("setDisplayId", Int::class.javaPrimitiveType).invoke(e, displayId)
+                }
+                Log.i(tag, "inject display=$displayId $e")
+            }
             return try {
                 inject(e, displayId)
             } finally {

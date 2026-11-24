@@ -422,4 +422,20 @@ interface IAgentShell {
      * 结果字段见 `ScreenCaptureCapability.toBundle()`，探测本身会真实抓一帧，可能有 100~400ms 开销。
      */
     Bundle captureCapability() = 57;
+
+    /**
+     * 免无障碍读屏：读当前焦点屏的节点树，返回扁平 JSON（nodes 数组用 parent 指父节点下标）。
+     * 走 UiAutomation，不注册 AccessibilityService，应用侧 getEnabledAccessibilityServiceList 查不到。
+     * 旧实现可能不支持，调用方需容忍空串。
+     */
+    String inspectUi(int maxDepth, int maxNodes) = 58;
+
+    /**
+     * 把系统焦点挪到指定屏。inspectUi 只读焦点屏，虚拟屏不是焦点屏时读到的是用户主屏。
+     * 旧实现可能不支持，调用方需容忍 false。
+     */
+    boolean focusDisplay(int displayId) = 59;
+
+    /** 把焦点还给用户主屏。 */
+    boolean focusMainDisplay() = 60;
 }

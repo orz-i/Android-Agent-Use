@@ -18,6 +18,7 @@ import com.agent.use.common.capture.LongScreenshotOutput
 import com.agent.use.common.capture.LongScreenshotProgress
 import com.agent.use.common.capture.LongScreenshotRunner
 import com.agent.use.common.capture.ScreenFrameSource
+import com.agent.use.common.input.EvdevTouch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -40,7 +41,7 @@ import kotlin.coroutines.resume
  */
 open class AgentAccessibilityService : AccessibilityService() {
 
-    private val gestureDispatcher = DisplayGestureDispatcher { _instance.value }
+    private val gestureDispatcher = DisplayGestureDispatcher(serviceProvider = { _instance.value })
 
     /**
      * 截屏结果：成功位图、受防截屏保护、或失败错误码。
@@ -63,6 +64,9 @@ open class AgentAccessibilityService : AccessibilityService() {
             }
         }
         _instance.value = this
+        // 主屏手势走内核 evdev 通道，后台预热一次：部署注入器 + 找触摸屏节点。
+        // 失败（无 root）会静默退化为 dispatchGesture。
+        EvdevTouch.warmUp(this)
         onServiceConnectedHook()
         Log.i(TAG, "AgentAccessibilityService connected.")
     }
@@ -150,7 +154,7 @@ open class AgentAccessibilityService : AccessibilityService() {
     /**
      * 获取指定虚拟屏上的顶层窗口列表（委托给当前已连接实例，兼容重连恢复）。
      */
-    fun windowsOn(displayId: Int): List<AccessibilityWindowInfo> =
+    open fun windowsOn(displayId: Int): List<AccessibilityWindowInfo> =
         _instance.value?.windowsOnAllDisplays?.get(displayId).orEmpty()
 
     /**
@@ -174,19 +178,19 @@ open class AgentAccessibilityService : AccessibilityService() {
     /**
      * 在指定屏上沿 [path] 执行单指手势。
      */
-    suspend fun gesture(displayId: Int, path: Path, durationMs: Long): Boolean =
+    open suspend fun gesture(displayId: Int, path: Path, durationMs: Long): Boolean =
         gestureDispatcher.gesture(displayId, path, durationMs)
 
     /**
      * 在指定屏上沿多条 [paths] 并行执行手势。
      */
-    suspend fun gesture(displayId: Int, paths: List<Path>, durationMs: Long): Boolean =
+    open suspend fun gesture(displayId: Int, paths: List<Path>, durationMs: Long): Boolean =
         gestureDispatcher.gesture(displayId, paths, durationMs)
 
     /**
      * 在同一点上连点 [count] 下。
      */
-    suspend fun taps(
+    open suspend fun taps(
         displayId: Int,
         x: Float,
         y: Float,
@@ -300,11 +304,11 @@ open class AgentAccessibilityService : AccessibilityService() {
     /**
      * 发生在指定屏上的原始无障碍事件流（跨服务重连实例保留）。
      */
-    fun eventsFor(displayId: Int): Flow<AccessibilityEvent> = DisplayEventStream.rawEventsFor(displayId)
+    open fun eventsFor(displayId: Int): Flow<AccessibilityEvent> = DisplayEventStream.rawEventsFor(displayId)
     /**
      * 窗口变化的信号流（跨服务重连实例保留）。
      */
-    fun windowChanges(): Flow<Unit> = DisplayEventStream.windowChanges()
+    open fun windowChanges(): Flow<Unit> = DisplayEventStream.windowChanges()
 
     companion object {
         private const val TAG = "AgentA11yService"
