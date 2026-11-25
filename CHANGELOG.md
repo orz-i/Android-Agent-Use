@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+### 🧪 `MiniHttpServer.serveRequests`：keep-alive 断言改喂字节，不再经过回环
+
+- **新增 `MiniHttpServer.serveRequests(input, output, remote, handler, …)`**：把「在同一对输入输出上按 keep-alive
+  连续处理请求」抽成可直接调用的函数，返回处理过的请求数；`serve(socket)` 变成它的薄包装，行为不变。
+- **起因是测试环境的假红**：本机回环被过滤代理接管时，它会把流水线请求**合并成一条响应**（一条 `Content-Length`
+  等于两个正文之和的 200）、塞一张 502 拦截页，或者直接掐断连接。字节级断言因此偶发变红，测到的是代理而不是这段逻辑。
+- **语义用例现在喂字节**：keep-alive、`Connection: close` 的识别、流水线、正文超限、`Expect: 100-continue` 全部在
+  内存流上确定地断言；真连接只留一条冒烟，证明 accept → serve → 回字节的接线还在。
+
 ### 🧩 新模块 `:aau-shell`：配对、ADB 协议与助手交接的纯 JVM 内核
 
 - **把宿主里的这几件事搬进 AAU**：ADB 无线调试配对（SPAKE2、TLS、RSA 身份、端口发现与扫描）、

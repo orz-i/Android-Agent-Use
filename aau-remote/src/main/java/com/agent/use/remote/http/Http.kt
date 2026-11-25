@@ -148,25 +148,14 @@ class MiniHttpServer(
         try {
             socket.soTimeout = readTimeoutMs
             socket.tcpNoDelay = true
-            val input = BufferedInputStream(socket.getInputStream())
-            val output = socket.getOutputStream()
-            while (running.get()) {
-                val request = try {
-                    readRequest(input, socket.inetAddress, output) ?: return
-                } catch (e: HttpProtocolException) {
-                    write(output, HttpResponse.empty(e.status), close = true)
-                    return
-                }
-                val response = try {
-                    handler(request)
-                } catch (e: Exception) {
-                    onError(e); HttpResponse.empty(500)
-                }
-                val close = request.header("connection")?.split(',')
-                    ?.any { it.trim().equals("close", ignoreCase = true) } == true
-                write(output, response, close)
-                if (close) return
-            }
+            serveRequests(
+                input = BufferedInputStream(socket.getInputStream()),
+                output = socket.getOutputStream(),
+                remote = socket.inetAddress,
+                handler = handler,
+                stillRunning = { running.get() },
+                onError = onError,
+            )
         } catch (_: SocketException) {
         } catch (_: java.net.SocketTimeoutException) {
         } catch (e: IOException) {
@@ -177,6 +166,44 @@ class MiniHttpServer(
     companion object {
         const val MAX_HEAD = 16 * 1024
         const val MAX_BODY = 256 * 1024
+
+        /**
+         * 在一对输入输出上按 keep-alive 连续处理请求，直到 `Connection: close`、对方关闭或 [stillRunning] 变假；
+         * 返回处理过的请求数。
+         *
+         * 抽到流上不是为了好看：本机回环可能被过滤类代理接管（它会把流水线合并成一条、塞一张 502 拦截页，
+         * 或者干脆把连接掐掉）。那种环境里拿真 socket 做字节级断言，测到的是代理，不是这段逻辑；
+         * 这一层只认字节，喂一段请求字节进来就能确定地验证 keep-alive、流水线与关闭时机。
+         */
+        fun serveRequests(
+            input: InputStream,
+            output: OutputStream,
+            remote: InetAddress,
+            handler: (HttpRequest) -> HttpResponse,
+            stillRunning: () -> Boolean = { true },
+            onError: (Throwable) -> Unit = {},
+        ): Int {
+            var served = 0
+            while (stillRunning()) {
+                val request = try {
+                    readRequest(input, remote, output) ?: return served
+                } catch (e: HttpProtocolException) {
+                    write(output, HttpResponse.empty(e.status), close = true)
+                    return served
+                }
+                val response = try {
+                    handler(request)
+                } catch (e: Exception) {
+                    onError(e); HttpResponse.empty(500)
+                }
+                served++
+                val close = request.header("connection")?.split(',')
+                    ?.any { it.trim().equals("close", ignoreCase = true) } == true
+                write(output, response, close)
+                if (close) return served
+            }
+            return served
+        }
 
         /**
          * 读一个请求；对方在请求开始前关了连接时返回 null。对方先问能不能发正文（`Expect: 100-continue`，
