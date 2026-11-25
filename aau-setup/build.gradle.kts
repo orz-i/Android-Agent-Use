@@ -43,6 +43,9 @@ kotlin {
 
 dependencies {
     implementation(project(":aau-common"))
+    // 配对、ADB 协议与助手交接的纯 JVM 内核。api：接入方拿到 aau-setup 就能直接用 BuiltinShellControl，
+    // 不必再单独声明一次；它也保持在纯 JVM 模块里，让 :core 这类非 Android 消费者能共用同一份实现。
+    api(project(":aau-shell"))
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
 

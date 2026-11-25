@@ -18,7 +18,7 @@
 - [一、项目背景与核心价值](#一项目背景与核心价值)
 - [二、与 scrcpy 的本质差异](#二与-scrcpy-的本质差异)
 - [三、架构概览](#三架构概览)
-- [四、五大模块设计](#四五大模块设计)
+- [四、模块设计](#四模块设计)
 - [五、安全与特权降权设计](#五安全与特权降权设计)
 - [六、快速开始与 API 用法](#六快速开始与-api-用法)
 - [七、环境诊断与自检](#七环境诊断与自检)
@@ -105,7 +105,7 @@ flowchart TD
 
 ---
 
-## 四、五大模块设计
+## 四、模块设计
 
 AAU 遵循严格的单向依赖与关注点分离原则：
 
@@ -115,8 +115,12 @@ aau-kit (Root)
   ├── aau-server    # [特权服务端] 运行在 UID 2000 的独立守护进程，产出独立 dex/jar (aau-server.jar)
   ├── aau-client    # [客户端 SDK] 接入方 Android Library，零拷贝直读管线与生命周期池、CDP 原生网络捕获
   ├── aau-a11y      # [可选扩展] 基于 AccessibilityService 的语义树抽取与定向手势
+  ├── aau-shell     # [纯 JVM 内核] ADB 配对协议、内置助手交接、看门狗与自动恢复；aau-setup 与接入方共用同一份实现
   └── aau-setup     # [特权引导] Shizuku / 无线调试 / Root 引导与全链路诊断套件 (AAUDiagnosticSuite)
 ```
+
+`aau-shell` 刻意是 `java-library` 而不是 Android Library：配对状态机、ADB 字节协议与助手脚本生成全部与 Android 无关，
+宿主只需实现 `BuiltinShellPlatform`。纯 JVM 的接入方（例如把 Agent 内核放在独立模块里的宿主）因此能直接依赖它。
 
 ---
 

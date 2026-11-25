@@ -6,6 +6,23 @@
 
 ## [Unreleased]
 
+### 🧩 新模块 `:aau-shell`：配对、ADB 协议与助手交接的纯 JVM 内核
+
+- **把宿主里的这几件事搬进 AAU**：ADB 无线调试配对（SPAKE2、TLS、RSA 身份、端口发现与扫描）、
+  内置助手的交接（Binder 口令、经 adbd 或 `su 2000 -c` 启动、USB 启动脚本）、看门狗与指数退避重启、
+  无线调试自动开启、无障碍服务自愈、配对引导状态机。这些原先只存在于接入方自己的 `core/shell`、`core/adb` 里。
+- **`:aau-shell` 是 `java-library`，不是 Android Library**：整包只依赖 `kotlinx-coroutines` 与 `java.*` / `javax.crypto` / `javax.net`，
+  平台能力全部经 `BuiltinShellPlatform` 由宿主实现。这一点是硬约束 —— 纯 JVM 的 Agent 内核模块无法依赖 Android Library，
+  所以代码不能塞进 `:aau-setup` 的 `src/main/java`，只能作为它的兄弟模块存在。
+- **`aau-setup` 以 `api` 依赖它**：接入方声明 `aau-setup` 就能直接用 `BuiltinShellControl`，不必再单独加一行。
+- **品牌参数化 `ShellBrand`**：应用名（脚本提示）、助手入口类全名、无障碍服务组件、ADB 证书 CN、shell 退出码标记。
+  默认值指向 AAU 自己的示例（`com.agent.use.shell.HelperMain` 等），**宿主必须在进程启动时 `ShellBranding.configure(...)`**，
+  否则助手进程起不来。助手由 `app_process` 直接拉起、不经过 `Application`，所以 App 进程与助手进程要各装一次。
+- **助手入口类是协议可见项**：它写在启动命令里，换掉等于换一套启动方式；默认值刻意不跟随接入方，
+  免得两个宿主各自以为自己起的是自己的助手。
+- **测试**：290 条 JVM 用例随代码一起搬过来（配对向量、TLS、脚本生成、命令注入转义、看门狗退避、无障碍列表增删）。
+  用例统一用一套示例品牌 `configureExampleBrand()`，既核对全部生成物，也当作「宿主覆盖默认品牌」的回归。
+
 ### 🏷️ 屏幕文本实体抽取：把一串文字变成可点击的区间 (On-device NER)
 
 - **新入口 `AauEntityExtractor`**（`:aau-ner`，LiteRT）：把调用方给的文本映射成实体区间，

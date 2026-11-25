@@ -18,7 +18,7 @@
 - [1. Motivation & Core Value](#1-motivation--core-value)
 - [2. Fundamental Comparison: AAU vs scrcpy](#2-fundamental-comparison-aau-vs-scrcpy)
 - [3. Architecture Overview](#3-architecture-overview)
-- [4. Five Modular Components](#4-five-modular-components)
+- [4. Modular Components](#4-modular-components)
 - [5. Security & Privilege Dropping Design](#5-security--privilege-dropping-design)
 - [6. Quick Start & API Usage](#6-quick-start--api-usage)
 - [7. Diagnostics & Self-Check](#7-diagnostics--self-check)
@@ -101,7 +101,7 @@ flowchart TD
 
 ---
 
-## 4. Five Modular Components
+## 4. Modular Components
 
 ```
 aau-kit (Root)
@@ -109,8 +109,13 @@ aau-kit (Root)
   ├── aau-server    # Shell UID 2000 standalone daemon, builds standalone dex/jar (aau-server.jar)
   ├── aau-client    # Android Library SDK, zero-copy ImageReader pipeline, lifecycle pool & CDP network capture
   ├── aau-a11y      # Optional accessibility extension for semantic tree dump & gestures
+  ├── aau-shell     # Pure-JVM kernel: ADB pairing, helper handoff, watchdog & auto recovery
   └── aau-setup     # Privilege activation (Shizuku/Wireless ADB/Root) & diagnostic suite (AAUDiagnosticSuite)
 ```
+
+`aau-shell` is a `java-library` on purpose, not an Android Library: the pairing state machine, the ADB wire protocol
+and the helper launch scripts are all Android-free — a host only implements `BuiltinShellPlatform`. Pure-JVM consumers
+therefore depend on it directly, and `aau-setup` re-exports it via `api`.
 
 ---
 

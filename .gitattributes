@@ -1,0 +1,2 @@
+# 金样与向量文件按字节比较，换行不能随检出平台变（Windows 的 core.autocrlf 会把 LF 换成 CRLF）。
+aau-shell/src/test/resources/** -text
