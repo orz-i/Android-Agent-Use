@@ -200,8 +200,111 @@ class ExternalCapturePluginLoaderTest {
         val report = load()
         assertEquals(0, report.loaded.size)
         val reasons = report.rejected.map { it.reason }.toSet()
-        assertTrue(reasons.toString(), reasons.any { it == "disabled" })
+        // 被文件关掉的包不算错误：它进 skipped，设置页还要能把它重新打开。
+        assertTrue(reasons.toString(), reasons.none { it == "disabled" })
         assertTrue(reasons.toString(), reasons.any { it.startsWith("spec_invalid_json") })
+        val off = report.skipped.single { it.id == "external.off" }
+        assertTrue(off.disabledInFile)
+        assertFalse(off.enabled)
+        assertFalse(NetworkCapturePluginRegistry.listPluginIds().contains("external.off"))
+    }
+
+    @Test
+    fun declarationIsCarriedThroughToTheSettingsList() {
+        packageDir(
+            "acme",
+            """
+            {
+              "id": "acme.market",
+              "apiVersion": 1,
+              "version": 7,
+              "packages": ["com.acme.market"],
+              "declaration": {
+                "name": "Acme Market",
+                "summary": "Reads the Acme response envelope.",
+                "author": "someone",
+                "notes": ["decode ACME container", "no request rewriting"]
+              },
+              "hostFix": { "headerPriority": ["x-acme-host"], "defaultHost": "api.acme.com" },
+              "responseCodecs": [{ "id": "acme", "steps": [{ "op": "base64" }] }],
+              "ebpfProfile": {
+                "sslOffsetRules": [
+                  { "libSubstring": "libacme.so", "writeOffset": "0x10", "readOffset": "0x20" }
+                ]
+              }
+            }
+            """.trimIndent(),
+        )
+        val report = load()
+        assertEquals(1, report.loaded.size)
+        val pack = report.packs.single()
+        assertEquals("external.acme.market", pack.id)
+        assertEquals("Acme Market", pack.title)
+        assertEquals("Reads the Acme response envelope.", pack.description)
+        assertEquals("someone", pack.author)
+        assertEquals(listOf("decode ACME container", "no request rewriting"), pack.declares)
+        assertEquals(7, pack.version)
+        // 通道计数来自实际解析，不是包自己写的 notes
+        assertEquals(1, pack.sslRules)
+        assertEquals(1, pack.codecs)
+        assertTrue(pack.hostFix)
+        assertEquals(listOf("ssl:1", "codec:1", "hostfix"), pack.channels)
+    }
+
+    @Test
+    fun userDisabledPackageStaysVisibleButIsNotRegistered() {
+        packageDir(
+            "acme",
+            """
+            {
+              "id": "acme.market",
+              "apiVersion": 1,
+              "packages": ["com.acme.market"],
+              "declaration": { "name": "Acme Market" }
+            }
+            """.trimIndent(),
+        )
+        val report = ExternalCapturePluginLoader.load(
+            rootDir = temp.root,
+            parentClassLoader = javaClass.classLoader,
+            disabledIds = setOf("external.acme.market"),
+        )
+        registeredIds += report.loaded.map { it.id }
+        assertEquals(0, report.loaded.size)
+        assertTrue(report.rejected.isEmpty())
+        val pack = report.packs.single()
+        assertTrue(pack.disabledByUser)
+        assertFalse(pack.disabledInFile)
+        assertFalse(pack.enabled)
+        assertEquals("Acme Market", pack.title)
+        assertFalse(NetworkCapturePluginRegistry.listPluginIds().contains("external.acme.market"))
+    }
+
+    @Test
+    fun inspectListsPacksWithoutTouchingTheRegistry() {
+        packageDir(
+            "acme",
+            """
+            {
+              "id": "acme.market",
+              "apiVersion": 1,
+              "packages": ["com.acme.market"],
+              "declaration": { "name": "Acme Market", "notes": ["reads responses"] }
+            }
+            """.trimIndent(),
+        )
+        packageDir("broken", "{ nope }")
+        val packs = ExternalCapturePluginLoader.inspect(temp.root)
+        assertEquals(2, packs.size)
+        val acme = packs.single { it.id == "external.acme.market" }
+        assertEquals("Acme Market", acme.title)
+        assertTrue(acme.enabled)
+        // 连 id 都读不出来的包用目录名占位，不能让它从列表里消失
+        val broken = packs.single { it.id == "external.broken" }
+        assertNotNull(broken.error)
+        assertFalse(broken.enabled)
+        // 只看不改：注册表里不该出现这两个包（同类测试可能留下别的插件，所以只查 id）
+        assertFalse(NetworkCapturePluginRegistry.listPluginIds().contains("external.acme.market"))
     }
 
     @Test

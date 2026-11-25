@@ -1,7 +1,18 @@
 {
   "id": "bosszhipin",
   "apiVersion": 1,
-  "version": 1,
+  "version": 2,
+  "declaration": {
+    "name": "BOSS 直聘",
+    "summary": "把 BOSS 的加密/压缩响应还原成明文，并按 x-bz-host 补全请求域名。",
+    "author": "Mika",
+    "notes": [
+      "读 libzp-sdk-transport.so 的 SSL 写/读偏移",
+      "观察 libyzwg.so 的 nativeDecodeContent 返回值（只读，不改目标进程）",
+      "解 BZPBlock 信封：24 字节头 + LZ4 / gzip",
+      "按 content-encrypt / zp-encrypting 标注解不开的原因"
+    ]
+  },
   "packages": ["com.hpbr.bosszhipin", "com.hpbr.bosszhipin.lite"],
   "hostFix": {
     "headerPriority": ["x-bz-host", ":authority", "host"],

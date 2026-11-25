@@ -1,7 +1,17 @@
 {
   "id": "douyin",
   "apiVersion": 1,
-  "version": 1,
+  "version": 2,
+  "declaration": {
+    "name": "抖音 / 今日头条",
+    "summary": "按 Chromium Cronet 的 ABI 布局读请求头与响应体，解 zstd / brotli。",
+    "author": "Mika",
+    "notes": [
+      "用 Cronet ABI 规则读 raw headers 与 IoBuffer，不依赖版本偏移",
+      "解 zstd / brotli 响应体",
+      "识别 zstd-encoding 这种非标准头"
+    ]
+  },
   "packages": [
     "com.ss.android.ugc.aweme",
     "com.ss.android.ugc.aweme.lite",

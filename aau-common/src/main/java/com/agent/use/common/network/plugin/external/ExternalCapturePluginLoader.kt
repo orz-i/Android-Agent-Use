@@ -95,17 +95,73 @@ object ExternalCapturePluginLoader {
 
     data class RejectedPlugin(val path: String, val reason: String)
 
+    /**
+     * 一个插件包的**声明**：包自述的用途 + 加载器从 `plugin.json` 里实际解析出来的通道。
+     *
+     * 两者都列出来是有意的。只看自述，一个包可以写"只读响应体"却挂了 JNI 入口；
+     * 只看通道计数，用户又不知道它为什么要挂。设置页把两栏并排显示。
+     */
+    data class PackInfo(
+        /** 注册表 id，带 `builtin.` / `external.` 前缀；启用开关按它记。 */
+        val id: String,
+        val dir: String,
+        val version: Int,
+        val apiVersion: Int,
+        val packages: List<String>,
+        val fallback: Boolean,
+        /** `declaration.name`，没有就用 id。 */
+        val title: String? = null,
+        val description: String? = null,
+        val author: String? = null,
+        /** `declaration.notes`：包自己声明的用途，人读。 */
+        val declares: List<String> = emptyList(),
+        val sslRules: Int = 0,
+        val cronetRules: Int = 0,
+        val jniRules: Int = 0,
+        val codecs: Int = 0,
+        val hostFix: Boolean = false,
+        val hasCode: Boolean = false,
+        /** `plugin.json` 里写了自己 `"enabled": false`。 */
+        val disabledInFile: Boolean = false,
+        /** 用户在设置页关掉了它。文件没动，只是不加载。 */
+        val disabledByUser: Boolean = false,
+        /** 校验失败的原因。非空时这个包不会生效，但设置页仍然列出来。 */
+        val error: String? = null,
+    ) {
+        val enabled: Boolean get() = !disabledInFile && !disabledByUser && error == null
+
+        /** 这个包实际会碰的通道，给"技术声明"那一栏用。 */
+        val channels: List<String>
+            get() = buildList {
+                if (sslRules > 0) add("ssl:$sslRules")
+                if (cronetRules > 0) add("cronet:$cronetRules")
+                if (jniRules > 0) add("jni:$jniRules")
+                if (codecs > 0) add("codec:$codecs")
+                if (hostFix) add("hostfix")
+                if (hasCode) add("code")
+            }
+    }
+
     data class Report(
         val loaded: List<LoadedPlugin> = emptyList(),
         val rejected: List<RejectedPlugin> = emptyList(),
+        /** 目录里每一份 `plugin.json`，**包括被禁用的和坏掉的**——设置页要能看见它们。 */
+        val packs: List<PackInfo> = emptyList(),
     ) {
-        val isEmpty: Boolean get() = loaded.isEmpty() && rejected.isEmpty()
+        val isEmpty: Boolean get() = loaded.isEmpty() && rejected.isEmpty() && packs.isEmpty()
+
+        /** 有包但没加载：被文件关了、被用户关了。 */
+        val skipped: List<PackInfo> get() = packs.filter { !it.enabled && it.error == null }
     }
 
     /**
      * 扫描 [rootDir] 下每个子目录，有 `plugin.json` 的按插件包处理，其余静默跳过。
      *
      * 单个包失败只记入 [Report.rejected]，不影响其它包——一个坏配置不该让所有抓包失效。
+     *
+     * 被禁用的包（`plugin.json` 里 `"enabled": false`，或 id 在 [disabledIds] 里）不算失败：
+     * 只出现在 [Report.packs] / [Report.skipped] 里，不注册、不告警。设置页靠这个把
+     * 「用户自己关掉的」和「坏掉加载不了」分开显示。
      */
     fun load(
         rootDir: File?,
@@ -114,33 +170,152 @@ object ExternalCapturePluginLoader {
         dexLoaderFactory: DexClassLoaderFactory = defaultDexLoader,
         idPrefix: String = PLUGIN_ID_PREFIX,
         registry: NetworkCapturePluginRegistry = NetworkCapturePluginRegistry,
+        disabledIds: Set<String> = emptySet(),
     ): Report {
         val root = rootDir ?: return Report()
         if (!root.isDirectory) return Report()
-        val dirs = root.listFiles()
-            ?.filter { it.isDirectory && !it.name.startsWith(".") }
-            ?.sortedBy { it.name }
-            .orEmpty()
+        val dirs = pluginDirs(root)
         if (dirs.isEmpty()) return Report()
 
         val loaded = ArrayList<LoadedPlugin>()
         val rejected = ArrayList<RejectedPlugin>()
+        val packs = ArrayList<PackInfo>()
 
         for (dir in dirs) {
             val specFile = File(dir, PLUGIN_FILE_NAME)
             if (!specFile.isFile) continue
+            val spec = try {
+                parseSpec(specFile.readText())
+            } catch (t: Throwable) {
+                rejected += RejectedPlugin(dir.absolutePath, rejectReason(t))
+                packs += brokenPackInfo(dir, idPrefix, t)
+                continue
+            }
+            val info = describe(spec, dir, idPrefix, disabledIds)
+            // 禁用不是错误：不注册、不告警，但留在 packs 里让设置页能看见并重新打开。
+            if (info.disabledInFile || info.disabledByUser) {
+                packs += info
+                continue
+            }
             val outcome = runCatching { loadOne(dir, specFile, parentClassLoader, allowCode, dexLoaderFactory, idPrefix) }
             outcome.fold(
                 onSuccess = { plugin ->
                     registry.register(plugin.plugin)
                     loaded += plugin.report
+                    packs += info
                 },
                 onFailure = { t ->
-                    rejected += RejectedPlugin(dir.absolutePath, rejectReason(t))
+                    val reason = rejectReason(t)
+                    rejected += RejectedPlugin(dir.absolutePath, reason)
+                    packs += info.copy(error = reason)
                 },
             )
         }
-        return Report(loaded, rejected)
+        return Report(loaded, rejected, packs)
+    }
+
+    /**
+     * 只看不改：[load] 的只读版本，设置页列包用。
+     *
+     * 不实例化 dex 里的类、不注册、不碰 dalvik——它要能在 UI 线程上跑，也不会因为一个坏包
+     * 把正在跑的抓包带崩。校验只到「文件齐不齐、接口版本对不对、校验和对不对」。
+     */
+    fun inspect(
+        rootDir: File?,
+        idPrefix: String = PLUGIN_ID_PREFIX,
+        disabledIds: Set<String> = emptySet(),
+        verifyChecksum: Boolean = true,
+    ): List<PackInfo> {
+        val root = rootDir ?: return emptyList()
+        if (!root.isDirectory) return emptyList()
+        val packs = ArrayList<PackInfo>()
+        for (dir in pluginDirs(root)) {
+            val specFile = File(dir, PLUGIN_FILE_NAME)
+            if (!specFile.isFile) continue
+            val spec = try {
+                parseSpec(specFile.readText())
+            } catch (t: Throwable) {
+                packs += brokenPackInfo(dir, idPrefix, t)
+                continue
+            }
+            packs += validateOnly(describe(spec, dir, idPrefix, disabledIds), spec, dir, verifyChecksum)
+        }
+        return packs
+    }
+
+    private fun pluginDirs(root: File): List<File> = root.listFiles()
+        ?.filter { it.isDirectory && !it.name.startsWith(".") }
+        ?.sortedBy { it.name }
+        .orEmpty()
+
+    /** 连 `id` 都读不出来的包：用目录名占位，否则设置页里它会凭空消失。 */
+    private fun brokenPackInfo(dir: File, idPrefix: String, t: Throwable) = PackInfo(
+        id = idPrefix + dir.name,
+        dir = dir.absolutePath,
+        version = 0,
+        apiVersion = 0,
+        packages = emptyList(),
+        fallback = false,
+        error = rejectReason(t),
+    )
+
+    /** 把解析好的 spec 摊成声明。纯读，不校验。 */
+    private fun describe(spec: Spec, dir: File, idPrefix: String, disabledIds: Set<String>): PackInfo {
+        val profile = spec.ebpfProfile
+        val id = idPrefix + spec.id
+        val decl = spec.declaration
+        return PackInfo(
+            id = id,
+            dir = dir.absolutePath,
+            version = spec.version,
+            apiVersion = spec.apiVersion,
+            packages = spec.packages,
+            fallback = spec.fallback || WILDCARD_PACKAGE in spec.packages,
+            title = decl?.name,
+            description = decl?.summary,
+            author = decl?.author,
+            declares = decl?.notes.orEmpty(),
+            sslRules = profile?.sslOffsetRules?.size ?: 0,
+            cronetRules = profile?.cronetOffsetRules?.size ?: 0,
+            jniRules = profile?.jniHookRules?.size ?: 0,
+            codecs = spec.declarative.responseCodecs.size,
+            hostFix = spec.declarative.hostFix != null,
+            hasCode = spec.dexFile != null,
+            disabledInFile = !spec.enabled,
+            disabledByUser = id in disabledIds,
+        )
+    }
+
+    /** [inspect] 用的静态校验，判定与 [loadOne] 前半段保持一致。 */
+    private fun validateOnly(info: PackInfo, spec: Spec, dir: File, verifyChecksum: Boolean): PackInfo {
+        if (spec.apiVersion != API_VERSION) {
+            return info.copy(error = "api_version_mismatch:${spec.apiVersion}!=$API_VERSION")
+        }
+        val dexFile = spec.dexFile?.let { name ->
+            dexProblem(dir, name)?.let { return info.copy(error = it) }
+            File(dir, name)
+        }
+        if ((spec.entryClass != null || spec.middlewareClass != null) && dexFile == null) {
+            return info.copy(error = "code_without_dex")
+        }
+        if (verifyChecksum && dexFile != null) {
+            spec.sha256?.let { expected ->
+                val actual = sha256(dexFile)
+                if (!actual.equals(expected, ignoreCase = true)) {
+                    return info.copy(error = "sha256_mismatch:${actual.take(12)}!=${expected.take(12)}")
+                }
+            }
+        }
+        return info
+    }
+
+    /** 名字非法 / 越界 / 不存在时返回原因；没问题返回 null。 */
+    private fun dexProblem(dir: File, name: String): String? {
+        if (!DEX_NAME_PATTERN.matches(name)) return "dex_name_invalid:$name"
+        val candidate = File(dir, name)
+        if (candidate.canonicalFile.parentFile != dir.canonicalFile) return "dex_outside_package:$name"
+        if (!candidate.isFile) return "dex_missing:$name"
+        return null
     }
 
     private class Loaded(val plugin: NetworkCapturePlugin, val report: LoadedPlugin)
@@ -158,7 +333,7 @@ object ExternalCapturePluginLoader {
         if (spec.apiVersion != API_VERSION) {
             reject("api_version_mismatch:${spec.apiVersion}!=$API_VERSION")
         }
-        if (!spec.enabled) reject("disabled")
+        // enabled 在这里不再判：load() 已经把被禁用的包挡在门外，走到这里的一定是该加载的。
 
         val dexFile = spec.dexFile?.let { name ->
             if (!DEX_NAME_PATTERN.matches(name)) reject("dex_name_invalid:$name")
@@ -220,6 +395,20 @@ object ExternalCapturePluginLoader {
 
     // ------------------------------------------------------------------ plugin.json
 
+    /**
+     * `plugin.json` 的 `declaration` 段：包自己说的用途。
+     *
+     * 这是给**人**看的，不参与加载判定——写错了不影响抓包。但设置页会原样显示，
+     * 所以它也是插件包唯一能把「我是干什么的」讲清楚的地方。
+     */
+    internal data class Declaration(
+        val name: String?,
+        val summary: String?,
+        val author: String?,
+        /** 逐条用途，例如「读取 BOSS 响应体的 BZPBlock 信封」。 */
+        val notes: List<String>,
+    )
+
     internal data class Spec(
         val id: String,
         val apiVersion: Int,
@@ -233,6 +422,7 @@ object ExternalCapturePluginLoader {
         val sha256: String?,
         val entryClass: String?,
         val middlewareClass: String?,
+        val declaration: Declaration?,
         val ebpfProfile: EbpfProbeProfile?,
         val declarative: DeclarativeConfig,
     )
@@ -265,9 +455,23 @@ object ExternalCapturePluginLoader {
             sha256 = (root["sha256"] as? String)?.trim()?.takeIf { it.isNotEmpty() },
             entryClass = (root["entryClass"] as? String)?.trim()?.takeIf { it.isNotEmpty() },
             middlewareClass = (root["middlewareClass"] as? String)?.trim()?.takeIf { it.isNotEmpty() },
+            declaration = parseDeclaration(root["declaration"]),
             ebpfProfile = ebpfRaw?.let { EbpfProbeProfile.parseProfileObject(it) },
             declarative = DeclarativeCodecJson.parseConfig(root),
         )
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun parseDeclaration(raw: Any?): Declaration? {
+        val map = raw as? Map<String, Any?> ?: return null
+        val notes = (map["notes"] as? List<Any?>).orEmpty()
+            .mapNotNull { (it as? String)?.trim()?.takeIf(String::isNotEmpty) }
+            .distinct()
+        val name = (map["name"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val summary = (map["summary"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val author = (map["author"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        if (name == null && summary == null && author == null && notes.isEmpty()) return null
+        return Declaration(name, summary, author, notes)
     }
 
     private fun sha256(file: File): String {

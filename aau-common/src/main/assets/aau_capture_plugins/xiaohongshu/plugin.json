@@ -1,7 +1,17 @@
 {
   "id": "xiaohongshu",
   "apiVersion": 1,
-  "version": 1,
+  "version": 2,
+  "declaration": {
+    "name": "小红书",
+    "summary": "绑定 libcronet 114 的固定偏移，按 edith.xiaohongshu.com 补全域名。",
+    "author": "Mika",
+    "notes": [
+      "SSL_write / SSL_read / SNI 固定偏移（libcronet 114.0.5735.38）",
+      "Cronet 四段回调偏移：构造、响应开始、读完成、成功",
+      "把 /api/sns/ 请求的 Host 补成 edith.xiaohongshu.com"
+    ]
+  },
   "packages": ["com.xingin.xhs"],
   "hostFix": {
     "headerPriority": [":authority", "host"],

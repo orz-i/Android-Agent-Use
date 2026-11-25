@@ -1,7 +1,16 @@
 {
   "id": "generic-cronet",
   "apiVersion": 1,
-  "version": 1,
+  "version": 2,
+  "declaration": {
+    "name": "通用 Cronet 兜底",
+    "summary": "没有专项规则时，按 Chromium Cronet 的默认 ABI 布局尝试读明文。",
+    "author": "Mika",
+    "notes": [
+      "匹配所有应用，只在没有专项插件包时生效",
+      "只读 Cronet 结构体，不必每个版本改偏移"
+    ]
+  },
   "fallback": true,
   "packages": ["*"],
   "ebpfProfile": {
