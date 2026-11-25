@@ -116,11 +116,17 @@ aau-kit (Root)
   ├── aau-client    # [客户端 SDK] 接入方 Android Library，零拷贝直读管线与生命周期池、CDP 原生网络捕获
   ├── aau-a11y      # [可选扩展] 基于 AccessibilityService 的语义树抽取与定向手势
   ├── aau-shell     # [纯 JVM 内核] ADB 配对协议、内置助手交接、看门狗与自动恢复；aau-setup 与接入方共用同一份实现
+  ├── aau-ui        # [纯 JVM 读屏层] 快照模型、稳定编号、等待与诊断；宿主只需实现 ScreenSurface
   └── aau-setup     # [特权引导] Shizuku / 无线调试 / Root 引导与全链路诊断套件 (AAUDiagnosticSuite)
 ```
 
 `aau-shell` 刻意是 `java-library` 而不是 Android Library：配对状态机、ADB 字节协议与助手脚本生成全部与 Android 无关，
 宿主只需实现 `BuiltinShellPlatform`。纯 JVM 的接入方（例如把 Agent 内核放在独立模块里的宿主）因此能直接依赖它。
+
+`aau-ui` 同样如此：它接在 `aau-a11y` 给出的节点树之后，补上「树怎么读成一屏、编号怎么在一屏一屏之间保持、
+等到什么时候才算到了、这一屏到底能不能用」这一段。宿主实现 `ScreenSurface`（快照、画面、屏上文字、等待、诊断）
+就能白拿 `ScreenSnapshot` / `RefStabilizer` / `ScreenWaiter` / `ScreenDiagnosis` / `TreeAdequacy`；
+动作（点按、输入、启动 App）与产品语义仍留在宿主自己的端口里。
 
 ---
 

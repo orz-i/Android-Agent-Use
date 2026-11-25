@@ -110,12 +110,19 @@ aau-kit (Root)
   ├── aau-client    # Android Library SDK, zero-copy ImageReader pipeline, lifecycle pool & CDP network capture
   ├── aau-a11y      # Optional accessibility extension for semantic tree dump & gestures
   ├── aau-shell     # Pure-JVM kernel: ADB pairing, helper handoff, watchdog & auto recovery
+  ├── aau-ui        # Pure-JVM screen layer: snapshot model, stable refs, waiting & diagnosis
   └── aau-setup     # Privilege activation (Shizuku/Wireless ADB/Root) & diagnostic suite (AAUDiagnosticSuite)
 ```
 
 `aau-shell` is a `java-library` on purpose, not an Android Library: the pairing state machine, the ADB wire protocol
 and the helper launch scripts are all Android-free — a host only implements `BuiltinShellPlatform`. Pure-JVM consumers
 therefore depend on it directly, and `aau-setup` re-exports it via `api`.
+
+`aau-ui` is the same shape. It picks up where `aau-a11y` stops — a node tree — and answers the questions every host
+otherwise rewrites: how a tree becomes a screen, how element refs survive from one read to the next, when a wait is
+actually satisfied, and whether this screen is usable at all. Implement `ScreenSurface` (snapshot, frame, on-screen
+text, waiting, diagnosis) and `ScreenSnapshot` / `RefStabilizer` / `ScreenWaiter` / `ScreenDiagnosis` / `TreeAdequacy`
+come for free; actions and product semantics stay in the host's own port.
 
 ---
 

@@ -20,6 +20,8 @@ include(":aau-client")
 include(":aau-a11y")
 // 纯 JVM 内核：ADB 配对、助手交接、看门狗。放在 aau-setup 之前，setup 的 Android 壳依赖它。
 include(":aau-shell")
+// 读屏快照模型、稳定编号、等待与诊断：纯 JVM，宿主只需实现 ScreenSurface。
+include(":aau-ui")
 include(":aau-setup")
 include(":aau-remote")
 

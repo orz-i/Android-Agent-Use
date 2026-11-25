@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+### 🧭 新模块 `:aau-ui`：读屏快照、稳定编号、等待与诊断的纯 JVM 内核
+
+- **接上 `aau-a11y` 之后的这一段**：`aau-a11y` 给出节点树，`aau-client` 给出画面与输入，但「树怎么读成一屏、
+  编号怎么在一屏一屏之间保持不变、等一个条件满足到底是什么语义、这一屏能不能用」一直由接入方各自重写。
+  现在这些在这里只有一份。
+- **`:aau-ui` 是 `java-library`**：快照模型、找回与编号、等待循环、诊断判定都只有数据与状态机；
+  宿主实现 `ScreenSurface`（快照、画面、屏上文字、`waitStable` / `awaitChange`、诊断）即可。
+- **搬进来的东西**：`ScreenSnapshot` / `UiElement` / `UiWindowTree` / `WebInfo` / `ScreenSig`；
+  编号稳定器 `RefStabilizer`（含按特征找回 `relocate`、位移上限、跨屏累计位移）与 `ModelSnapshot`；
+  等待 `ScreenWaiter` + `Until` / `UntilOutcome`（弹框、别的包盖上来、换了 App 会提前停）；
+  诊断 `ScreenDiagnosis` / `ScreenFacts`、`TreeAdequacy`（树够不够用）、`VisibleText`（OCR 去噪）、`ScreenMap`（文字与控件的空间关联）；
+  以及 `ScreenText`（给模型的文本渲染）、`DescribedTarget`（按描述找元素）、`Hant`（繁体归一）。
+- **等待可被打断**：`WaitGate` 把「人插话、任务取消」这类信号挡在外面，库不认识插话这件事；
+  每段等待经它包一层，打断一到就提前结束，不丢任何东西。
+- **`ScreenSurface` 只有读**：动作（点按、输入、启动、系统动作）与产品语义（App 访问名单、任务结束去留、抓包端口）
+  仍留在宿主的端口里 —— 那些是产品，不是读屏。
+- **顺手把图谱模型也放进来**：`AppAtlas` / `AtlasScreen` / `AtlasEdge` / `AtlasShortcut` / `AtlasCodec` / `AtlasStore`（含内存实现），
+  以及路线里的 `Selector` / `Anchors` / `RouteStep` / `Route` / `RouteCodec` / `RouteAnchors`。
+  版面清洗与「用户改名」这类策略留在宿主，作为扩展函数挂上去。
+- **测试**：82 条 JVM 用例随代码一起搬过来（文本渲染与预算、结构与相似度、编号复用与找回、诊断分类、树质量、OCR 去噪、图谱淘汰与编解码）。
+
 ### 🧪 `MiniHttpServer.serveRequests`：keep-alive 断言改喂字节，不再经过回环
 
 - **新增 `MiniHttpServer.serveRequests(input, output, remote, handler, …)`**：把「在同一对输入输出上按 keep-alive
