@@ -51,6 +51,9 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.zstd.jni)
+    // 插件包里的 flows 由 aau-ui 的解析器读；测试里用真的那份，避免「包里的脚本」和
+    // 「解释器认识的语法」各说各话。
+    testImplementation(project(":aau-ui"))
 }
 
 afterEvaluate {

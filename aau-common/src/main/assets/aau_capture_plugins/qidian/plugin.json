@@ -1,0 +1,336 @@
+{
+  "id": "qidian",
+  "apiVersion": 1,
+  "version": 7,
+  "packages": [
+    "com.qidian.QDReader"
+  ],
+  "declaration": {
+    "name": "起点读书",
+    "summary": "福利中心「激励任务」的操作脚本：进福利中心、点入口、等广告、点 CTA、按名字关掉、领奖，一轮一阶梯。",
+    "author": "Mika",
+    "notes": [
+      "脚本只点界面，不伪造任何回调；奖励以 finishWatch 的 RewardList 为准（抓包开着时）",
+      "按钮按坐标落指：福利中心是 H5，无障碍点击只起涟漪、不触发 JS 的 click",
+      "关闭按钮按无障碍名字找：优量汇写的是「点击退出关闭视频」，横竖屏都不必猜坐标",
+      "CTA 从 OCR 文字里取最靠下的一行，覆盖「去微信立即玩小游戏」这类新版素材",
+      "次数用完时入口变「已领取」，回执停 all_claimed；等不到广告是 ad_not_shown，两者分开",
+      "App 要由 phone_launch_app 起（跑在 agent 屏上），手势才注得进去"
+    ]
+  },
+  "flows": [
+    {
+      "id": "reward-video",
+      "title": "连看激励视频领奖",
+      "description": "在起点读书福利中心的「激励任务」那一屏运行。每一轮点一次「去完成」，看完广告、点 CTA、关掉广告、领奖，再走下一阶。参数 taskText 用来确认页面已经到了；rounds 是最多走几轮。",
+      "params": {
+        "taskText": {
+          "type": "string",
+          "default": "惊喜礼包",
+          "description": "福利中心阶梯上的一项奖励名，用来判断页面已就绪"
+        },
+        "rounds": {
+          "type": "int",
+          "default": "9",
+          "description": "最多走几轮（福利中心一屏九个阶梯）"
+        }
+      },
+      "steps": [
+        {
+          "op": "log",
+          "text": "等福利中心出现"
+        },
+        {
+          "op": "wait",
+          "query": {
+            "textAny": [
+              "激励任务",
+              "书架",
+              "今日阅读"
+            ]
+          },
+          "timeoutMs": 15000,
+          "optional": true
+        },
+        {
+          "op": "if",
+          "not": {
+            "text": "激励任务"
+          },
+          "then": [
+            {
+              "op": "tap",
+              "at": [
+                870,
+                209
+              ]
+            },
+            {
+              "op": "sleep",
+              "ms": 1500
+            },
+            {
+              "op": "wait",
+              "query": {
+                "text": "激励任务"
+              },
+              "timeoutMs": 15000,
+              "optional": true
+            }
+          ]
+        },
+        {
+          "op": "wait",
+          "query": {
+            "text": "激励任务"
+          },
+          "timeoutMs": 10000,
+          "optional": true
+        },
+        {
+          "op": "wait",
+          "query": {
+            "text": "${taskText}"
+          },
+          "timeoutMs": 5000,
+          "optional": true
+        },
+        {
+          "op": "if",
+          "query": {
+            "textAny": [
+              "领取"
+            ],
+            "exclude": [
+              "已领"
+            ]
+          },
+          "then": [
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "领取"
+                ],
+                "exclude": [
+                  "已领"
+                ]
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 1200
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "知道了",
+                  "开心收下"
+                ]
+              },
+              "optional": true
+            }
+          ]
+        },
+        {
+          "op": "repeat",
+          "times": "${rounds}",
+          "as": "round",
+          "steps": [
+            {
+              "op": "tap",
+              "query": {
+                "text": "去完成",
+                "near": "激励任务",
+                "pick": "nearest"
+              }
+            },
+            {
+              "op": "wait",
+              "query": {
+                "text": "激励任务"
+              },
+              "gone": true,
+              "timeoutMs": 25000,
+              "optional": true
+            },
+            {
+              "op": "if",
+              "query": {
+                "text": "激励任务"
+              },
+              "then": [
+                {
+                  "op": "if",
+                  "query": {
+                    "text": "已领取"
+                  },
+                  "then": [
+                    {
+                      "op": "stop",
+                      "reason": "all_claimed"
+                    }
+                  ]
+                },
+                {
+                  "op": "stop",
+                  "reason": "ad_not_shown"
+                }
+              ]
+            },
+            {
+              "op": "sleep",
+              "ms": 15600
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "去微信立即玩",
+                  "去微信畅玩",
+                  "去微信看看",
+                  "立即试玩",
+                  "立即玩",
+                  "开始游戏",
+                  "去浏览",
+                  "查看商品",
+                  "立即购买",
+                  "立即下载",
+                  "了解详情",
+                  "查看详情",
+                  "去逛逛"
+                ],
+                "source": "text",
+                "pick": "maxY"
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 1500
+            },
+            {
+              "op": "if",
+              "query": {
+                "textAny": [
+                  "打开",
+                  "允许"
+                ]
+              },
+              "then": [
+                {
+                  "op": "sleep",
+                  "ms": 13000
+                },
+                {
+                  "op": "tap",
+                  "query": {
+                    "textAny": [
+                      "取消",
+                      "不允许",
+                      "暂不",
+                      "仅此一次"
+                    ]
+                  },
+                  "optional": true
+                }
+              ]
+            },
+            {
+              "op": "sleep",
+              "ms": 15000
+            },
+            {
+              "op": "returnto",
+              "package": "com.qidian.QDReader",
+              "max": 3,
+              "settleMs": 800
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "退出关闭",
+                  "关闭视频",
+                  "关闭广告",
+                  "跳过广告"
+                ]
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 1000
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "放弃",
+                  "残忍离开"
+                ],
+                "source": "text"
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 800
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "知道了",
+                  "开心收下",
+                  "确定"
+                ]
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 800
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "领取"
+                ],
+                "exclude": [
+                  "已领"
+                ]
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 800
+            },
+            {
+              "op": "tap",
+              "query": {
+                "textAny": [
+                  "知道了",
+                  "开心收下"
+                ]
+              },
+              "optional": true
+            },
+            {
+              "op": "sleep",
+              "ms": 800
+            }
+          ]
+        },
+        {
+          "op": "stop",
+          "reason": "round_limit"
+        }
+      ]
+    }
+  ]
+}

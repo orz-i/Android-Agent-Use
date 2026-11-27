@@ -34,7 +34,7 @@ class BuiltinPluginPackagesTest {
     @Test
     fun builtinPackagesCoverTheAppsThatUsedToBeHardcoded() {
         val ids = packages().map { it.id }.toSet()
-        assertEquals(setOf("bosszhipin", "douyin", "generic-cronet", "xiaohongshu"), ids)
+        assertEquals(setOf("bosszhipin", "douyin", "generic-cronet", "qidian", "xiaohongshu"), ids)
     }
 
     @Test
@@ -181,5 +181,48 @@ class BuiltinPluginPackagesTest {
         )
         assertTrue(report.rejected.toString(), report.rejected.isEmpty())
         assertTrue(report.loaded.map { it.id }.toString(), report.loaded.any { it.id == "builtin.bosszhipin" })
+    }
+
+    /**
+     * 起点这个包只带脚本、不带抓包规则：`flows` 要能被 aau-ui 的解析器读出来，
+     * 而且「关广告」那一步必须是按无障碍名字找，不能退回猜坐标。
+     */
+    @Test
+    fun qidianPackageCarriesTheRewardVideoScript() {
+        val pkg = packages().single { it.id == "qidian" }
+        val spec = ExternalCapturePluginLoader.parseSpec(pkg.json)
+        assertEquals(1, spec.flows)
+        assertEquals(0, spec.declarative.responseCodecs.size)
+
+        val parsed = com.agent.use.flow.AppFlowSpec.parsePack(pkg.json, "builtin.qidian")
+        assertTrue(parsed.errors.toString(), parsed.errors.isEmpty())
+        val flow = parsed.flows.single()
+        assertEquals("reward-video", flow.id)
+        assertTrue(flow.matchesPackage("com.qidian.QDReader"))
+
+        val texts = mutableListOf<String>()
+        val excludes = mutableListOf<String>()
+        fun walk(steps: List<com.agent.use.flow.FlowStep>) {
+            for (step in steps) {
+                (step.raw["query"] as? kotlinx.serialization.json.JsonObject)?.let { q ->
+                    (q["textAny"] as? kotlinx.serialization.json.JsonArray)?.forEach { t ->
+                        (t as? kotlinx.serialization.json.JsonPrimitive)?.content?.let(texts::add)
+                    }
+                    (q["text"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.let(texts::add)
+                    (q["exclude"] as? kotlinx.serialization.json.JsonArray)?.forEach { t ->
+                        (t as? kotlinx.serialization.json.JsonPrimitive)?.content?.let(excludes::add)
+                    }
+                }
+                walk(step.then)
+                walk(step.otherwise)
+                walk(step.body)
+            }
+        }
+        walk(flow.steps)
+        assertTrue(texts.toString(), "退出关闭" in texts)
+        assertTrue(texts.toString(), "去完成" in texts)
+        assertTrue(texts.toString(), "去微信立即玩" in texts)
+        // 「领取」这两个字也出现在「已领取」里：点灰按钮没用，还会把下一步带偏
+        assertTrue(excludes.toString(), "已领" in excludes)
     }
 }

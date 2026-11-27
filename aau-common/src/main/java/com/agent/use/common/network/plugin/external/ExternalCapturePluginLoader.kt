@@ -119,6 +119,8 @@ object ExternalCapturePluginLoader {
         val cronetRules: Int = 0,
         val jniRules: Int = 0,
         val codecs: Int = 0,
+        /** `flows` 里的应用脚本条数；和抓包无关，但同一个包可以两样都带。 */
+        val flows: Int = 0,
         val hostFix: Boolean = false,
         val hasCode: Boolean = false,
         /** `plugin.json` 里写了自己 `"enabled": false`。 */
@@ -137,6 +139,7 @@ object ExternalCapturePluginLoader {
                 if (cronetRules > 0) add("cronet:$cronetRules")
                 if (jniRules > 0) add("jni:$jniRules")
                 if (codecs > 0) add("codec:$codecs")
+                if (flows > 0) add("flow:$flows")
                 if (hostFix) add("hostfix")
                 if (hasCode) add("code")
             }
@@ -279,6 +282,7 @@ object ExternalCapturePluginLoader {
             cronetRules = profile?.cronetOffsetRules?.size ?: 0,
             jniRules = profile?.jniHookRules?.size ?: 0,
             codecs = spec.declarative.responseCodecs.size,
+            flows = spec.flows,
             hostFix = spec.declarative.hostFix != null,
             hasCode = spec.dexFile != null,
             disabledInFile = !spec.enabled,
@@ -425,6 +429,8 @@ object ExternalCapturePluginLoader {
         val declaration: Declaration?,
         val ebpfProfile: EbpfProbeProfile?,
         val declarative: DeclarativeConfig,
+        /** 应用脚本条数。脚本本身由宿主在需要时按包名取用，抓包链路只记个数。 */
+        val flows: Int,
     )
 
     @Suppress("UNCHECKED_CAST")
@@ -458,6 +464,7 @@ object ExternalCapturePluginLoader {
             declaration = parseDeclaration(root["declaration"]),
             ebpfProfile = ebpfRaw?.let { EbpfProbeProfile.parseProfileObject(it) },
             declarative = DeclarativeCodecJson.parseConfig(root),
+            flows = (root["flows"] as? List<*>)?.size ?: 0,
         )
     }
 
